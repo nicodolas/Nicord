@@ -132,6 +132,59 @@ Anti-ban settings are persisted in `config.json` (`AppConfig.antiban`)
 and applied live to the running engine on Settings Save — no restart
 needed.
 
+## Discord commands (`ActionSendCommand`)
+
+A scenario node that sends a Discord command instead of a plain
+message. Two kinds, configured per node in the Builder (click the
+node to edit it):
+
+- **Prefix / text command** (`!rank`, `!daily arg1 arg2`): fields
+  `prefix` (default `!`), `name`, `args` (ordered list). Composed
+  text is `{prefix}{name}` + args joined by spaces (empty args
+  skipped), then sent as a normal message through the existing
+  pipeline (daily cap, slot + jitter, typing, retry, auto-delete,
+  auto-break). Template vars (`{{username}}`…) are resolved; Smart
+  Templates variation is NOT applied — it would corrupt a command.
+- **Slash command** (`/daily`): fields `application_id` (the bot's
+  application ID, required), `name`, `command_id` (optional),
+  `version` (optional), `options` (list of name/type/value; types:
+  3 string, 4 integer, 5 boolean, 6 user, 7 channel, 8 role,
+  10 number). Sent via `POST /interactions` (type 2) with
+  `guild_id` (resolved from the channel via `GET /channels/{id}`;
+  omitted for DMs), `session_id`, and a snowflake nonce.
+
+Slash command ID / version resolution: config first, else the
+channel's application-commands search (`GET
+/channels/{id}/application-commands/search`) by name (preferring the
+configured application). If that fails, the send fails with a clear
+log error telling the user to paste the Command ID manually — manual
+entry is the reliable path.
+
+Gateway (`src/gateway.rs`, `tokio-tungstenite` + rustls, same TLS
+stack as reqwest — no OpenSSL): Discord requires a valid gateway
+`session_id` for slash invocations, so Nicord runs a minimal gateway
+client — Identify with intents 0, HELLO / heartbeat / READY only, no
+event handling. It connects LAZILY (only when a slash command fires)
+as a background task owned by the engine, reconnects with backoff,
+and stops on Emergency Stop / engine shutdown. If no session appears
+within 20s, the send falls back to a one-shot `connect_once`
+(connect → READY → close). A failed gateway never breaks message
+sending: slash fails with a clear message while prefix commands keep
+working. REST-only operation is unchanged when no slash commands
+exist.
+
+Slash invocations count toward the 300/day cap and `sent_today`
+(logged with status `sent`, detail `slash /name`) and run the Auto
+Break layer. One scheduled firing runs exactly the FIRST command
+node in a scenario (message nodes are ignored when a command node
+exists) — running several commands per firing would duplicate earlier
+commands when a later one fails and the run is retried.
+
+What the user must provide for slash: the bot's Application ID
+(from the bot's Discord developer page / the app's info); the
+Command ID only if auto-resolve fails. The gateway token is the same
+stored token (Identify reuses it in-memory; never logged).
+
 ## Scheduler — fires exactly once per scheduled time
 
 Each scenario records `last_run_at` (the last scheduled time it fired) in
@@ -142,7 +195,8 @@ duplicates. A machine that was off does not bulk-send missed runs. Cron is
 a real 5-field parser (minute hour day month weekday), not hourly.
 
 Node execution: the scheduler runs Send Message / Send Embed nodes (first
-non-empty content in node order wins over the message list), UtilityWait
+non-empty content in node order wins over the message list), Send Command
+nodes (first command node wins over message nodes), UtilityWait
 (delay before sending), ConditionTimeWindow (skip outside the window),
 UtilityRandomPick (rotation) and UtilitySetVariable (template vars). Any
 other node kind is rejected by `Scenario::validate` with a clear error —
