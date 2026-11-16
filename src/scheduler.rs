@@ -11,8 +11,9 @@
 
 use crate::{
     antiban::{sanitize_content, AntiBanConfig},
-    discord::{DiscordClient, DiscordError},
-    scenario::{due_time, render_template_with_vars, Scenario, Schedule},
+    discord::{build_interaction_payload, make_nonce, DiscordClient, DiscordError},
+    gateway::{Gateway, SESSION_WAIT_SECS},
+    scenario::{due_time, render_template_with_vars, CommandConfig, Scenario, Schedule},
     spintax::{apply_spintax, vary_message},
     store::Store,
 };
@@ -99,6 +100,9 @@ pub struct Engine {
     identity_last_try: Mutex<Option<Instant>>,
     /// Auto Break progress (Discord-BLUE).
     break_state: Mutex<BreakState>,
+    /// Gateway client for slash commands (lazy: connects only when a
+    /// slash command actually fires).
+    gateway: Arc<Gateway>,
     /// Failed sends this session (dashboard success rate). Skips
     /// ("skip: ...") are not failures and are never counted here.
     failed_today: std::sync::Mutex<u32>,
@@ -126,6 +130,7 @@ impl Engine {
                 sent_since_break: 0,
                 next_break_at: 0,
             }),
+            gateway: Arc::new(Gateway::new()),
             failed_today: std::sync::Mutex::new(0),
             deleted_today: std::sync::Mutex::new(0),
             started_at: Instant::now(),
@@ -178,6 +183,8 @@ impl Engine {
     pub fn stop_all(&self) {
         self.emergency_stop.store(true, Ordering::SeqCst);
         self.running.store(false, Ordering::SeqCst);
+        // The gateway task exits too (a later slash send reconnects).
+        self.gateway.stop();
     }
 
     pub fn resume(&self) {
@@ -305,6 +312,15 @@ impl Engine {
             }
         }
 
+        // A Send Command node takes precedence over message nodes: one
+        // scheduled firing runs exactly the first command node (see
+        // `Scenario::command_node` for why only the first one runs).
+        if let Some(cmd_node) = scenario.command_node() {
+            let cfg = CommandConfig::from_node(cmd_node);
+            return self
+                .send_command(scenario, &cfg, client, username, server_name, &antiban)
+                .await;
+        }
         // Node execution (in node order): a Send Message / Send Embed node
         // with non-empty content wins over the plain message list.
         // UtilityWait nodes add an explicit delay before sending.
@@ -371,10 +387,24 @@ impl Engine {
 
         // Retry: network errors up to 3x with backoff; 429 waits retry_after;
         // 401/403 stop immediately (Spec §6).
+        self.send_message_with_retry(scenario, client, &clean, &antiban, &mut rng)
+            .await
+    }
+
+    /// Send one message with the retry policy, then run the post-send
+    /// layers (Auto Delete, Auto Break). Returns the message id.
+    async fn send_message_with_retry(
+        &self,
+        scenario: &Scenario,
+        client: &DiscordClient,
+        clean: &str,
+        antiban: &AntiBanConfig,
+        rng: &mut StdRng,
+    ) -> Result<String, String> {
         let mut attempt = 0;
         loop {
             attempt += 1;
-            match client.send_message(&scenario.channel_id, &clean).await {
+            match client.send_message(&scenario.channel_id, clean).await {
                 Ok(sent) => {
                     *self.sent_today.lock().await += 1;
                     let entry = SendLogEntry {
@@ -385,64 +415,9 @@ impl Engine {
                         detail: format!("message {}", sent.id),
                     };
                     let _ = self.store.log_send(&entry);
-                    // Auto Delete (Discord-BLUE): delete the message after
-                    // the configured delay. A delete failure is only
-                    // logged — the send already succeeded.
-                    if antiban.auto_delete {
-                        if self
-                            .sleep_interruptible(Duration::from_millis(antiban.delete_delay_ms))
-                            .await
-                        {
-                            return Err("emergency stop pressed while waiting to delete".into());
-                        }
-                        match client.delete_message(&scenario.channel_id, &sent.id).await {
-                            Ok(()) => {
-                                if let Ok(mut d) = self.deleted_today.lock() {
-                                    *d += 1;
-                                }
-                                let _ = self.store.log_send(&SendLogEntry {
-                                    scenario_id: scenario.id.clone(),
-                                    scenario_name: scenario.name.clone(),
-                                    channel_id: scenario.channel_id.clone(),
-                                    status: "deleted".into(),
-                                    detail: format!("deleted message {}", sent.id),
-                                });
-                            }
-                            Err(e) => {
-                                tracing::warn!("auto-delete failed for {}: {e}", sent.id);
-                            }
-                        }
-                    }
-                    // Auto Break (Discord-BLUE): after a random 15–25
-                    // sends, rest for a random 10–30 minutes.
-                    if antiban.auto_break {
-                        let break_sleep = {
-                            let mut st = self.break_state.lock().await;
-                            if st.next_break_at == 0 {
-                                st.next_break_at = antiban.break_after_target(&mut rng);
-                            }
-                            st.sent_since_break += 1;
-                            if st.sent_since_break >= st.next_break_at {
-                                let reached = st.next_break_at;
-                                let dur = antiban.break_duration_secs(&mut rng);
-                                st.sent_since_break = 0;
-                                st.next_break_at = antiban.break_after_target(&mut rng);
-                                Some((reached, Duration::from_secs(dur)))
-                            } else {
-                                None
-                            }
-                        };
-                        if let Some((reached, d)) = break_sleep {
-                            tracing::info!(
-                                "auto-break: resting {} minutes after {} sends",
-                                d.as_secs() / 60,
-                                reached
-                            );
-                            if self.sleep_interruptible(d).await {
-                                return Err("emergency stop pressed during auto-break".into());
-                            }
-                        }
-                    }
+                    self.maybe_auto_delete(scenario, client, &sent.id, antiban)
+                        .await?;
+                    self.maybe_auto_break(antiban, rng).await?;
                     return Ok(sent.id);
                 }
                 Err(DiscordError::RateLimited {
@@ -482,6 +457,323 @@ impl Engine {
                     tokio::time::sleep(Duration::from_secs(backoff)).await;
                 }
             }
+        }
+    }
+
+    /// Auto Delete (Discord-BLUE): delete the message after the
+    /// configured delay. A delete failure is only logged — the send
+    /// already succeeded. Err only when Emergency Stop interrupts the
+    /// wait (the message stays up in that case).
+    async fn maybe_auto_delete(
+        &self,
+        scenario: &Scenario,
+        client: &DiscordClient,
+        message_id: &str,
+        antiban: &AntiBanConfig,
+    ) -> Result<(), String> {
+        if !antiban.auto_delete {
+            return Ok(());
+        }
+        if self
+            .sleep_interruptible(Duration::from_millis(antiban.delete_delay_ms))
+            .await
+        {
+            return Err("emergency stop pressed while waiting to delete".into());
+        }
+        match client
+            .delete_message(&scenario.channel_id, message_id)
+            .await
+        {
+            Ok(()) => {
+                if let Ok(mut d) = self.deleted_today.lock() {
+                    *d += 1;
+                }
+                let _ = self.store.log_send(&SendLogEntry {
+                    scenario_id: scenario.id.clone(),
+                    scenario_name: scenario.name.clone(),
+                    channel_id: scenario.channel_id.clone(),
+                    status: "deleted".into(),
+                    detail: format!("deleted message {message_id}"),
+                });
+            }
+            Err(e) => {
+                tracing::warn!("auto-delete failed for {message_id}: {e}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Auto Break (Discord-BLUE): after a random 15–25 sends, rest for
+    /// a random 10–30 minutes. Err only when Emergency Stop interrupts
+    /// the rest.
+    async fn maybe_auto_break(
+        &self,
+        antiban: &AntiBanConfig,
+        rng: &mut StdRng,
+    ) -> Result<(), String> {
+        if !antiban.auto_break {
+            return Ok(());
+        }
+        let break_sleep = {
+            let mut st = self.break_state.lock().await;
+            if st.next_break_at == 0 {
+                st.next_break_at = antiban.break_after_target(rng);
+            }
+            st.sent_since_break += 1;
+            if st.sent_since_break >= st.next_break_at {
+                let reached = st.next_break_at;
+                let dur = antiban.break_duration_secs(rng);
+                st.sent_since_break = 0;
+                st.next_break_at = antiban.break_after_target(rng);
+                Some((reached, Duration::from_secs(dur)))
+            } else {
+                None
+            }
+        };
+        if let Some((reached, d)) = break_sleep {
+            tracing::info!(
+                "auto-break: resting {} minutes after {} sends",
+                d.as_secs() / 60,
+                reached
+            );
+            if self.sleep_interruptible(d).await {
+                return Err("emergency stop pressed during auto-break".into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Execute the first `ActionSendCommand` node of a scenario.
+    /// Prefix commands flow through the normal message pipeline
+    /// (template vars, sanitize, slot, typing, retry, auto-delete,
+    /// auto-break) — but NOT Smart Templates variation, which would
+    /// corrupt a command (random emoji / case flips). Slash commands
+    /// use the interaction endpoint instead (see `send_slash`).
+    async fn send_command(
+        &self,
+        scenario: &Scenario,
+        cfg: &CommandConfig,
+        client: &DiscordClient,
+        username: &str,
+        server_name: &str,
+        antiban: &AntiBanConfig,
+    ) -> Result<String, String> {
+        let mut rng = StdRng::from_os_rng();
+        if cfg.is_slash() {
+            return self.send_slash(scenario, cfg, client, antiban).await;
+        }
+        let mut vars: HashMap<String, String> = scenario
+            .variables
+            .iter()
+            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+            .collect();
+        vars.extend(scenario.set_variable_overrides());
+        let composed = cfg.compose_prefix();
+        let rendered = render_template_with_vars(
+            &composed,
+            username,
+            server_name,
+            &scenario.channel_id,
+            &vars,
+        );
+        let (clean, warnings) = sanitize_content(&rendered, antiban);
+        for w in &warnings {
+            tracing::warn!("anti-ban: {w}");
+        }
+        if clean.trim().is_empty() {
+            return Err("command is empty after sanitising".into());
+        }
+        let wait_secs = scenario.wait_seconds();
+        if wait_secs > 0 {
+            tokio::time::sleep(Duration::from_secs(wait_secs)).await;
+            if self.emergency_stop.load(Ordering::SeqCst) {
+                return Err("emergency stop pressed while waiting".into());
+            }
+        }
+        self.wait_for_slot(&scenario.channel_id).await;
+        if self.emergency_stop.load(Ordering::SeqCst) {
+            return Err("emergency stop pressed while waiting".into());
+        }
+        if antiban.auto_typing {
+            let _ = client.send_typing(&scenario.channel_id).await;
+            let typing = Duration::from_secs(antiban.typing_secs(&mut rng));
+            if self.sleep_interruptible(typing).await {
+                return Err("emergency stop pressed while typing".into());
+            }
+        }
+        self.send_message_with_retry(scenario, client, &clean, antiban, &mut rng)
+            .await
+    }
+
+    /// Invoke a slash command (`POST /interactions`).
+    /// Steps: resolve the guild from the channel, resolve the command
+    /// ID/version (config, else the channel's application-commands
+    /// search), get a gateway session (lazy connect), then invoke.
+    /// Counts toward the daily cap like a message send.
+    async fn send_slash(
+        &self,
+        scenario: &Scenario,
+        cfg: &CommandConfig,
+        client: &DiscordClient,
+        antiban: &AntiBanConfig,
+    ) -> Result<String, String> {
+        let mut rng = StdRng::from_os_rng();
+        let wait_secs = scenario.wait_seconds();
+        if wait_secs > 0 {
+            tokio::time::sleep(Duration::from_secs(wait_secs)).await;
+            if self.emergency_stop.load(Ordering::SeqCst) {
+                return Err("emergency stop pressed while waiting".into());
+            }
+        }
+        self.wait_for_slot(&scenario.channel_id).await;
+        if self.emergency_stop.load(Ordering::SeqCst) {
+            return Err("emergency stop pressed while waiting".into());
+        }
+        // Guild of the channel (None for DMs — the payload omits it).
+        let guild_id = match client.get_channel(&scenario.channel_id).await {
+            Ok(ch) => ch.guild_id,
+            Err(e) => {
+                return Err(format!("cannot read channel for slash command: {e}"));
+            }
+        };
+        // Command ID / version: config first, else auto-resolve by name.
+        let (command_id, version) = if !cfg.command_id.trim().is_empty() {
+            (cfg.command_id.trim().to_string(), cfg.version.clone())
+        } else {
+            match client
+                .search_application_commands(&scenario.channel_id, cfg.name.trim())
+                .await
+            {
+                Ok(found) => {
+                    let hit = found.iter().find(|c| {
+                        c.name == cfg.name.trim()
+                            && (cfg.application_id.trim().is_empty()
+                                || c.application_id == cfg.application_id.trim())
+                    });
+                    match hit {
+                        Some(h) => (h.id.clone(), h.version.clone()),
+                        None => {
+                            return Err(format!(
+                                "slash command /{} not found in this channel — paste its Command ID manually in the node editor",
+                                cfg.name.trim()
+                            ));
+                        }
+                    }
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "cannot search application commands ({e}) — paste the Command ID manually in the node editor"
+                    ));
+                }
+            }
+        };
+        // Gateway session (lazy connect — only slash needs it).
+        self.gateway.ensure_started(client.token().to_string());
+        let session = match self.wait_for_session().await {
+            Some(s) => s,
+            None => {
+                // Fallback: one-shot connect (the background task may be
+                // wedged or still backing off) instead of failing outright.
+                match Gateway::connect_once(client.token(), Duration::from_secs(15)).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return Err(format!(
+                            "không kết nối được gateway — lệnh slash cần phiên gateway ({e}); kiểm tra mạng rồi thử lại"
+                        ));
+                    }
+                }
+            }
+        };
+        // Options: name/type/value triples from the node config.
+        let options: Vec<(String, u8, String)> = cfg
+            .options
+            .iter()
+            .map(|o| (o.name.clone(), o.kind, o.value.clone()))
+            .collect();
+        let payload = build_interaction_payload(
+            cfg.application_id.trim(),
+            guild_id.as_deref(),
+            &scenario.channel_id,
+            &session,
+            &make_nonce(),
+            &command_id,
+            cfg.name.trim(),
+            &version,
+            &options,
+        );
+        // Retry like a message send: 429 waits, 401/403 stop at once.
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match client.invoke_interaction(payload.clone()).await {
+                Ok(()) => {
+                    *self.sent_today.lock().await += 1;
+                    let _ = self.store.log_send(&SendLogEntry {
+                        scenario_id: scenario.id.clone(),
+                        scenario_name: scenario.name.clone(),
+                        channel_id: scenario.channel_id.clone(),
+                        status: "sent".into(),
+                        detail: format!("slash /{}", cfg.name.trim()),
+                    });
+                    self.maybe_auto_break(antiban, &mut rng).await?;
+                    return Ok(format!("slash /{}", cfg.name.trim()));
+                }
+                Err(DiscordError::RateLimited {
+                    retry_after_secs,
+                    global,
+                }) => {
+                    tracing::warn!(
+                        "Discord 429 on slash, waiting {retry_after_secs}s (global={global})"
+                    );
+                    if global {
+                        tokio::time::sleep(Duration::from_secs(3600)).await;
+                    } else {
+                        tokio::time::sleep(Duration::from_secs(retry_after_secs.max(1))).await;
+                    }
+                    if attempt >= 3 {
+                        if let Ok(mut f) = self.failed_today.lock() {
+                            *f += 1;
+                        }
+                        return Err(format!(
+                            "rate limited repeatedly (last retry_after {retry_after_secs}s)"
+                        ));
+                    }
+                }
+                Err(DiscordError::Unauthorized(m)) | Err(DiscordError::Forbidden(m)) => {
+                    if let Ok(mut f) = self.failed_today.lock() {
+                        *f += 1;
+                    }
+                    return Err(format!("stopped immediately: {m}"));
+                }
+                Err(DiscordError::Other(m)) => {
+                    if attempt >= 3 {
+                        if let Ok(mut f) = self.failed_today.lock() {
+                            *f += 1;
+                        }
+                        return Err(format!("failed after 3 attempts: {m}"));
+                    }
+                    let backoff = 2u64.pow(attempt) * 2;
+                    tokio::time::sleep(Duration::from_secs(backoff)).await;
+                }
+            }
+        }
+    }
+
+    /// Wait up to SESSION_WAIT_SECS for the gateway session id,
+    /// polling every 500ms. None on timeout or Emergency Stop.
+    async fn wait_for_session(&self) -> Option<String> {
+        let deadline = Instant::now() + Duration::from_secs(SESSION_WAIT_SECS);
+        loop {
+            if let Some(s) = self.gateway.session_id().await {
+                return Some(s);
+            }
+            if self.emergency_stop.load(Ordering::SeqCst) {
+                return None;
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
 
