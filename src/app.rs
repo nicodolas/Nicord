@@ -1,15 +1,17 @@
 //! Native egui UI (eframe, immediate-mode — no React / WebView).
-//! Screens: Onboarding (ToS warning → Key → Token) → Dashboard →
+//! Screens: Onboarding (ToS warning → Token) → Dashboard →
 //! Builder (list-based, add/remove/move up-down) → Logs → Settings.
 //! Light by design: simple widgets, no canvas, no animations.
+//!
+//! One simple app for everyone: 1 channel, 300 messages/day
+//! (cap resets 00:00 UTC). No tiers.
 
 use crate::{
     antiban::AntiBanConfig,
     crypto::{decrypt_token, encrypt_token, mask_token},
     discord::{Channel, DiscordClient, Guild},
-    license::{verify_license_key, Plan},
     scenario::{Node, NodeKind, Scenario},
-    scheduler::{free_channels_violation, Engine},
+    scheduler::{channels_violation, Engine},
     store::{config_dir, load_config, save_config, AppConfig, Store},
 };
 use std::sync::{Arc, Mutex};
@@ -29,10 +31,8 @@ pub struct NicordApp {
     pub scenarios: Arc<Mutex<Vec<Scenario>>>,
     pub config: AppConfig,
     pub screen: Screen,
-    pub plan: Plan,
     pub status: Arc<Mutex<String>>,
     pub tos_checked: bool,
-    pub key_input: String,
     pub token_input: String,
     pub new_scenario_name: String,
     pub new_message: String,
@@ -49,14 +49,7 @@ impl NicordApp {
     pub fn new(store: Arc<Store>) -> Self {
         let config = load_config();
         let scenarios = store.load_scenarios().unwrap_or_default();
-        let plan = if config.license_key.trim().is_empty() {
-            Plan::Free
-        } else {
-            verify_license_key(&config.license_key)
-                .map(|info| info.plan)
-                .unwrap_or(Plan::Free)
-        };
-        let screen = if !config.tos_accepted || config.license_key.trim().is_empty() {
+        let screen = if !config.tos_accepted {
             Screen::Onboarding
         } else {
             Screen::Dashboard
@@ -69,10 +62,8 @@ impl NicordApp {
             scenarios: Arc::new(Mutex::new(scenarios)),
             config,
             screen,
-            plan,
             status: Arc::new(Mutex::new(String::new())),
             tos_checked: false,
-            key_input: String::new(),
             token_input: String::new(),
             new_scenario_name: String::new(),
             new_message: String::new(),
@@ -176,7 +167,6 @@ impl NicordApp {
         let engine = self.engine.clone();
         let scenarios = self.scenarios.clone();
         let config = self.config.clone();
-        let plan = self.plan;
         std::thread::spawn(move || {
             let rt = match tokio::runtime::Runtime::new() {
                 Ok(rt) => rt,
@@ -185,7 +175,6 @@ impl NicordApp {
             let engine2 = engine.clone();
             let scenarios2 = scenarios.clone();
             rt.block_on(async move {
-                engine2.set_plan(plan);
                 let get_client = move || {
                     decrypt_token(&config.encrypted_token)
                         .ok()
@@ -279,7 +268,7 @@ impl eframe::App for NicordApp {
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("Nicord");
-                ui.label(format!("Plan: {:?}", self.plan));
+                ui.label("1 channel • 300 messages/day");
                 if self.screen != Screen::Onboarding {
                     for (label, screen) in [
                         ("Dashboard", Screen::Dashboard),
@@ -292,7 +281,7 @@ impl eframe::App for NicordApp {
                         }
                     }
                 }
-                if ui.button("⛔ Emergency Stop").clicked() {
+                if ui.button("Emergency Stop").clicked() {
                     self.engine.stop_all();
                     self.set_status("EMERGENCY STOP — all queues halted.");
                 }
@@ -323,7 +312,7 @@ impl NicordApp {
         ui.heading("Welcome to Nicord");
         ui.colored_label(
             egui::Color32::RED,
-            "⚠ WARNING — READ FIRST: Automating a normal Discord user account \
+            "WARNING — READ FIRST: Automating a normal Discord user account \
              (self-bot) is forbidden by Discord's Terms of Service and can result \
              in PERMANENT account termination. Nicord makes no guarantee you will \
              never be banned. Use a SPARE account, never your main account.",
@@ -333,36 +322,7 @@ impl NicordApp {
             "I understand the risk and accept responsibility for my own account.",
         );
         ui.separator();
-        ui.label("Step 1 — License key (enter once, unlocks features)");
-        ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut self.key_input).hint_text("NICORD-XXXX-..."));
-            if ui.button("Activate key").clicked() {
-                if !self.tos_checked {
-                    self.set_status("Please accept the ToS warning first.");
-                } else {
-                    match verify_license_key(&self.key_input) {
-                        Ok(info) => {
-                            self.plan = info.plan;
-                            self.engine.set_plan(info.plan);
-                            self.config.license_key = self.key_input.clone();
-                            let _ = save_config(&self.config);
-                            self.set_status(&format!("Key accepted — plan {:?}", info.plan));
-                        }
-                        Err(e) => self.set_status(&format!("Key rejected: {e}")),
-                    }
-                }
-            }
-            if ui.button("Continue Free (1 channel)").clicked() {
-                if !self.tos_checked {
-                    self.set_status("Please accept the ToS warning first.");
-                } else {
-                    self.plan = Plan::Free;
-                    self.set_status("Free plan: 1 channel, 1 scenario.");
-                }
-            }
-        });
-        ui.separator();
-        ui.label("Step 2 — Your Discord token (paste once, stored encrypted locally)");
+        ui.label("Step 1 — Your Discord token (paste once, stored encrypted locally)");
         ui.label("Get it yourself from Discord like a developer token. Never share it with anyone — not even Nicord support.");
         if !self.config.token_last4.is_empty() {
             // token_last4 holds ONLY the last 4 chars (never the full token);
@@ -412,7 +372,7 @@ impl NicordApp {
                 }
             }
         });
-        if ui.button("Skip for now → Dashboard").clicked() {
+        if ui.button("Skip for now -> Dashboard").clicked() {
             self.config.tos_accepted = self.tos_checked;
             let _ = save_config(&self.config);
             self.screen = Screen::Dashboard;
@@ -423,23 +383,23 @@ impl NicordApp {
         ui.heading("Dashboard");
         let count = self.scenarios.lock().map(|l| l.len()).unwrap_or(0);
         ui.label(format!(
-            "Scenarios: {}  •  Running: {}  •  Sent today: {}  •  Free limit: 1 channel, 1 scenario",
+            "Scenarios: {}  •  Running: {}  •  Sent today: {} / 300  •  Limit: 1 channel, resets 00:00 UTC",
             count,
             self.engine.running.load(std::sync::atomic::Ordering::SeqCst),
             self.sent_today
         ));
         ui.horizontal(|ui| {
-            if ui.button("▶ Start engine").clicked() {
+            if ui.button("Start engine").clicked() {
                 self.start_engine();
             }
-            if ui.button("⏸ Stop engine").clicked() {
+            if ui.button("Stop engine").clicked() {
                 self.engine.stop_all();
                 self.set_status("Engine stopped.");
             }
-            if ui.button("✉ Test send (sends a REAL message)").clicked() {
+            if ui.button("Test send (sends a REAL message)").clicked() {
                 self.test_send();
             }
-            if ui.button("▁ Minimise (engine keeps running)").clicked() {
+            if ui.button("Minimise (engine keeps running)").clicked() {
                 ui.ctx()
                     .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
             }
@@ -490,42 +450,20 @@ impl NicordApp {
                 egui::TextEdit::singleline(&mut self.new_scenario_name)
                     .hint_text("New scenario name"),
             );
-            if ui.button("＋ New scenario").clicked() {
-                if self.plan == Plan::Free {
-                    let running = self
-                        .scenarios
-                        .lock()
-                        .map(|l| l.iter().filter(|s| s.enabled).count())
-                        .unwrap_or(0);
-                    let total = self.scenarios.lock().map(|l| l.len()).unwrap_or(0);
-                    if total >= 1 && running >= 1 {
-                        self.set_status("Free plan: only 1 scenario. Upgrade with a Pro key.");
-                    } else {
-                        let name = if self.new_scenario_name.trim().is_empty() {
-                            "Untitled scenario".to_string()
-                        } else {
-                            self.new_scenario_name.trim().to_string()
-                        };
-                        let s = Scenario::new(&name);
-                        if let Ok(mut list) = self.scenarios.lock() {
-                            list.push(s);
-                        }
-                        self.save_scenarios();
-                        self.new_scenario_name.clear();
-                    }
+            if ui.button("+ New scenario").clicked() {
+                // No scenario-count limit: the only limit is 1 distinct
+                // channel, enforced when a scenario is enabled.
+                let name = if self.new_scenario_name.trim().is_empty() {
+                    "Untitled scenario".to_string()
                 } else {
-                    let name = if self.new_scenario_name.trim().is_empty() {
-                        "Untitled scenario".to_string()
-                    } else {
-                        self.new_scenario_name.trim().to_string()
-                    };
-                    let s = Scenario::new(&name);
-                    if let Ok(mut list) = self.scenarios.lock() {
-                        list.push(s);
-                    }
-                    self.save_scenarios();
-                    self.new_scenario_name.clear();
+                    self.new_scenario_name.trim().to_string()
+                };
+                let s = Scenario::new(&name);
+                if let Ok(mut list) = self.scenarios.lock() {
+                    list.push(s);
                 }
+                self.save_scenarios();
+                self.new_scenario_name.clear();
             }
         });
         ui.separator();
@@ -547,7 +485,7 @@ impl NicordApp {
                     {
                         to_toggle = Some(i);
                     }
-                    if ui.button("🗑 Delete").clicked() {
+                    if ui.button("Delete").clicked() {
                         to_delete = Some(i);
                     }
                 });
@@ -559,17 +497,14 @@ impl NicordApp {
             if let Ok(mut list) = self.scenarios.lock() {
                 let was_enabled = list.get(i).map(|s| s.enabled).unwrap_or(false);
                 if !was_enabled {
-                    // Hypothetical list with this scenario enabled: Free
-                    // allows 1 running scenario AND 1 distinct channel.
+                    // Hypothetical list with this scenario enabled: only
+                    // 1 distinct channel is allowed across enabled scenarios.
                     let mut hypo = list.clone();
                     if let Some(s) = hypo.get_mut(i) {
                         s.enabled = true;
                     }
-                    let running = hypo.iter().filter(|x| x.enabled).count();
-                    if self.plan == Plan::Free && running > 1 {
-                        msg = Some("Free plan: only 1 running scenario.".to_string());
-                    } else if let Some(v) = free_channels_violation(&hypo, self.plan) {
-                        msg = Some(format!("{v}. Upgrade with a Pro key."));
+                    if let Some(v) = channels_violation(&hypo) {
+                        msg = Some(v);
                     } else if let Some(s) = list.get_mut(i) {
                         s.enabled = true;
                     }
@@ -611,7 +546,7 @@ impl NicordApp {
             }
             ui.label("Channel picker (loads your servers/channels from Discord):");
             ui.horizontal(|ui| {
-                if ui.button("↻ Load servers").clicked() {
+                if ui.button("Load servers").clicked() {
                     self.load_guilds();
                 }
                 let guilds = self.guilds.lock().map(|g| g.clone()).unwrap_or_default();
@@ -678,9 +613,9 @@ impl NicordApp {
                 });
             ui.horizontal(|ui| {
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.new_message).hint_text("Add a message…"),
+                    egui::TextEdit::singleline(&mut self.new_message).hint_text("Add a message..."),
                 );
-                if ui.button("＋ Add message").clicked() && !self.new_message.trim().is_empty() {
+                if ui.button("+ Add message").clicked() && !self.new_message.trim().is_empty() {
                     if let Ok(mut list) = self.scenarios.lock() {
                         if let Some(s) = list.get_mut(i) {
                             s.messages.push(self.new_message.trim().to_string());
@@ -695,7 +630,7 @@ impl NicordApp {
                 ui.label(format!("• {} — {}", kind.group(), kind.label()));
             }
             ui.horizontal(|ui| {
-                if ui.button("＋ Add: Send Message node").clicked() {
+                if ui.button("+ Add: Send Message node").clicked() {
                     if let Ok(mut list) = self.scenarios.lock() {
                         if let Some(s) = list.get_mut(i) {
                             s.nodes.push(Node::new(NodeKind::ActionSendMessage));
@@ -703,7 +638,7 @@ impl NicordApp {
                     }
                     self.save_scenarios();
                 }
-                if ui.button("＋ Add: Wait node").clicked() {
+                if ui.button("+ Add: Wait node").clicked() {
                     if let Ok(mut list) = self.scenarios.lock() {
                         if let Some(s) = list.get_mut(i) {
                             s.nodes.push(Node::new(NodeKind::UtilityWait));
@@ -711,7 +646,7 @@ impl NicordApp {
                     }
                     self.save_scenarios();
                 }
-                if ui.button("✓ Validate (dry-run)").clicked() {
+                if ui.button("Validate (dry-run)").clicked() {
                     let result = self
                         .scenarios
                         .lock()
@@ -726,7 +661,7 @@ impl NicordApp {
                     }
                 }
             });
-            // Persist channel_id edits (Free: 1 distinct channel).
+            // Persist channel_id edits (1 distinct channel).
             if let Ok(mut list) = self.scenarios.lock() {
                 let cur = list.get(i).map(|s| s.channel_id.clone());
                 if cur.as_deref() != Some(channel_id.as_str()) {
@@ -734,8 +669,8 @@ impl NicordApp {
                     if let Some(h) = hypo.get_mut(i) {
                         h.channel_id = channel_id.clone();
                     }
-                    if let Some(v) = free_channels_violation(&hypo, self.plan) {
-                        self.set_status(&format!("{v}. Upgrade with a Pro key."));
+                    if let Some(v) = channels_violation(&hypo) {
+                        self.set_status(&v);
                     } else if let Some(s) = list.get_mut(i) {
                         s.channel_id = channel_id;
                         let _ = self.store.save_scenario(s);
@@ -745,7 +680,7 @@ impl NicordApp {
             // Scenario export / import (JSON).
             ui.separator();
             ui.horizontal(|ui| {
-                if ui.button("⬇ Export scenario JSON").clicked() {
+                if ui.button("Export scenario JSON").clicked() {
                     let path = config_dir().join(format!(
                         "nicord-export-{}.json",
                         self.scenarios
@@ -771,7 +706,7 @@ impl NicordApp {
                     egui::TextEdit::singleline(&mut self.import_path)
                         .hint_text("Path to a scenario .json to import"),
                 );
-                if ui.button("⬆ Import scenario").clicked() {
+                if ui.button("Import scenario").clicked() {
                     let path = self.import_path.trim().to_string();
                     match std::fs::read_to_string(&path)
                         .map_err(|e| e.to_string())
@@ -785,7 +720,7 @@ impl NicordApp {
                             if let Ok(list) = self.scenarios.lock() {
                                 let mut hypo = list.clone();
                                 hypo.push(imported.clone());
-                                if let Some(v) = free_channels_violation(&hypo, self.plan) {
+                                if let Some(v) = channels_violation(&hypo) {
                                     self.set_status(&format!("Import blocked: {v}"));
                                     ok = false;
                                 }
@@ -814,7 +749,7 @@ impl NicordApp {
                 egui::TextEdit::singleline(&mut self.log_filter)
                     .hint_text("scenario name or status, e.g. sent"),
             );
-            if ui.button("⬇ Export logs (CSV)").clicked() {
+            if ui.button("Export logs (CSV)").clicked() {
                 let path = config_dir().join("nicord-logs.csv");
                 let result = self
                     .store
@@ -861,25 +796,7 @@ impl NicordApp {
 
     fn show_settings(&mut self, ui: &mut egui::Ui) {
         ui.heading("Settings");
-        ui.label(format!(
-            "Plan: {:?} (Free = 1 channel, 1 scenario, 100 msgs/day)",
-            self.plan
-        ));
-        ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut self.key_input).hint_text("New license key"));
-            if ui.button("Apply key").clicked() {
-                match verify_license_key(&self.key_input) {
-                    Ok(info) => {
-                        self.plan = info.plan;
-                        self.engine.set_plan(info.plan);
-                        self.config.license_key = self.key_input.clone();
-                        let _ = save_config(&self.config);
-                        self.set_status(&format!("Key accepted — plan {:?}", info.plan));
-                    }
-                    Err(e) => self.set_status(&format!("Key rejected: {e}")),
-                }
-            }
-        });
+        ui.label("Limits: 1 channel • 300 messages/day (resets 00:00 UTC)");
         ui.checkbox(&mut self.config.autostart, "Start with the computer");
         ui.label("Note: autostart is saved here, but the OS hook is not wired yet — enable Nicord in your OS startup apps after the first run (see README). There is no system-tray icon yet: keep the window open (minimised is fine); closing the window stops the engine.");
         if ui.button("Save settings").clicked() {
@@ -889,9 +806,21 @@ impl NicordApp {
         ui.separator();
         ui.colored_label(egui::Color32::RED, "Danger zone");
         if ui
-            .button("🗑 Delete all local data (token, key, scenarios)")
+            .button("Delete all local data (token, scenarios)")
             .clicked()
         {
+            // Actually delete the scenarios too: resetting the config
+            // alone left them in the DB (and in the UI), despite the
+            // button promising to delete them.
+            if let Ok(list) = self.scenarios.lock() {
+                for s in list.iter() {
+                    let _ = self.store.delete_scenario(&s.id);
+                }
+            }
+            if let Ok(mut list) = self.scenarios.lock() {
+                list.clear();
+            }
+            self.selected = None;
             self.config = AppConfig::default();
             let _ = save_config(&self.config);
             self.screen = Screen::Onboarding;
