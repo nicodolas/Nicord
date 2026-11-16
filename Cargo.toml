@@ -2,7 +2,7 @@
 name = "nicord"
 version = "0.1.0"
 edition = "2021"
-description = "Nicord — desktop Discord auto-sender using your own account. Local-first, no login, license-key unlocked."
+description = "Nicord — desktop Discord auto-sender using your own account. Local-first, no login."
 license = "MIT"
 authors = ["Nico <nicodolas>"]
 repository = "https://github.com/nicodolas/Nicord"
@@ -18,16 +18,16 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Storage
 rusqlite = { version = "0.32", features = ["bundled"] }
-# Crypto: AES-256-GCM token encryption + Ed25519 license verification
+# Crypto: AES-256-GCM token encryption
 aes-gcm = "0.10"
-ed25519-dalek = { version = "2", features = ["rand_core"] }
 base64 = "0.22"
 sha2 = "0.10"
 rand = "0.9"
 # Time / ids / logging
 chrono = { version = "0.4", features = ["clock", "serde"] }
+# App window icon (PNG decode only; embedded as base64 text via include_str! in main.rs)
+image = { version = "0.25", default-features = false, features = ["png"] }
 chrono-tz = "0.10"
-rand_core = "0.6"
 uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
