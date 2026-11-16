@@ -267,6 +267,35 @@ packaging are generated from it and live in `assets/`. The window icon is
 embedded in the binary as base64 text (`assets/icon-256.b64`, decoded in
 `src/main.rs`), so a checkout builds without extra steps.
 
+## Auto-update (in-app)
+
+`src/updater.rs`. On startup (background thread, never blocks the UI)
+the app GETs the public GitHub Releases API
+(`api.github.com/repos/nicodolas/Nicord/releases/latest`,
+unauthenticated, User-Agent only — no user data sent) and compares
+the latest tag with `env!("CARGO_PKG_VERSION")`. A newer release
+opens a dialog: "Cập nhật ngay" / "Để sau". Nothing installs
+silently. A 404 (no releases yet) or any API/network error is
+treated as "no update" and logged quietly — no error dialog.
+
+- Asset: `Nicord-v{tag}-windows-x64.zip` on Windows
+  (`-linux-x64.zip` on Linux), exact name first, then any `.zip`
+  for the platform; a wrong-platform file is never picked.
+- Download streams with reqwest (`stream` feature) into a temp
+  staging dir with a progress bar; extraction uses the `zip` crate
+  and rejects unsafe paths (`enclosed_name`, Zip Slip guard).
+- Install (Windows): a running exe cannot overwrite itself, so a
+  helper `.bat` (`.sh` on Linux) waits for Nicord's PID to exit,
+  backs the old exe up to `Nicord.exe.bak`, copies the staged files
+  over the install folder, deletes the staging dir and relaunches
+  Nicord. The engine is stopped cleanly (`stop_all`) before the app
+  quits. `config.json` / `nicord.db` live in the OS config dir
+  (`%APPDATA%\nicord` / `~/.config/nicord`), never next to the exe,
+  so an update cannot touch user data.
+- Settings has a "Cập nhật" card: "Kiểm tra cập nhật" button +
+  auto-check toggle (default ON, persisted in `config.json` as
+  `auto_check_updates`).
+
 ## Known limitations
 
 - **System tray is Windows-only.** On Linux the tray checkbox is
