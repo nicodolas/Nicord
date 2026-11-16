@@ -123,6 +123,41 @@ server name fetched once at engine start (`get_me` + `list_guilds`).
   plaintext.
 - Logs contain message IDs and status only — never the token.
 
+## Font and theme (v0.1.0 redesign)
+
+- **Font: Inter** (SIL OFL 1.1, by Rasmus Andersson — the open font
+  deliberately designed to match Apple San Francisco's look and metrics,
+  with full Vietnamese support). Apple's own SF Pro is proprietary and
+  licensed for Apple platforms only, so it cannot legally be bundled into
+  a Windows app; Inter is the correct legal equivalent. Regular and
+  SemiBold, subsetted with `pyftsubset` (fontTools) to the glyphs the
+  UI needs: Latin + full Vietnamese diacritics (U+1EA0–U+1EF9,
+  precomposed) + common punctuation (339 glyphs; the only missing
+  codepoint from the round-1 set is U+00AD soft hyphen, which Inter
+  does not ship and is invisible anyway). Coverage verified with
+  fontTools: zero missing glyphs for Vietnamese; the subset has **no
+  arrows, checkmarks or warning glyphs**, so UI text avoids them (use
+  ASCII `->` or drawn shapes instead). Source: the official rsms/inter
+  GitHub release (Inter 4.1, `extras/ttf/` static instances).
+- The subsets are embedded as **base64 text** — `assets/font-inter-regular.b64`
+  (49,052 chars) and `assets/font-inter-semibold.b64`
+  (50,192 chars) — decoded in `src/main.rs` and installed as egui's
+  default proportional font (SemiBold for headings/buttons). No binary
+  `.ttf` is committed, because the GitHub write route is text-only
+  (same trick as the icon). Binary cost: ~+74 KB total (smaller than
+  round 1's ~+92 KB).
+- **Theme (`src/theme.rs`):** Discord-dark palette — background
+  `#1E1F22`, sidebar `#161719`, cards `#2B2D31`, borders `#3F4147`,
+  blurple accent `#5865F2` (light accent `#7B61FF`), danger `#ED4245`,
+  success `#57F287`, warning `#FAA81A`, text `#F2F3F5` / secondary
+  `#B5BAC1` / muted `#80848E`. Sizes: heading 24, section 17, body and
+  buttons 15, small/monospace 13, big numbers 28 (all SemiBold where
+  emphasised). Layout: 208 px left sidebar (brand, nav, "Today" status
+  card, Emergency Stop at the bottom on every screen) + main column
+  with a title, Vietnamese subtitle and the limit line
+  "1 channel • 300 messages/day • resets 00:00 UTC". No extra images,
+  no idle animations.
+
 ## App icon
 
 The icon source is `assets/icon.svg` (white speech bubble with a clock on
