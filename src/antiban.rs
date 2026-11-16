@@ -6,6 +6,10 @@ use chrono::{Local, Timelike};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
+/// The daily cap for every user: 300 messages/day, resetting at 00:00 UTC.
+/// Warm-up: 30% (90/day) for the first 3 days since first run.
+pub const DAILY_CAP: u32 = 300;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AntiBanConfig {
     /// Minimum seconds between two sends in the same channel (default 10).
@@ -15,7 +19,7 @@ pub struct AntiBanConfig {
     /// Random extra delay per send, seconds (default 5..=25).
     pub jitter_min_secs: u64,
     pub jitter_max_secs: u64,
-    /// Max messages per day per account (Free default 100).
+    /// Max messages per day per account (300 for everyone).
     pub daily_cap: u32,
     /// Warm-up: first N days run at 30% of the cap.
     pub warmup_days: u32,
@@ -33,7 +37,7 @@ impl Default for AntiBanConfig {
             hard_floor_secs: 5,
             jitter_min_secs: 5,
             jitter_max_secs: 25,
-            daily_cap: 100,
+            daily_cap: DAILY_CAP,
             warmup_days: 3,
             sleep_start_hour: 23,
             sleep_end_hour: 7,
@@ -67,8 +71,8 @@ impl AntiBanConfig {
     }
 
     /// Effective daily cap during warm-up (30% for the first N days).
-    /// `base_cap` is the plan/scenario cap (Free 100, Pro 1000) — never
-    /// hardcoded here, so the caller decides which cap applies.
+    /// `base_cap` is the account cap (300) — never hardcoded here, so the
+    /// caller decides which cap applies.
     pub fn effective_daily_cap(&self, base_cap: u32, account_age_days: u32) -> u32 {
         if account_age_days < self.warmup_days {
             (base_cap as f64 * 0.3).ceil() as u32
@@ -140,12 +144,22 @@ mod tests {
     }
 
     #[test]
+    fn default_cap_is_300_with_90_warmup() {
+        let cfg = AntiBanConfig::default();
+        assert_eq!(cfg.daily_cap, DAILY_CAP);
+        assert_eq!(cfg.daily_cap, 300);
+        // Warm-up: 30% of 300 = 90/day for the first 3 days.
+        assert_eq!(cfg.effective_daily_cap(cfg.daily_cap, 0), 90);
+        assert_eq!(cfg.effective_daily_cap(cfg.daily_cap, 2), 90);
+        // Day 3 (age == warmup_days) is full cap.
+        assert_eq!(cfg.effective_daily_cap(cfg.daily_cap, 3), 300);
+        assert_eq!(cfg.effective_daily_cap(cfg.daily_cap, 10), 300);
+    }
+
+    #[test]
     fn warmup_caps_at_thirty_percent() {
         let cfg = AntiBanConfig::default();
-        assert_eq!(cfg.effective_daily_cap(100, 0), 30);
-        assert_eq!(cfg.effective_daily_cap(100, 10), 100);
-        // Pro base cap also warms up at 30%.
-        assert_eq!(cfg.effective_daily_cap(1000, 0), 300);
-        assert_eq!(cfg.effective_daily_cap(1000, 10), 1000);
+        assert_eq!(cfg.effective_daily_cap(300, 0), 90);
+        assert_eq!(cfg.effective_daily_cap(300, 10), 300);
     }
 }
