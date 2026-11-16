@@ -38,12 +38,25 @@ pub struct Guild {
 }
 
 /// The account behind the token (`GET /users/@me`).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct Me {
     #[serde(default)]
     pub username: String,
     #[serde(default)]
     pub global_name: Option<String>,
+    /// Snowflake user id.
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub verified: bool,
+    /// Two-factor auth enabled.
+    #[serde(default)]
+    pub mfa_enabled: bool,
+    /// 0 = none, 1 = Nitro Classic, 2 = Nitro, 3 = Nitro Basic.
+    #[serde(default)]
+    pub premium_type: u32,
 }
 
 impl Me {
@@ -58,6 +71,22 @@ impl Me {
                     self.username.clone()
                 }
             }
+        }
+    }
+
+    /// Any paid Nitro tier.
+    #[allow(dead_code)]
+    pub fn has_nitro(&self) -> bool {
+        self.premium_type > 0
+    }
+
+    /// Human-readable Nitro tier.
+    pub fn nitro_label(&self) -> &'static str {
+        match self.premium_type {
+            1 => "Nitro Classic",
+            2 => "Nitro",
+            3 => "Nitro Basic",
+            _ => "Không có",
         }
     }
 }
@@ -156,6 +185,43 @@ impl DiscordClient {
             .await
             .map_err(|e| DiscordError::Other(format!("network error: {e}")))?;
         self.handle_response(resp).await
+    }
+
+    /// Auto Typing (Discord-BLUE): show "typing..." in the channel.
+    /// Discord answers 204 with an empty body; any error is returned so
+    /// the caller can decide (the send path ignores typing failures).
+    pub async fn send_typing(&self, channel_id: &str) -> Result<(), DiscordError> {
+        let resp = self
+            .http
+            .post(typing_url(channel_id))
+            .header("Authorization", self.auth_header())
+            .send()
+            .await
+            .map_err(|e| DiscordError::Other(format!("network error: {e}")))?;
+        match resp.status() {
+            StatusCode::NO_CONTENT | StatusCode::OK => Ok(()),
+            s => Err(self.status_error(s, resp).await),
+        }
+    }
+
+    /// Auto Delete (Discord-BLUE): delete a message the app just sent.
+    /// Discord answers 204 with an empty body.
+    pub async fn delete_message(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+    ) -> Result<(), DiscordError> {
+        let resp = self
+            .http
+            .delete(delete_url(channel_id, message_id))
+            .header("Authorization", self.auth_header())
+            .send()
+            .await
+            .map_err(|e| DiscordError::Other(format!("network error: {e}")))?;
+        match resp.status() {
+            StatusCode::NO_CONTENT | StatusCode::OK => Ok(()),
+            s => Err(self.status_error(s, resp).await),
+        }
     }
 
     pub async fn get_me(&self) -> Result<serde_json::Value, DiscordError> {
@@ -267,6 +333,16 @@ pub fn parse_retry_after(body: &str) -> u64 {
         .unwrap_or(5)
 }
 
+/// Typing-indicator endpoint for a channel (Auto Typing).
+pub fn typing_url(channel_id: &str) -> String {
+    format!("{DISCORD_API}/channels/{channel_id}/typing")
+}
+
+/// Single-message endpoint (Auto Delete).
+pub fn delete_url(channel_id: &str, message_id: &str) -> String {
+    format!("{DISCORD_API}/channels/{channel_id}/messages/{message_id}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,5 +370,42 @@ mod tests {
             ..ch.clone()
         };
         assert!(!voice.is_text());
+    }
+
+    #[test]
+    fn typing_and_delete_urls() {
+        assert_eq!(
+            typing_url("123"),
+            "https://discord.com/api/v10/channels/123/typing"
+        );
+        assert_eq!(
+            delete_url("123", "456"),
+            "https://discord.com/api/v10/channels/123/messages/456"
+        );
+    }
+
+    #[test]
+    fn me_parses_validator_fields() {
+        let v: serde_json::Value = serde_json::json!({
+            "username": "nico",
+            "global_name": "Nico",
+            "id": "123456",
+            "email": "nico@example.com",
+            "verified": true,
+            "mfa_enabled": true,
+            "premium_type": 2
+        });
+        let me: Me = serde_json::from_value(v).unwrap();
+        assert_eq!(me.display_name(), "Nico");
+        assert_eq!(me.id, "123456");
+        assert_eq!(me.email.as_deref(), Some("nico@example.com"));
+        assert!(me.verified && me.mfa_enabled);
+        assert!(me.has_nitro());
+        assert_eq!(me.nitro_label(), "Nitro");
+        // Missing fields default (old /users/@me bodies still parse).
+        let bare: Me = serde_json::from_value(serde_json::json!({"username": "x"})).unwrap();
+        assert_eq!(bare.id, "");
+        assert!(!bare.has_nitro());
+        assert_eq!(bare.nitro_label(), "Không có");
     }
 }
