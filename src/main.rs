@@ -10,6 +10,7 @@ mod app;
 mod autostart;
 mod crypto;
 mod discord;
+mod gateway;
 mod scenario;
 mod scheduler;
 mod spintax;
