@@ -9,13 +9,28 @@ mod antiban;
 mod app;
 mod crypto;
 mod discord;
-mod license;
 mod scenario;
 mod scheduler;
 mod store;
 
 use app::NicordApp;
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use std::sync::Arc;
+
+/// Window / taskbar icon, decoded from the PNG embedded at build time.
+/// The PNG is stored as base64 text (assets/icon-256.b64, generated from
+/// assets/icon.svg) so the build stays self-contained in one text file.
+/// Returns `None` (plain default icon) instead of crashing if decoding fails.
+fn load_icon() -> Option<egui::IconData> {
+    let bytes = B64.decode(include_str!("../assets/icon-256.b64")).ok()?;
+    let image = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    let (width, height) = image.dimensions();
+    Some(egui::IconData {
+        rgba: image.into_raw(),
+        width,
+        height,
+    })
+}
 
 fn main() -> eframe::Result<()> {
     tracing_subscriber::fmt()
@@ -30,10 +45,14 @@ fn main() -> eframe::Result<()> {
         std::process::exit(1);
     }));
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1100.0, 700.0])
+        .with_title("Nicord");
+    if let Some(icon) = load_icon() {
+        viewport = viewport.with_icon(icon);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1100.0, 700.0])
-            .with_title("Nicord"),
+        viewport,
         ..Default::default()
     };
 
@@ -42,4 +61,16 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|_cc| Ok(Box::new(NicordApp::new(store)))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn window_icon_decodes() {
+        let icon = load_icon().expect("assets/icon-256.b64 must decode");
+        assert_eq!((icon.width, icon.height), (256, 256));
+        assert_eq!(icon.rgba.len(), 256 * 256 * 4);
+    }
 }
