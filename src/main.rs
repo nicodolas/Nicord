@@ -18,6 +18,7 @@ mod store;
 mod theme;
 #[cfg(target_os = "windows")]
 mod tray;
+mod updater;
 
 use app::NicordApp;
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
