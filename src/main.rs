@@ -12,6 +12,7 @@ mod discord;
 mod scenario;
 mod scheduler;
 mod store;
+mod theme;
 
 use app::NicordApp;
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
@@ -59,7 +60,11 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Nicord",
         options,
-        Box::new(|_cc| Ok(Box::new(NicordApp::new(store)))),
+        Box::new(|cc| {
+            // Discord-like dark theme + bundled Inter font.
+            theme::apply_theme(&cc.egui_ctx);
+            Ok(Box::new(NicordApp::new(store)))
+        }),
     )
 }
 
