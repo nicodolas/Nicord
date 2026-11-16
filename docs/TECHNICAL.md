@@ -85,6 +85,53 @@ internal/dev mechanisms; they only receive the finished product.
 
 There is no captcha solving, detection evasion, or bulk proxy rotation.
 
+## Discord-BLUE features (ported, all optional, all off by default)
+
+Ported from bluemanhst/Discord-BLUE (Python/tkinter) into Rust. The
+multi-account / multi-channel model was NOT ported — Nicord stays
+1 account, 1 channel, 300 messages/day.
+
+- **Smart Templates** (`src/spintax.rs`): Spintax `{a|b|c}` picks one
+  option at random; `{...}` groups without `|` and `{{template}}` vars
+  pass through untouched. Variation randomly inserts an emoji, doubles
+  a space, or flips one word's case (each ~15%, so most messages stay
+  natural). Applied after template vars are resolved, before sending.
+  BLUE's abbreviation mutation was not ported (Vietnamese-slang
+  specific, would mangle ordinary words).
+- **Auto Typing** (`DiscordClient::send_typing`): POST
+  `/channels/{id}/typing`, then wait a random 2–5s before sending.
+  A typing failure never blocks the send; the wait aborts on
+  Emergency Stop.
+- **Auto Break** (scheduler): after a random 15–25 sends, rest for a
+  random 10–30 minutes (interruptible). Counter and target reset after
+  every break.
+- **Auto Delete** (`DiscordClient::delete_message`): after a successful
+  send, wait `delete_delay_ms` (0 = immediately, interruptible), then
+  DELETE the message (204 = success). Failures are only logged; the
+  send already succeeded. Deleted count shows on the Dashboard.
+- **Token Validator** (Settings → "Kiểm tra token"): calls the existing
+  `get_me_typed()` and shows username, user ID, email, email-verified,
+  2FA, Nitro tier. 401 → "Token không hợp lệ hoặc đã hết hạn". The
+  token itself is never shown.
+- **Dashboard stats**: success rate % (sent / sent+failed, session),
+  send rate (sent/minute since engine start), deleted count (session),
+  and "Export thống kê (.json)" writing a stats JSON to the config dir
+  (same pattern as scenario export).
+- **System tray** (Windows only, `src/tray.rs`, `tray-icon` crate):
+  closing the window hides Nicord to the tray instead of quitting;
+  tray menu "Hiện Nicord" / "Thoát", left-click shows the window.
+  The tray code is `#[cfg(target_os = "windows")]` — Linux builds
+  never compile it (Linux is check-only; Windows is the release
+  target). The tray icon reuses the embedded `assets/icon-256.b64`.
+- **Real autostart** (`src/autostart.rs`): Windows Run key
+  `HKCU\...\CurrentVersion\Run` (`winreg` crate, Windows only);
+  Linux XDG desktop entry `~/.config/autostart/nicord.desktop`.
+  On startup the toggle reflects the actual OS state.
+
+Anti-ban settings are persisted in `config.json` (`AppConfig.antiban`)
+and applied live to the running engine on Settings Save — no restart
+needed.
+
 ## Scheduler — fires exactly once per scheduled time
 
 Each scenario records `last_run_at` (the last scheduled time it fired) in
@@ -168,9 +215,9 @@ embedded in the binary as base64 text (`assets/icon-256.b64`, decoded in
 
 ## Known limitations
 
-- **No system-tray icon / real autostart yet.** The autostart toggle in
-  Settings is saved but not wired to the OS. Keep the window open
-  (minimised is fine) for the engine to run.
+- **System tray is Windows-only.** On Linux the tray checkbox is
+  hidden and closing the window still quits. Autostart works on both
+  Windows (Run key) and Linux (XDG desktop entry).
 - **Spike not run yet:** 7 days of stable sending on a spare account has
   not been proven — run it before releasing.
 - Sending is REST-only (no gateway). The channel picker is wired (Load
