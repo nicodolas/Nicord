@@ -30,7 +30,7 @@ pub enum Schedule {
     Daily { time: NaiveTime },
     /// Weekly on given weekdays (0 = Mon .. 6 = Sun) at a local time.
     Weekly { weekdays: Vec<u8>, time: NaiveTime },
-    /// Advanced cron string, Pro only. Real 5-field parser.
+    /// Advanced cron string. Real 5-field parser.
     Cron { expr: String },
 }
 
@@ -546,16 +546,16 @@ pub struct ScenarioLimits {
     pub daily_cap: u32,
 }
 
-/// 0 = no per-scenario cap; the plan cap (Free 100, Pro 1000) applies.
+/// 0 = no per-scenario cap; the account cap (300/day) applies.
 /// A non-zero value caps this one scenario (per day) in addition to the
-/// plan cap. The old default of 100 silently capped Pro scenarios at 100.
+/// account cap.
 fn default_daily_cap() -> u32 {
     0
 }
 
 impl Default for ScenarioLimits {
     fn default() -> Self {
-        Self { daily_cap: 100 }
+        Self { daily_cap: 300 }
     }
 }
 
@@ -1226,5 +1226,18 @@ mod tests {
         let (i1, _) = s.pick_message_with_index(None, &mut rng).unwrap();
         let (i2, _) = s.pick_message_with_index(Some(i1), &mut rng).unwrap();
         assert_ne!(i1, i2);
+    }
+
+    #[test]
+    fn example_scenario_json_stays_valid() {
+        let json = std::fs::read_to_string("examples/scenario-example.json")
+            .expect("examples/scenario-example.json must exist");
+        let s: Scenario =
+            serde_json::from_str(&json).expect("example scenario must parse as a Scenario");
+        assert_eq!(s.limits.daily_cap, 300);
+        assert!(
+            s.validate().is_err(),
+            "example has a placeholder channel id"
+        );
     }
 }
