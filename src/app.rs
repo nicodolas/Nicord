@@ -20,6 +20,7 @@ use crate::{
     scheduler::{channels_violation, Engine},
     store::{config_dir, load_config, save_config, AppConfig, Store},
     theme,
+    updater::{self, CheckResult, UpdateState},
 };
 use egui::RichText;
 use std::sync::{Arc, Mutex};
@@ -56,6 +57,9 @@ pub struct NicordApp {
     pub import_path: String,
     /// Result of the last "Kiểm tra token" (Token Validator).
     pub token_info: Arc<Mutex<Option<Me>>>,
+    /// Auto-update state, shared with the background check/download
+    /// threads (see `crate::updater`).
+    pub update_status: Arc<Mutex<updater::UpdateStatus>>,
     /// System tray icon (Windows only, when enabled in Settings).
     #[cfg(target_os = "windows")]
     pub tray: Option<crate::tray::Tray>,
@@ -101,6 +105,7 @@ impl NicordApp {
             log_filter: String::new(),
             import_path: String::new(),
             token_info: Arc::new(Mutex::new(None)),
+            update_status: Arc::new(Mutex::new(updater::UpdateStatus::default())),
             #[cfg(target_os = "windows")]
             tray: if tray_enabled {
                 crate::tray::Tray::new()
@@ -116,6 +121,13 @@ impl NicordApp {
         if has_enabled && !app.config.encrypted_token.is_empty() && app.config.tos_accepted {
             app.start_engine();
             app.set_status("Resumed enabled scenarios from last session.");
+        }
+        // Auto-update: one quiet check on startup (only after the ToS
+        // is accepted — the dialog never appears on Onboarding). A
+        // failed check or "no releases yet" stays silent; only a newer
+        // release opens the dialog.
+        if app.config.auto_check_updates && app.config.tos_accepted {
+            app.check_updates(false);
         }
         app
     }
@@ -312,6 +324,242 @@ impl NicordApp {
                     Err(e) => format!("Test lệnh thất bại: {e}"),
                 };
             }
+        });
+    }
+
+    /// Check GitHub Releases for a newer version, on a background
+    /// thread (never blocks the UI). `manual` is the Settings button:
+    /// it reports the result in the status banner, while the startup
+    /// auto-check stays silent unless a newer release exists.
+    fn check_updates(&self, manual: bool) {
+        let shared = self.update_status.clone();
+        let status = self.status.clone();
+        if let Ok(mut u) = shared.lock() {
+            u.state = UpdateState::Checking;
+            u.dialog = false;
+        }
+        if manual {
+            self.set_status("Đang kiểm tra cập nhật…");
+        }
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    if let Ok(mut u) = shared.lock() {
+                        u.state = UpdateState::Failed(format!("cannot start runtime: {e}"));
+                    }
+                    return;
+                }
+            };
+            let result = rt.block_on(updater::check_for_update());
+            tracing::info!(
+                "update check: {}",
+                match &result {
+                    CheckResult::Available(info) => format!("new release {}", info.tag),
+                    CheckResult::UpToDate => "up to date".to_string(),
+                    CheckResult::NoRelease => "no releases".to_string(),
+                    CheckResult::Failed(e) => format!("failed: {e}"),
+                }
+            );
+            let mut text: Option<String> = None;
+            if let Ok(mut u) = shared.lock() {
+                match &result {
+                    CheckResult::Available(info) => {
+                        u.state = UpdateState::Available(info.clone());
+                        // The one case that opens the dialog — and only
+                        // the dialog asks; nothing installs silently.
+                        u.dialog = true;
+                        text = Some(format!("Có bản mới {}!", info.tag));
+                    }
+                    CheckResult::UpToDate => {
+                        u.state = UpdateState::UpToDate;
+                        text = Some("Bạn đang dùng bản mới nhất.".to_string());
+                    }
+                    CheckResult::NoRelease => {
+                        u.state = UpdateState::NoRelease;
+                        text = Some("Chưa có bản phát hành.".to_string());
+                    }
+                    CheckResult::Failed(e) => {
+                        // Quiet by design (auto-check): no error dialog.
+                        u.state = UpdateState::Failed(e.clone());
+                        text = Some(format!("Kiểm tra cập nhật thất bại: {e}"));
+                    }
+                }
+            }
+            // Manual checks report in the banner; the startup check
+            // only speaks up when there is actually a newer release.
+            if manual {
+                if let (Some(t), Ok(mut s)) = (text, status.lock()) {
+                    *s = t;
+                }
+            } else if let CheckResult::Available(info) = &result {
+                if let Ok(mut s) = status.lock() {
+                    *s = format!("Có bản mới {} — xem hộp thoại cập nhật.", info.tag);
+                }
+            }
+        });
+    }
+
+    /// One-line Settings status for the updater (read once per frame).
+    fn update_status_line(&self) -> String {
+        let Ok(u) = self.update_status.lock() else {
+            return String::new();
+        };
+        match &u.state {
+            UpdateState::Idle => "Chưa kiểm tra.".to_string(),
+            UpdateState::Checking => "Đang kiểm tra…".to_string(),
+            UpdateState::Available(info) => format!("Có bản mới {} — xem hộp thoại.", info.tag),
+            UpdateState::UpToDate => "Bạn đang dùng bản mới nhất.".to_string(),
+            UpdateState::NoRelease => "Chưa có bản phát hành.".to_string(),
+            UpdateState::Downloading => {
+                let total = u
+                    .total
+                    .map(|t| format!(" / {}", updater::fmt_bytes(t)))
+                    .unwrap_or_default();
+                format!("Đang tải… {}{}", updater::fmt_bytes(u.downloaded), total)
+            }
+            UpdateState::ReadyToInstall => "Đã tải xong, sẵn sàng cập nhật.".to_string(),
+            UpdateState::Failed(e) => format!("Kiểm tra thất bại: {e}"),
+        }
+    }
+
+    /// Download the release zip for the available update, on a
+    /// background thread with progress. Extracts it into a temp
+    /// staging dir; nothing in the install folder is touched yet.
+    fn start_download(&self) {
+        let info = {
+            let Ok(u) = self.update_status.lock() else {
+                return;
+            };
+            match &u.state {
+                UpdateState::Available(info) => info.clone(),
+                _ => return,
+            }
+        };
+        let shared = self.update_status.clone();
+        let status = self.status.clone();
+        if let Ok(mut u) = shared.lock() {
+            u.state = UpdateState::Downloading;
+            u.downloaded = 0;
+            u.total = info.asset.size;
+            u.plan = None;
+        }
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    if let Ok(mut u) = shared.lock() {
+                        u.state = UpdateState::Failed(format!("cannot start runtime: {e}"));
+                        u.dialog = true;
+                    }
+                    return;
+                }
+            };
+            let stage_dir =
+                std::env::temp_dir().join(format!("nicord-update-{}", uuid::Uuid::new_v4()));
+            if let Err(e) = std::fs::create_dir_all(&stage_dir) {
+                if let Ok(mut u) = shared.lock() {
+                    u.state = UpdateState::Failed(format!("không tạo được thư mục tạm: {e}"));
+                    u.dialog = true;
+                }
+                return;
+            }
+            let zip_path = stage_dir.join(&info.asset.name);
+            let progress = Arc::new(Mutex::new(updater::DownloadProgress {
+                downloaded: 0,
+                total: info.asset.size,
+            }));
+            let progress_reader = progress.clone();
+            // Pump progress into the shared UI state while downloading.
+            let shared_pump = shared.clone();
+            let pump = std::thread::spawn(move || loop {
+                let (d, t) = match progress_reader.lock() {
+                    Ok(p) => (p.downloaded, p.total),
+                    Err(_) => break,
+                };
+                let done = if let Ok(mut u) = shared_pump.lock() {
+                    u.downloaded = d;
+                    u.total = t;
+                    matches!(u.state, UpdateState::Downloading)
+                } else {
+                    false
+                };
+                if !done {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            });
+            let result = rt.block_on(updater::download_asset(
+                &info.asset.url,
+                &zip_path,
+                progress,
+            ));
+            let _ = pump.join();
+            match result {
+                Err(e) => {
+                    let _ = std::fs::remove_dir_all(&stage_dir);
+                    if let Ok(mut u) = shared.lock() {
+                        u.state =
+                            UpdateState::Failed(format!("Tải bản mới thất bại, thử lại sau ({e})"));
+                        u.dialog = true;
+                    }
+                    if let Ok(mut s) = status.lock() {
+                        *s = "Tải bản mới thất bại, thử lại sau.".to_string();
+                    }
+                }
+                Ok(()) => match updater::prepare_install(&zip_path) {
+                    Err(e) => {
+                        let _ = std::fs::remove_dir_all(&stage_dir);
+                        if let Ok(mut u) = shared.lock() {
+                            u.state = UpdateState::Failed(e);
+                            u.dialog = true;
+                        }
+                    }
+                    Ok(plan) => {
+                        if let Ok(mut u) = shared.lock() {
+                            u.state = UpdateState::ReadyToInstall;
+                            u.plan = Some(plan);
+                        }
+                    }
+                },
+            }
+        });
+    }
+
+    /// Install the staged update: write the helper script, stop the
+    /// engine cleanly, then launch the helper (detached) and quit.
+    /// The helper waits for this process to exit, swaps the files,
+    /// and relaunches Nicord. Runs on a thread so the UI stays alive
+    /// until the process actually exits.
+    fn install_update(&self) {
+        let plan = {
+            let Ok(u) = self.update_status.lock() else {
+                return;
+            };
+            match &u.plan {
+                Some(p) => p.clone(),
+                None => return,
+            }
+        };
+        let shared = self.update_status.clone();
+        let engine = self.engine.clone();
+        std::thread::spawn(move || {
+            let helper = match updater::write_helper(&plan) {
+                Ok(h) => h,
+                Err(e) => {
+                    if let Ok(mut u) = shared.lock() {
+                        u.state = UpdateState::Failed(e);
+                        u.dialog = true;
+                    }
+                    return;
+                }
+            };
+            // Stop the engine first: no more sends go out, the
+            // gateway task exits too. The helper additionally waits
+            // for this PID to disappear before touching any file.
+            engine.stop_all();
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            updater::launch_helper_and_exit(&helper);
         });
     }
 
@@ -536,6 +784,9 @@ impl eframe::App for NicordApp {
                     Screen::Settings => self.show_settings(ui),
                 }
             });
+        // Auto-update dialog (only when a newer release was found, or
+        // a download/install step needs the user's attention).
+        self.show_update_dialog(ctx);
         // Keep the engine ticking / status fresh.
         ctx.request_repaint_after(std::time::Duration::from_secs(1));
     }
@@ -1743,6 +1994,24 @@ impl NicordApp {
             }
         });
         ui.add_space(12.0);
+        theme::card(ui, |ui| {
+            theme::section_title(ui, "Cập nhật");
+            ui.checkbox(
+                &mut self.config.auto_check_updates,
+                "Tự động kiểm tra cập nhật khi mở app",
+            );
+            ui.horizontal(|ui| {
+                if theme::primary_button(ui, "Kiểm tra cập nhật").clicked() {
+                    self.check_updates(true);
+                }
+                ui.label(self.update_status_line());
+            });
+            theme::muted(
+                ui,
+                "Nicord chỉ hỏi bản phát hành công khai trên GitHub, không gửi dữ liệu cá nhân. Cập nhật chỉ diễn ra khi bạn đồng ý — file cài đặt được thay, còn token, kịch bản và lịch sử gửi vẫn nguyên.",
+            );
+        });
+        ui.add_space(12.0);
         theme::danger_frame().show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.label(
@@ -1769,6 +2038,97 @@ impl NicordApp {
                 self.set_status("Local data cleared.");
             }
         });
+    }
+
+    /// Auto-update dialog: only opens when a newer release was found
+    /// (or a download/install step failed after the user asked for
+    /// it). "Để sau" dismisses until the next launch — nothing ever
+    /// installs without the user pressing "Cập nhật ngay".
+    fn show_update_dialog(&self, ctx: &egui::Context) {
+        let (open, state, downloaded, total) = match self.update_status.lock() {
+            Ok(u) => (u.dialog, u.state.clone(), u.downloaded, u.total),
+            Err(_) => return,
+        };
+        if !open {
+            return;
+        }
+        let current = updater::current_version();
+        let mut close = false;
+        egui::Window::new("Cập nhật Nicord")
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.set_width(380.0);
+                match &state {
+                    UpdateState::Available(info) => {
+                        ui.label(format!(
+                            "Có bản mới {} (bạn đang dùng v{}).",
+                            info.tag, current
+                        ));
+                        theme::muted(
+                            ui,
+                            "Bản mới sẽ thay thế Nicord.exe, README.txt, LICENSE và icon.ico. Cài đặt, token và kịch bản của bạn không bị đụng tới.",
+                        );
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if theme::primary_button(ui, "Cập nhật ngay").clicked() {
+                                self.start_download();
+                            }
+                            if ui.button("Để sau").clicked() {
+                                close = true;
+                            }
+                        });
+                    }
+                    UpdateState::Downloading => {
+                        ui.label("Đang tải bản mới…");
+                        if let Some(total) = total.filter(|t| *t > 0) {
+                            ui.add(
+                                egui::ProgressBar::new(downloaded as f32 / total as f32)
+                                    .show_percentage(),
+                            );
+                        } else {
+                            ui.spinner();
+                        }
+                        ui.label(format!(
+                            "Đã tải {} / {}",
+                            updater::fmt_bytes(downloaded),
+                            total.map(updater::fmt_bytes).unwrap_or_else(|| "?".to_string())
+                        ));
+                    }
+                    UpdateState::ReadyToInstall => {
+                        ui.label("Đã tải xong. App sẽ tắt để cập nhật rồi tự mở lại.");
+                        theme::muted(ui, "File cũ được giữ lại thành Nicord.exe.bak trong cùng thư mục.");
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if theme::primary_button(ui, "Cập nhật và khởi động lại").clicked() {
+                                self.install_update();
+                            }
+                            if ui.button("Để sau").clicked() {
+                                close = true;
+                            }
+                        });
+                    }
+                    UpdateState::Failed(e) => {
+                        ui.label(format!("Cập nhật thất bại: {e}"));
+                        ui.add_space(8.0);
+                        if ui.button("Đóng").clicked() {
+                            close = true;
+                        }
+                    }
+                    // Checking / UpToDate / NoRelease / Idle never open
+                    // the dialog; if the state moved on, close it.
+                    _ => {
+                        close = true;
+                    }
+                }
+            });
+        if close {
+            if let Ok(mut u) = self.update_status.lock() {
+                u.dialog = false;
+                u.state = UpdateState::Idle;
+            }
+        }
     }
 }
 
