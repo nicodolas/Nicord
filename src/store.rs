@@ -1,5 +1,5 @@
 //! Local storage (Spec §9, §10): SQLite for scenarios + logs,
-//! JSON for the app config (license key, encrypted token, settings).
+//! JSON for the app config (encrypted token, settings).
 //! Nothing here is ever uploaded anywhere.
 
 use crate::scenario::Scenario;
@@ -10,9 +10,6 @@ use std::{path::PathBuf, sync::Mutex};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppConfig {
-    /// License key as entered (only the key, never the token in one field).
-    #[serde(default)]
-    pub license_key: String,
     /// AES-256-GCM encrypted Discord token (base64), or empty.
     #[serde(default)]
     pub encrypted_token: String,
@@ -134,6 +131,8 @@ impl Store {
 
     /// Number of successful sends today (UTC date), from the persisted log.
     /// Survives restarts — the Dashboard reads this, not a memory counter.
+    /// The bucket is the UTC date, never the local date: the cap resets at
+    /// 00:00 UTC, so changing the machine timezone cannot grant extras.
     pub fn count_sends_today(&self) -> u32 {
         let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let conn = match self.db.lock() {
@@ -266,6 +265,22 @@ pub fn save_config(cfg: &AppConfig) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// Test-only: insert a 'sent' log row stamped at `created_at`
+    /// (RFC 3339), so tests can pin the clock instead of using now.
+    #[cfg(test)]
+    fn insert_send_log_at(store: &Store, created_at: &str) {
+        store
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO send_logs (scenario_id, scenario_name, channel_id, status, detail, created_at)
+                 VALUES ('t', 't', 'c', 'sent', 'test', ?1)",
+                params![created_at],
+            )
+            .unwrap();
+    }
+
     #[test]
     fn scenario_roundtrip_in_memory_store() {
         let store = Store::open_memory().unwrap();
@@ -274,5 +289,17 @@ mod tests {
         let loaded = store.load_scenarios().unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].name, "roundtrip");
+    }
+
+    #[test]
+    fn count_sends_today_uses_utc_date() {
+        let store = Store::open_memory().unwrap();
+        let today = chrono::Utc::now().date_naive();
+        let yesterday = today - chrono::Duration::days(1);
+        // A send stamped yesterday UTC must not count — even though in a
+        // far-eastern timezone (e.g. +14) it is still "today" locally.
+        insert_send_log_at(&store, &format!("{yesterday}T12:00:00+00:00"));
+        insert_send_log_at(&store, &format!("{today}T00:00:00+00:00"));
+        assert_eq!(store.count_sends_today(), 1);
     }
 }
