@@ -11,9 +11,8 @@
 //! (cap resets 00:00 UTC). No tiers.
 
 use crate::{
-    antiban::AntiBanConfig,
     crypto::{decrypt_token, encrypt_token, mask_token},
-    discord::{Channel, DiscordClient, Guild},
+    discord::{Channel, DiscordClient, DiscordError, Guild, Me},
     scenario::{Node, NodeKind, Scenario},
     scheduler::{channels_violation, Engine},
     store::{config_dir, load_config, save_config, AppConfig, Store},
@@ -49,18 +48,32 @@ pub struct NicordApp {
     pub picker_guild_id: String,
     pub log_filter: String,
     pub import_path: String,
+    /// Result of the last "Kiểm tra token" (Token Validator).
+    pub token_info: Arc<Mutex<Option<Me>>>,
+    /// System tray icon (Windows only, when enabled in Settings).
+    #[cfg(target_os = "windows")]
+    pub tray: Option<crate::tray::Tray>,
+    /// Set by the tray "Thoát" menu item: the next close is a real quit.
+    #[cfg(target_os = "windows")]
+    pub allow_quit: bool,
 }
 
 impl NicordApp {
     pub fn new(store: Arc<Store>) -> Self {
-        let config = load_config();
+        let mut config = load_config();
+        // The autostart toggle shows the real OS state, not just the
+        // last saved flag (the user may have changed it outside Nicord).
+        config.autostart = crate::autostart::is_enabled();
+        // Read before the struct literal below moves `config`.
+        #[cfg(target_os = "windows")]
+        let tray_enabled = config.tray_enabled;
         let scenarios = store.load_scenarios().unwrap_or_default();
         let screen = if !config.tos_accepted {
             Screen::Onboarding
         } else {
             Screen::Dashboard
         };
-        let engine = Arc::new(Engine::new(store.clone(), AntiBanConfig::default()));
+        let engine = Arc::new(Engine::new(store.clone(), config.antiban.clone()));
         let has_enabled = scenarios.iter().any(|s| s.enabled);
         let app = Self {
             store,
@@ -80,6 +93,15 @@ impl NicordApp {
             picker_guild_id: String::new(),
             log_filter: String::new(),
             import_path: String::new(),
+            token_info: Arc::new(Mutex::new(None)),
+            #[cfg(target_os = "windows")]
+            tray: if tray_enabled {
+                crate::tray::Tray::new()
+            } else {
+                None
+            },
+            #[cfg(target_os = "windows")]
+            allow_quit: false,
         };
         // Auto-resume: enabled scenarios keep running across restarts.
         // The engine is started here (not only from the Dashboard button)
@@ -166,6 +188,70 @@ impl NicordApp {
                 };
             }
         });
+    }
+
+    /// Token Validator (Discord-BLUE): check the stored token with
+    /// `GET /users/@me` in a background thread and show the account
+    /// (username, id, email, 2FA, Nitro). The token itself is never shown.
+    fn check_token(&self) {
+        let token = match decrypt_token(&self.config.encrypted_token) {
+            Ok(t) => t,
+            Err(e) => {
+                self.set_status(&format!("No valid token stored: {e}"));
+                return;
+            }
+        };
+        let info = self.token_info.clone();
+        let status = self.status.clone();
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    if let Ok(mut s) = status.lock() {
+                        *s = format!("cannot start runtime: {e}");
+                    }
+                    return;
+                }
+            };
+            let client = DiscordClient::new(&token);
+            match rt.block_on(client.get_me_typed()) {
+                Ok(me) => {
+                    if let Ok(mut i) = info.lock() {
+                        *i = Some(me);
+                    }
+                    if let Ok(mut s) = status.lock() {
+                        *s = "Token hợp lệ.".to_string();
+                    }
+                }
+                Err(e) => {
+                    if let Ok(mut i) = info.lock() {
+                        *i = None;
+                    }
+                    if let Ok(mut s) = status.lock() {
+                        *s = match e {
+                            DiscordError::Unauthorized(_) => {
+                                "Token không hợp lệ hoặc đã hết hạn.".to_string()
+                            }
+                            _ => format!("Không kiểm tra được token: {e}"),
+                        };
+                    }
+                }
+            }
+        });
+    }
+
+    /// Build or drop the tray icon to match the Settings toggle
+    /// (Windows only).
+    #[cfg(target_os = "windows")]
+    fn sync_tray(&mut self) {
+        if self.config.tray_enabled && self.tray.is_none() {
+            self.tray = crate::tray::Tray::new();
+            if self.tray.is_none() {
+                self.set_status("Could not create the tray icon.");
+            }
+        } else if !self.config.tray_enabled {
+            self.tray = None;
+        }
     }
 
     fn start_engine(&self) {
@@ -271,6 +357,36 @@ impl eframe::App for NicordApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // "Sent today" is the persisted count, not a memory counter.
         self.sent_today = self.store.count_sends_today();
+
+        // System tray (Windows only): closing the window hides Nicord
+        // to the tray instead of quitting; the tray menu can show it
+        // again or quit for real.
+        #[cfg(target_os = "windows")]
+        {
+            if ctx.input(|i| i.viewport().close_requested())
+                && self.tray.is_some()
+                && !self.allow_quit
+            {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            }
+            if let Some(tray) = &self.tray {
+                match tray.poll() {
+                    crate::tray::TrayAction::Show => {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    }
+                    crate::tray::TrayAction::Quit => {
+                        self.allow_quit = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    crate::tray::TrayAction::None => {}
+                }
+                // Keep polling the tray while the window is hidden:
+                // hidden windows get no repaint on their own.
+                ctx.request_repaint_after(std::time::Duration::from_millis(500));
+            }
+        }
 
         // Left sidebar: brand, navigation, today status, Emergency Stop.
         // It is on every screen, so Emergency Stop is always one click away.
@@ -570,6 +686,23 @@ impl NicordApp {
             Ok(Some(t)) => t.format("%d/%m %H:%M").to_string(),
             _ => "—".to_string(),
         };
+        // Group B stats: success rate and send rate need the session
+        // counters from the engine (failures and deletes are session-only;
+        // sent today comes from the persisted log).
+        let failed = self.engine.failed_count();
+        let deleted = self.engine.deleted_count();
+        let total = self.sent_today + failed;
+        let success_pct = if total == 0 {
+            None
+        } else {
+            Some(self.sent_today as f64 * 100.0 / total as f64)
+        };
+        let elapsed_min = self.engine.started_at.elapsed().as_secs_f64() / 60.0;
+        let rate_per_min = if elapsed_min > 0.0 {
+            self.sent_today as f64 / elapsed_min
+        } else {
+            0.0
+        };
         ui.columns(3, |cols| {
             theme::stat_card(&mut cols[0], "Scenarios", &count.to_string());
             theme::stat_card(
@@ -582,6 +715,22 @@ impl NicordApp {
                 "Sent today (limit 300)",
                 &format!("{} / 300", self.sent_today),
             );
+        });
+        ui.add_space(4.0);
+        ui.columns(3, |cols| {
+            theme::stat_card(
+                &mut cols[0],
+                "Success rate",
+                &success_pct
+                    .map(|p| format!("{p:.0}%"))
+                    .unwrap_or_else(|| "—".to_string()),
+            );
+            theme::stat_card(
+                &mut cols[1],
+                "Send rate",
+                &format!("{rate_per_min:.1}/phút"),
+            );
+            theme::stat_card(&mut cols[2], "Deleted (this session)", &deleted.to_string());
         });
         ui.add_space(4.0);
         ui.horizontal(|ui| {
@@ -611,9 +760,39 @@ impl NicordApp {
                     ui.ctx()
                         .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                 }
+                if ui.button("Export thống kê (.json)").clicked() {
+                    let stats = serde_json::json!({
+                        "sent_today": self.sent_today,
+                        "failed_this_session": failed,
+                        "deleted_this_session": deleted,
+                        "success_rate_pct": success_pct,
+                        "sends_per_min": rate_per_min,
+                        "uptime_secs": self.engine.started_at.elapsed().as_secs(),
+                        "generated_at_utc": chrono::Utc::now().to_rfc3339(),
+                    });
+                    let path = config_dir().join(format!(
+                        "nicord-stats-{}.json",
+                        chrono::Utc::now().format("%Y%m%d-%H%M%S")
+                    ));
+                    let result = serde_json::to_string_pretty(&stats)
+                        .map_err(|e| e.to_string())
+                        .and_then(|j| std::fs::write(&path, j).map_err(|e| e.to_string()));
+                    match result {
+                        Ok(()) => self.set_status(&format!("Stats exported to {}", path.display())),
+                        Err(e) => self.set_status(&format!("Export failed: {e}")),
+                    }
+                }
             });
             ui.add_space(6.0);
-            theme::muted(ui, "Note: there is no system-tray icon yet — keep the window open (minimised is fine). Closing the window stops the engine.");
+            #[cfg(target_os = "windows")]
+            let tray_note = if self.config.tray_enabled {
+                "Closing the window hides Nicord to the tray — the engine keeps running. Right-click the tray icon to quit."
+            } else {
+                "Note: enable “System tray” in Settings to hide Nicord to the tray on close. Closing the window stops the engine."
+            };
+            #[cfg(not(target_os = "windows"))]
+            let tray_note = "Note: there is no system-tray icon on this platform — keep the window open (minimised is fine). Closing the window stops the engine.";
+            theme::muted(ui, tray_note);
         });
         ui.add_space(12.0);
         // Scenario list.
@@ -1167,15 +1346,149 @@ impl NicordApp {
     }
 
     fn show_settings(&mut self, ui: &mut egui::Ui) {
+        // Token Validator (Discord-BLUE): check the stored token and
+        // show the account behind it. The token itself is never shown.
+        theme::card(ui, |ui| {
+            theme::section_title(ui, "Tài khoản");
+            ui.horizontal(|ui| {
+                if theme::primary_button(ui, "Kiểm tra token").clicked() {
+                    self.check_token();
+                }
+                theme::muted(ui, "Kiểm tra token đã lưu: tên, ID, email, 2FA, Nitro.");
+            });
+            if let Ok(info) = self.token_info.lock() {
+                if let Some(me) = info.as_ref() {
+                    ui.add_space(6.0);
+                    ui.label(format!("Tên: {} (@{})", me.display_name(), me.username));
+                    ui.label(format!(
+                        "ID: {}",
+                        if me.id.is_empty() {
+                            "—"
+                        } else {
+                            me.id.as_str()
+                        }
+                    ));
+                    ui.label(format!("Email: {}", me.email.as_deref().unwrap_or("—")));
+                    ui.label(format!(
+                        "Đã xác minh email: {}",
+                        if me.verified { "Có" } else { "Không" }
+                    ));
+                    ui.label(format!(
+                        "2FA: {}",
+                        if me.mfa_enabled { "Bật" } else { "Tắt" }
+                    ));
+                    ui.label(format!("Nitro: {}", me.nitro_label()));
+                }
+            }
+        });
+        ui.add_space(12.0);
+        // Anti-ban (Discord-BLUE): Smart Templates, Auto Typing,
+        // Auto Break, Auto Delete. Saved to config.json and applied to
+        // the running engine on Save.
+        theme::card(ui, |ui| {
+            theme::section_title(ui, "Chống ban");
+            ui.checkbox(
+                &mut self.config.antiban.smart_templates,
+                "Smart Templates: Spintax {a|b} + biến thể tin nhắn ngẫu nhiên",
+            );
+            theme::muted(
+                ui,
+                "Áp dụng sau khi thay biến {{username}}/{{server}} — tin nhắn không lặp y hệt.",
+            );
+            ui.checkbox(
+                &mut self.config.antiban.auto_typing,
+                "Auto Typing: hiện “đang gõ...” trước khi gửi",
+            );
+            ui.horizontal(|ui| {
+                ui.label("Thời gian gõ (giây):");
+                ui.add(
+                    egui::DragValue::new(&mut self.config.antiban.typing_min_sec)
+                        .range(0..=30)
+                        .speed(1),
+                );
+                ui.label("–");
+                ui.add(
+                    egui::DragValue::new(&mut self.config.antiban.typing_max_sec)
+                        .range(0..=30)
+                        .speed(1),
+                );
+            });
+            ui.checkbox(
+                &mut self.config.antiban.auto_break,
+                "Auto Break: nghỉ dài định kỳ sau một số tin",
+            );
+            ui.horizontal(|ui| {
+                ui.label("Nghỉ sau (tin):");
+                ui.add(
+                    egui::DragValue::new(&mut self.config.antiban.break_after_min)
+                        .range(1..=500)
+                        .speed(1),
+                );
+                ui.label("–");
+                ui.add(
+                    egui::DragValue::new(&mut self.config.antiban.break_after_max)
+                        .range(1..=500)
+                        .speed(1),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("Nghỉ trong (phút):");
+                ui.add(
+                    egui::DragValue::new(&mut self.config.antiban.break_duration_min)
+                        .range(1..=180)
+                        .speed(1),
+                );
+                ui.label("–");
+                ui.add(
+                    egui::DragValue::new(&mut self.config.antiban.break_duration_max)
+                        .range(1..=180)
+                        .speed(1),
+                );
+            });
+            ui.checkbox(
+                &mut self.config.antiban.auto_delete,
+                "Auto Delete: tự xóa tin sau khi gửi",
+            );
+            ui.horizontal(|ui| {
+                ui.label("Xóa sau (ms, 0 = ngay lập tức):");
+                ui.add(
+                    egui::DragValue::new(&mut self.config.antiban.delete_delay_ms)
+                        .range(0..=3_600_000)
+                        .speed(100),
+                );
+            });
+            theme::muted(
+                ui,
+                "Auto Delete chỉ xóa tin Nicord vừa gửi, không xóa tin cũ.",
+            );
+        });
+        ui.add_space(12.0);
         theme::card(ui, |ui| {
             theme::section_title(ui, "Limits");
             ui.label("Limits: 1 channel • 300 messages/day (resets 00:00 UTC)");
             ui.checkbox(&mut self.config.autostart, "Start with the computer");
-            theme::muted(ui, "Note: autostart is saved here, but the OS hook is not wired yet — enable Nicord in your OS startup apps after the first run (see README). There is no system-tray icon yet: keep the window open (minimised is fine); closing the window stops the engine.");
+            #[cfg(target_os = "windows")]
+            ui.checkbox(
+                &mut self.config.tray_enabled,
+                "Thu nhỏ xuống khay hệ thống khi đóng cửa sổ (X)",
+            );
+            #[cfg(not(target_os = "windows"))]
+            theme::muted(ui, "System tray: chỉ có trên Windows.");
+            theme::muted(ui, "Khởi động cùng máy được ghi thật vào hệ thống (Windows Run / Linux autostart). Khi bật khay hệ thống, đóng cửa sổ sẽ ẩn Nicord xuống khay thay vì thoát — bấm chuột phải vào icon khay để thoát hẳn.");
             ui.add_space(8.0);
             if theme::primary_button(ui, "Save settings").clicked() {
                 let _ = save_config(&self.config);
-                self.set_status("Settings saved.");
+                // Live-apply the anti-ban settings to the running engine.
+                self.engine.set_antiban(self.config.antiban.clone());
+                // Apply the real OS autostart hook.
+                match crate::autostart::set_enabled(self.config.autostart) {
+                    Ok(()) => self.set_status("Settings saved."),
+                    Err(e) => {
+                        self.set_status(&format!("Settings saved, but autostart failed: {e}"))
+                    }
+                }
+                #[cfg(target_os = "windows")]
+                self.sync_tray();
             }
         });
         ui.add_space(12.0);
