@@ -13,7 +13,10 @@ eframe = { version = "0.31", default-features = false, features = ["glow", "defa
 egui = "0.31"
 # Async + HTTP (Discord REST only; no gateway needed for scheduled sending)
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+# Auto-update: extract the release zip (Deflate, as produced by
+# Compress-Archive in the release workflow). Pure Rust, no system deps.
+zip = "2"
 # Minimal gateway client (slash commands only): wss with rustls, same
 # TLS stack as reqwest — no OpenSSL/native-tls system deps on Windows.
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
