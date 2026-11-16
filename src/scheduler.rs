@@ -12,11 +12,10 @@
 use crate::{
     antiban::{sanitize_content, AntiBanConfig},
     discord::{DiscordClient, DiscordError},
-    license::Plan,
     scenario::{due_time, render_template_with_vars, spin_text, Scenario, Schedule},
     store::Store,
 };
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Local, NaiveDate, Utc};
 use rand::{rngs::StdRng, SeedableRng};
 use std::{
     collections::HashMap,
@@ -37,12 +36,9 @@ pub struct SendLogEntry {
     pub detail: String,
 }
 
-/// Free-plan rule: at most 1 distinct channel across all *enabled*
+/// Single-product rule: at most 1 distinct channel across all *enabled*
 /// scenarios. Returns the offending description, if any.
-pub fn free_channels_violation(scenarios: &[Scenario], plan: Plan) -> Option<String> {
-    if plan != Plan::Free {
-        return None;
-    }
+pub fn channels_violation(scenarios: &[Scenario]) -> Option<String> {
     let mut channels: Vec<&str> = scenarios
         .iter()
         .filter(|s| s.enabled)
@@ -53,12 +49,20 @@ pub fn free_channels_violation(scenarios: &[Scenario], plan: Plan) -> Option<Str
     channels.dedup();
     if channels.len() > 1 {
         Some(format!(
-            "Free plan allows 1 channel, but enabled scenarios use {} distinct channels",
+            "Nicord allows 1 channel, but enabled scenarios use {} distinct channels",
             channels.len()
         ))
     } else {
         None
     }
+}
+
+/// Has the UTC-day bucket rolled over since `last_day`?
+/// Pure over its inputs: callers pass a UTC instant, so the result never
+/// depends on the machine timezone. In particular, local midnight does
+/// NOT reset the daily cap — only 00:00 UTC does.
+pub fn utc_day_rolled_over(last_day: NaiveDate, now_utc: DateTime<Utc>) -> bool {
+    last_day != now_utc.date_naive()
 }
 
 pub struct Engine {
@@ -70,15 +74,12 @@ pub struct Engine {
     last_msg_index: Mutex<HashMap<String, usize>>,
     /// Messages sent today per account (daily cap). Initialised from the
     /// persisted send log, so a restart does not reset the count.
+    /// The bucket is the UTC date (`last_day`): the cap resets at 00:00
+    /// UTC, never at local midnight.
     sent_today: Mutex<u32>,
     last_day: Mutex<chrono::NaiveDate>,
     pub emergency_stop: Arc<AtomicBool>,
     pub running: Arc<AtomicBool>,
-    /// Plan cap (Free 100, Pro/Team 1000). Set from the license plan.
-    /// Plain std Mutex: read once per tick / per send, never held across
-    /// an await, so the UI thread can also update it synchronously.
-    plan_daily_cap: std::sync::Mutex<u32>,
-    plan: std::sync::Mutex<Plan>,
     /// Real identity for template vars, fetched once at engine start
     /// (`get_me` + first guild). Falls back to ("you", "server") only
     /// when that call fails, and the failure is logged.
@@ -95,27 +96,12 @@ impl Engine {
             last_sent: Mutex::new(HashMap::new()),
             last_msg_index: Mutex::new(HashMap::new()),
             sent_today: Mutex::new(sent),
-            last_day: Mutex::new(Local::now().date_naive()),
+            last_day: Mutex::new(Utc::now().date_naive()),
             emergency_stop: Arc::new(AtomicBool::new(false)),
             running: Arc::new(AtomicBool::new(false)),
-            plan_daily_cap: std::sync::Mutex::new(Plan::Free.daily_cap()),
-            plan: std::sync::Mutex::new(Plan::Free),
             identity: Mutex::new(("you".to_string(), "server".to_string())),
             identity_last_try: Mutex::new(None),
         }
-    }
-
-    pub fn set_plan(&self, plan: Plan) {
-        if let Ok(mut c) = self.plan_daily_cap.lock() {
-            *c = plan.daily_cap();
-        }
-        if let Ok(mut p) = self.plan.lock() {
-            *p = plan;
-        }
-    }
-
-    pub fn current_plan(&self) -> Plan {
-        self.plan.lock().map(|p| *p).unwrap_or(Plan::Free)
     }
 
     pub fn stop_all(&self) {
@@ -214,30 +200,29 @@ impl Engine {
         if let Err(e) = scenario.check_time_windows(Local::now()) {
             return Err(format!("skip: {e}"));
         }
-        // Daily cap: plan cap with warm-up, additionally capped by the
+        // Daily cap: 300/day with warm-up, additionally capped by the
         // per-scenario limit when one is set (0 = no per-scenario limit).
         // The persisted send count is the source of truth for "sent today".
         {
-            let today = Local::now().date_naive();
+            // The bucket is the UTC date: the cap resets at 00:00 UTC,
+            // never at local midnight, so changing the machine timezone
+            // cannot grant extra messages.
+            let now_utc = Utc::now();
             let mut day = self.last_day.lock().await;
-            if *day != today {
-                *day = today;
+            if utc_day_rolled_over(*day, now_utc) {
+                *day = now_utc.date_naive();
                 *self.sent_today.lock().await = self.store.count_sends_today();
             }
             let sent = *self.sent_today.lock().await;
-            let base_cap = self
-                .plan_daily_cap
-                .lock()
-                .map(|c| *c)
-                .unwrap_or(Plan::Free.daily_cap());
+            let base_cap = self.antiban.daily_cap;
             let age = self.store.account_age_days();
-            let plan_eff = self.antiban.effective_daily_cap(base_cap, age);
+            let account_eff = self.antiban.effective_daily_cap(base_cap, age);
             let scenario_cap = if scenario.limits.daily_cap == 0 {
                 u32::MAX
             } else {
                 scenario.limits.daily_cap
             };
-            let eff = plan_eff.min(scenario_cap);
+            let eff = account_eff.min(scenario_cap);
             if sent >= eff {
                 return Err(format!(
                     "skip: daily cap reached ({sent}/{eff}, warm-up age {age}d)"
@@ -362,17 +347,12 @@ impl Engine {
         while self.running.load(Ordering::SeqCst) && !self.emergency_stop.load(Ordering::SeqCst) {
             let now = Local::now();
             let scenarios = scenarios_fn();
-            // Free plan: only the first distinct channel may send.
-            let plan = self.current_plan();
-            let allowed_channel: Option<String> = if plan == Plan::Free {
-                scenarios
-                    .iter()
-                    .filter(|s| s.enabled && !s.channel_id.is_empty())
-                    .map(|s| s.channel_id.clone())
-                    .min()
-            } else {
-                None
-            };
+            // Only the first distinct channel may send.
+            let allowed_channel: Option<String> = scenarios
+                .iter()
+                .filter(|s| s.enabled && !s.channel_id.is_empty())
+                .map(|s| s.channel_id.clone())
+                .min();
             for mut scenario in scenarios.into_iter().filter(|s| s.enabled) {
                 // Initialise creation time once, and reset last-run when
                 // the schedule itself was edited.
@@ -398,15 +378,15 @@ impl Engine {
                 let Some(schedule) = scenario.schedule.clone() else {
                     continue;
                 };
-                if plan == Plan::Free {
-                    if let Some(allowed) = &allowed_channel {
-                        if &scenario.channel_id != allowed {
-                            tracing::warn!(
-                                "Free plan: scenario {} uses channel {} but only {} may send — skipped",
-                                scenario.name, scenario.channel_id, allowed
-                            );
-                            continue;
-                        }
+                if let Some(allowed) = &allowed_channel {
+                    if &scenario.channel_id != allowed {
+                        tracing::warn!(
+                            "scenario {} uses channel {} but only {} may send — skipped",
+                            scenario.name,
+                            scenario.channel_id,
+                            allowed
+                        );
+                        continue;
                     }
                 }
                 let Some(due) = due_time(
@@ -473,5 +453,56 @@ impl Engine {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
         self.running.store(false, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    /// Build a UTC instant (never via Local wall-clock: these tests must
+    /// pass under any machine timezone).
+    fn utc(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap()
+    }
+
+    #[test]
+    fn cap_resets_at_utc_midnight_not_local_midnight() {
+        let last_day = NaiveDate::from_ymd_opt(2026, 11, 16).unwrap();
+        // 23:30 UTC on 16 Nov is already 06:30 on 17 Nov in +07 — the
+        // local day has rolled over, but the UTC day has not: no reset.
+        assert!(!utc_day_rolled_over(last_day, utc(2026, 11, 16, 23, 30)));
+        // 17:00 UTC on 16 Nov is exactly 00:00 on 17 Nov in +07 (local
+        // midnight) — still the same UTC day: no reset.
+        assert!(!utc_day_rolled_over(last_day, utc(2026, 11, 16, 17, 0)));
+        // 00:30 UTC on 17 Nov: the UTC day rolled over — reset.
+        assert!(utc_day_rolled_over(last_day, utc(2026, 11, 17, 0, 30)));
+        // Same UTC day, midday: no reset.
+        assert!(!utc_day_rolled_over(last_day, utc(2026, 11, 16, 12, 0)));
+        // A new UTC day also resets after a local midnight in -05
+        // (05:00 UTC is 00:00 in -05, still the same UTC day: no reset).
+        assert!(!utc_day_rolled_over(last_day, utc(2026, 11, 16, 5, 0)));
+    }
+
+    #[test]
+    fn one_distinct_channel_enforced() {
+        let mut a = Scenario::new("a");
+        a.enabled = true;
+        a.channel_id = "111".to_string();
+        let mut b = Scenario::new("b");
+        b.enabled = true;
+        b.channel_id = "222".to_string();
+        assert!(channels_violation(&[a.clone(), b.clone()]).is_some());
+        // Same channel is fine.
+        b.channel_id = "111".to_string();
+        assert!(channels_violation(&[a.clone(), b.clone()]).is_none());
+        // Disabled scenarios don't count.
+        b.enabled = false;
+        b.channel_id = "222".to_string();
+        assert!(channels_violation(&[a.clone(), b.clone()]).is_none());
+        // Empty channel ids don't count.
+        let c = Scenario::new("c");
+        assert!(channels_violation(&[a, c]).is_none());
     }
 }
