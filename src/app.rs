@@ -13,7 +13,10 @@
 use crate::{
     crypto::{decrypt_token, encrypt_token, mask_token},
     discord::{Channel, DiscordClient, DiscordError, Guild, Me},
-    scenario::{Node, NodeKind, Scenario},
+    scenario::{
+        slash_option_kind_label, CommandConfig, Node, NodeKind, Scenario, SlashOption,
+        SLASH_OPTION_KINDS,
+    },
     scheduler::{channels_violation, Engine},
     store::{config_dir, load_config, save_config, AppConfig, Store},
     theme,
@@ -42,6 +45,9 @@ pub struct NicordApp {
     pub new_scenario_name: String,
     pub new_message: String,
     pub selected: Option<usize>,
+    /// Builder: node selected for editing (command nodes have an
+    /// editor panel; other kinds show no editor yet).
+    pub selected_node: Option<String>,
     pub sent_today: u32,
     pub guilds: Arc<Mutex<Vec<Guild>>>,
     pub channels: Arc<Mutex<Vec<Channel>>>,
@@ -87,6 +93,7 @@ impl NicordApp {
             new_scenario_name: String::new(),
             new_message: String::new(),
             selected: None,
+            selected_node: None,
             sent_today: 0,
             guilds: Arc::new(Mutex::new(Vec::new())),
             channels: Arc::new(Mutex::new(Vec::new())),
@@ -236,6 +243,74 @@ impl NicordApp {
                         };
                     }
                 }
+            }
+        });
+    }
+
+    /// Send one command node once, right now (Builder "Test lệnh").
+    /// Builds a minimal scenario (trigger + that command node only)
+    /// and runs it through the normal send pipeline (daily cap, slot,
+    /// typing for prefix; gateway + interaction for slash).
+    fn test_command(&self, i: usize, node_id: &str) {
+        let token = match decrypt_token(&self.config.encrypted_token) {
+            Ok(t) => t,
+            Err(e) => {
+                self.set_status(&format!("No valid token stored: {e}"));
+                return;
+            }
+        };
+        let (scenario, name) = {
+            let Ok(list) = self.scenarios.lock() else {
+                self.set_status("Cannot read scenarios.");
+                return;
+            };
+            let Some(s) = list.get(i) else {
+                self.set_status("No scenario selected.");
+                return;
+            };
+            let Some(n) = s.nodes.iter().find(|n| n.id == node_id).cloned() else {
+                self.set_status("Node not found.");
+                return;
+            };
+            let display = CommandConfig::from_node(&n).display_name();
+            let mut test = s.clone();
+            test.nodes = vec![Node::new(NodeKind::TriggerSchedule), n];
+            test.enabled = true;
+            (test, display)
+        };
+        let engine = self.engine.clone();
+        let status = self.status.clone();
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    if let Ok(mut s) = status.lock() {
+                        *s = format!("cannot start runtime: {e}");
+                    }
+                    return;
+                }
+            };
+            let client = DiscordClient::new(&token);
+            let (username, server_name) = rt.block_on(async {
+                let u = client
+                    .get_me_typed()
+                    .await
+                    .map(|m| m.display_name())
+                    .unwrap_or_else(|_| "you".to_string());
+                let s = client
+                    .list_guilds()
+                    .await
+                    .ok()
+                    .and_then(|g| g.first().map(|x| x.name.clone()))
+                    .unwrap_or_else(|| "server".to_string());
+                (u, s)
+            });
+            let result = rt.block_on(engine.send_once(&scenario, &client, &username, &server_name));
+            if let Ok(mut s) = status.lock() {
+                *s = match result {
+                    Ok(id) => format!("Lệnh {name} đã gửi! ({id})"),
+                    Err(e) => format!("Test lệnh thất bại: {e}"),
+                };
             }
         });
     }
@@ -1030,7 +1105,8 @@ impl NicordApp {
     fn show_builder_editor(&mut self, ui: &mut egui::Ui, i: usize) {
         let mut channel_id = String::new();
         let mut messages: Vec<String> = Vec::new();
-        let mut nodes: Vec<(NodeKind, String)> = Vec::new();
+        // (kind, id, command display name — "" for non-command nodes).
+        let mut nodes: Vec<(NodeKind, String, String)> = Vec::new();
         if let Ok(list) = self.scenarios.lock() {
             if let Some(s) = list.get(i) {
                 channel_id = s.channel_id.clone();
@@ -1038,7 +1114,14 @@ impl NicordApp {
                 nodes = s
                     .nodes
                     .iter()
-                    .map(|n| (n.kind.clone(), n.id.clone()))
+                    .map(|n| {
+                        let cmd = if n.kind == NodeKind::ActionSendCommand {
+                            CommandConfig::from_node(n).display_name()
+                        } else {
+                            String::new()
+                        };
+                        (n.kind.clone(), n.id.clone(), cmd)
+                    })
                     .collect();
             }
         }
@@ -1136,10 +1219,21 @@ impl NicordApp {
                     self.save_scenarios();
                 }
             });
-            ui.label("Nodes (in order):");
-            for (kind, _id) in &nodes {
-                ui.label(format!("• {} — {}", kind.group(), kind.label()));
+            ui.label("Nodes (in order — click a command node to edit it):");
+            for (kind, id, cmd_name) in &nodes {
+                let label = if kind == &NodeKind::ActionSendCommand {
+                    format!("• {} — Lệnh: {cmd_name}", kind.group())
+                } else {
+                    format!("• {} — {}", kind.group(), kind.label())
+                };
+                if ui
+                    .selectable_label(self.selected_node.as_deref() == Some(id.as_str()), label)
+                    .clicked()
+                {
+                    self.selected_node = Some(id.clone());
+                }
             }
+            self.show_command_editor(ui, i);
             // Node buttons + Validate + Export/Import live in the pinned
             // action bar below the editor (show_builder_actions), so they
             // are always visible without scrolling.
@@ -1160,6 +1254,155 @@ impl NicordApp {
                 }
             }
         });
+    }
+
+    /// Editor panel for the selected `ActionSendCommand` node: kind,
+    /// name, prefix/args or slash application/options, plus a Test
+    /// button. Reads the node config into a local `CommandConfig`,
+    /// edits it, and writes it back when changed (same pattern as
+    /// channel_id above).
+    fn show_command_editor(&mut self, ui: &mut egui::Ui, i: usize) {
+        let Some(sel_id) = self.selected_node.clone() else {
+            return;
+        };
+        let mut cfg_opt: Option<CommandConfig> = None;
+        if let Ok(list) = self.scenarios.lock() {
+            if let Some(s) = list.get(i) {
+                if let Some(n) = s.nodes.iter().find(|n| n.id == sel_id) {
+                    if n.kind == NodeKind::ActionSendCommand {
+                        cfg_opt = Some(CommandConfig::from_node(n));
+                    }
+                }
+            }
+        }
+        let Some(mut cfg) = cfg_opt else {
+            return;
+        };
+        ui.separator();
+        theme::section_title(ui, "Lệnh Discord");
+        let mut is_slash = cfg.is_slash();
+        egui::ComboBox::from_label("Loại lệnh")
+            .selected_text(if is_slash {
+                "Slash (/daily)"
+            } else {
+                "Lệnh thường (!rank)"
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut is_slash, false, "Lệnh thường (!rank)");
+                ui.selectable_value(&mut is_slash, true, "Slash (/daily)");
+            });
+        cfg.kind = if is_slash {
+            "slash".to_string()
+        } else {
+            "prefix".to_string()
+        };
+        ui.horizontal(|ui| {
+            ui.label("Tên lệnh:");
+            ui.add(egui::TextEdit::singleline(&mut cfg.name).hint_text("vd: daily, rank"));
+        });
+        if is_slash {
+            ui.horizontal(|ui| {
+                ui.label("Application ID:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut cfg.application_id)
+                        .hint_text("ID của bot (bắt buộc)"),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("Command ID:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut cfg.command_id).hint_text("để trống để tự tìm"),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("Version:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut cfg.version).hint_text("để trống để tự tìm"),
+                );
+            });
+            ui.label("Tham số (options):");
+            let mut opt_remove: Option<usize> = None;
+            for (oi, opt) in cfg.options.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut opt.name)
+                            .hint_text("tên")
+                            .desired_width(90.0),
+                    );
+                    let mut kind = opt.kind;
+                    egui::ComboBox::from_id_salt(format!("cmd_opt_kind_{oi}"))
+                        .selected_text(slash_option_kind_label(kind))
+                        .show_ui(ui, |ui| {
+                            for (k, label) in SLASH_OPTION_KINDS {
+                                ui.selectable_value(&mut kind, *k, *label);
+                            }
+                        });
+                    opt.kind = kind;
+                    ui.add(
+                        egui::TextEdit::singleline(&mut opt.value)
+                            .hint_text("giá trị")
+                            .desired_width(110.0),
+                    );
+                    if ui.button("✕").clicked() {
+                        opt_remove = Some(oi);
+                    }
+                });
+            }
+            if let Some(oi) = opt_remove {
+                cfg.options.remove(oi);
+            }
+            if ui.button("+ Thêm tham số").clicked() {
+                cfg.options.push(SlashOption::default());
+            }
+            theme::muted(
+                ui,
+                "Lệnh slash cần Application ID của bot. Command ID để trống sẽ tự tìm theo tên; nếu không tìm được, hãy dán ID thủ công. Chỉ lệnh đầu tiên trong kịch bản được chạy mỗi lần.",
+            );
+        } else {
+            ui.horizontal(|ui| {
+                ui.label("Tiền tố:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut cfg.prefix)
+                        .hint_text("!")
+                        .desired_width(40.0),
+                );
+            });
+            ui.label("Tham số (args):");
+            let mut arg_remove: Option<usize> = None;
+            for (ai, arg) in cfg.args.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.add(egui::TextEdit::singleline(arg).hint_text("tham số"));
+                    if ui.button("✕").clicked() {
+                        arg_remove = Some(ai);
+                    }
+                });
+            }
+            if let Some(ai) = arg_remove {
+                cfg.args.remove(ai);
+            }
+            if ui.button("+ Thêm tham số").clicked() {
+                cfg.args.push(String::new());
+            }
+            ui.label(format!("Xem trước: {}", cfg.compose_prefix()));
+        }
+        ui.horizontal(|ui| {
+            if theme::primary_button(ui, "Test lệnh").clicked() {
+                self.test_command(i, &sel_id);
+            }
+            theme::muted(ui, "Gửi thử lệnh này một lần ngay bây giờ.");
+        });
+        // Write back when changed (same pattern as channel_id).
+        if let Ok(mut list) = self.scenarios.lock() {
+            if let Some(s) = list.get_mut(i) {
+                if let Some(n) = s.nodes.iter_mut().find(|n| n.id == sel_id) {
+                    let new_cfg = serde_json::to_value(&cfg).unwrap_or_default();
+                    if n.config != new_cfg {
+                        n.config = new_cfg;
+                        let _ = self.store.save_scenario(s);
+                    }
+                }
+            }
+        }
     }
 
     /// Pinned action bar under the Builder editor: Validate, node
@@ -1189,6 +1432,14 @@ impl NicordApp {
                     if let Ok(mut list) = self.scenarios.lock() {
                         if let Some(s) = list.get_mut(i) {
                             s.nodes.push(Node::new(NodeKind::ActionSendMessage));
+                        }
+                    }
+                    self.save_scenarios();
+                }
+                if ui.button("+ Send Command").clicked() {
+                    if let Ok(mut list) = self.scenarios.lock() {
+                        if let Some(s) = list.get_mut(i) {
+                            s.nodes.push(Node::new(NodeKind::ActionSendCommand));
                         }
                     }
                     self.save_scenarios();
