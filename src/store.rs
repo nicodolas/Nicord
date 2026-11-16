@@ -2,6 +2,7 @@
 //! JSON for the app config (encrypted token, settings).
 //! Nothing here is ever uploaded anywhere.
 
+use crate::antiban::AntiBanConfig;
 use crate::scenario::Scenario;
 use crate::scheduler::SendLogEntry;
 use rusqlite::{params, Connection};
@@ -21,6 +22,14 @@ pub struct AppConfig {
     pub autostart: bool,
     #[serde(default)]
     pub active_scenario_id: Option<String>,
+    /// Anti-ban settings (Smart Templates, Auto Typing, Auto Break,
+    /// Auto Delete). Missing in old config.json files → defaults.
+    #[serde(default)]
+    pub antiban: AntiBanConfig,
+    /// Minimise to the system tray instead of quitting (Windows only;
+    /// the checkbox is disabled on other platforms).
+    #[serde(default)]
+    pub tray_enabled: bool,
 }
 
 fn default_true() -> bool {
