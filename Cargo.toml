@@ -1,6 +1,6 @@
 [package]
 name = "nicord"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Nicord — desktop Discord auto-sender using your own account. Local-first, no login."
 license = "MIT"
