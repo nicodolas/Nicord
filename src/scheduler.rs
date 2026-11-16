@@ -12,7 +12,8 @@
 use crate::{
     antiban::{sanitize_content, AntiBanConfig},
     discord::{DiscordClient, DiscordError},
-    scenario::{due_time, render_template_with_vars, spin_text, Scenario, Schedule},
+    scenario::{due_time, render_template_with_vars, Scenario, Schedule},
+    spintax::{apply_spintax, vary_message},
     store::Store,
 };
 use chrono::{DateTime, Local, NaiveDate, Utc};
@@ -65,9 +66,20 @@ pub fn utc_day_rolled_over(last_day: NaiveDate, now_utc: DateTime<Utc>) -> bool 
     last_day != now_utc.date_naive()
 }
 
+/// Auto Break state: sends since the last break and the send count
+/// that triggers the next one (drawn fresh after every break).
+#[derive(Debug, Clone, Copy)]
+struct BreakState {
+    sent_since_break: u32,
+    next_break_at: u32,
+}
+
 pub struct Engine {
     pub store: Arc<Store>,
-    pub antiban: AntiBanConfig,
+    /// Anti-ban settings, live-editable from Settings: the UI writes a
+    /// new config while the engine reads a clone per send, so a toggle
+    /// takes effect without restarting the engine.
+    pub antiban: std::sync::RwLock<AntiBanConfig>,
     /// Last send time per channel (enforces the per-channel interval).
     last_sent: Mutex<HashMap<String, Instant>>,
     /// Last message index sent per scenario (rotation never repeats).
@@ -85,6 +97,15 @@ pub struct Engine {
     /// when that call fails, and the failure is logged.
     identity: Mutex<(String, String)>,
     identity_last_try: Mutex<Option<Instant>>,
+    /// Auto Break progress (Discord-BLUE).
+    break_state: Mutex<BreakState>,
+    /// Failed sends this session (dashboard success rate). Skips
+    /// ("skip: ...") are not failures and are never counted here.
+    failed_today: std::sync::Mutex<u32>,
+    /// Messages deleted by Auto Delete this session.
+    deleted_today: std::sync::Mutex<u32>,
+    /// When this engine was created (dashboard send rate / uptime).
+    pub started_at: Instant,
 }
 
 impl Engine {
@@ -92,7 +113,7 @@ impl Engine {
         let sent = store.count_sends_today();
         Self {
             store,
-            antiban,
+            antiban: std::sync::RwLock::new(antiban),
             last_sent: Mutex::new(HashMap::new()),
             last_msg_index: Mutex::new(HashMap::new()),
             sent_today: Mutex::new(sent),
@@ -101,6 +122,56 @@ impl Engine {
             running: Arc::new(AtomicBool::new(false)),
             identity: Mutex::new(("you".to_string(), "server".to_string())),
             identity_last_try: Mutex::new(None),
+            break_state: Mutex::new(BreakState {
+                sent_since_break: 0,
+                next_break_at: 0,
+            }),
+            failed_today: std::sync::Mutex::new(0),
+            deleted_today: std::sync::Mutex::new(0),
+            started_at: Instant::now(),
+        }
+    }
+
+    /// Current anti-ban config (clone, so the engine never holds the
+    /// lock across an await).
+    pub fn antiban(&self) -> AntiBanConfig {
+        self.antiban.read().map(|c| c.clone()).unwrap_or_default()
+    }
+
+    /// Replace the anti-ban config live (Settings Save). Takes effect
+    /// on the next send — no engine restart needed.
+    pub fn set_antiban(&self, cfg: AntiBanConfig) {
+        if let Ok(mut c) = self.antiban.write() {
+            *c = cfg;
+        }
+    }
+
+    /// Failed sends this session (dashboard).
+    pub fn failed_count(&self) -> u32 {
+        self.failed_today.lock().map(|c| *c).unwrap_or(0)
+    }
+
+    /// Messages deleted by Auto Delete this session (dashboard).
+    pub fn deleted_count(&self) -> u32 {
+        self.deleted_today.lock().map(|c| *c).unwrap_or(0)
+    }
+
+    /// Sleep that aborts early when Emergency Stop is pressed.
+    /// Returns true when the sleep was interrupted.
+    async fn sleep_interruptible(&self, dur: Duration) -> bool {
+        if dur.is_zero() {
+            return self.emergency_stop.load(Ordering::SeqCst);
+        }
+        let deadline = Instant::now() + dur;
+        loop {
+            if self.emergency_stop.load(Ordering::SeqCst) {
+                return true;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            tokio::time::sleep(left.min(Duration::from_millis(200))).await;
         }
     }
 
@@ -155,9 +226,10 @@ impl Engine {
 
     /// Wait until the per-channel interval + jitter has elapsed.
     async fn wait_for_slot(&self, channel_id: &str) {
-        let interval = Duration::from_secs(self.antiban.effective_interval_secs());
+        let antiban = self.antiban();
+        let interval = Duration::from_secs(antiban.effective_interval_secs());
         let mut rng = StdRng::from_os_rng();
-        let jitter = Duration::from_secs(self.antiban.jitter_secs(&mut rng));
+        let jitter = Duration::from_secs(antiban.jitter_secs(&mut rng));
         let wait = {
             let mut last = self.last_sent.lock().await;
             let now = Instant::now();
@@ -189,8 +261,11 @@ impl Engine {
         if self.emergency_stop.load(Ordering::SeqCst) {
             return Err("emergency stop is active".into());
         }
+        // Live anti-ban config for this send (Settings edits apply
+        // without restarting the engine).
+        let antiban = self.antiban();
         // Layer 5: sleep window.
-        if self.antiban.in_sleep_window(Local::now()) {
+        if antiban.in_sleep_window(Local::now()) {
             return Err("skip: inside night sleep window".into());
         }
         scenario
@@ -214,9 +289,9 @@ impl Engine {
                 *self.sent_today.lock().await = self.store.count_sends_today();
             }
             let sent = *self.sent_today.lock().await;
-            let base_cap = self.antiban.daily_cap;
+            let base_cap = antiban.daily_cap;
             let age = self.store.account_age_days();
-            let account_eff = self.antiban.effective_daily_cap(base_cap, age);
+            let account_eff = antiban.effective_daily_cap(base_cap, age);
             let scenario_cap = if scenario.limits.daily_cap == 0 {
                 u32::MAX
             } else {
@@ -248,7 +323,6 @@ impl Engine {
                 .insert(scenario.id.clone(), idx);
             msg
         };
-        let spun = spin_text(&raw, &mut rng);
         let mut vars: HashMap<String, String> = scenario
             .variables
             .iter()
@@ -256,9 +330,17 @@ impl Engine {
             .collect();
         vars.extend(scenario.set_variable_overrides());
         let rendered =
-            render_template_with_vars(&spun, username, server_name, &scenario.channel_id, &vars);
+            render_template_with_vars(&raw, username, server_name, &scenario.channel_id, &vars);
+        // Smart Templates (Discord-BLUE): Spintax + variation are applied
+        // AFTER template vars are resolved — so `{{username}}` is never
+        // mangled — and only when the toggle is on.
+        let final_text = if antiban.smart_templates {
+            vary_message(&apply_spintax(&rendered, &mut rng), &mut rng)
+        } else {
+            rendered
+        };
         // Layer 4: content checks.
-        let (clean, warnings) = sanitize_content(&rendered, &self.antiban);
+        let (clean, warnings) = sanitize_content(&final_text, &antiban);
         for w in &warnings {
             tracing::warn!("anti-ban: {w}");
         }
@@ -277,6 +359,16 @@ impl Engine {
             return Err("emergency stop pressed while waiting".into());
         }
 
+        // Auto Typing (Discord-BLUE): show "typing..." for a random
+        // 2–5s before sending. A typing failure never blocks the send.
+        if antiban.auto_typing {
+            let _ = client.send_typing(&scenario.channel_id).await;
+            let typing = Duration::from_secs(antiban.typing_secs(&mut rng));
+            if self.sleep_interruptible(typing).await {
+                return Err("emergency stop pressed while typing".into());
+            }
+        }
+
         // Retry: network errors up to 3x with backoff; 429 waits retry_after;
         // 401/403 stop immediately (Spec §6).
         let mut attempt = 0;
@@ -293,6 +385,64 @@ impl Engine {
                         detail: format!("message {}", sent.id),
                     };
                     let _ = self.store.log_send(&entry);
+                    // Auto Delete (Discord-BLUE): delete the message after
+                    // the configured delay. A delete failure is only
+                    // logged — the send already succeeded.
+                    if antiban.auto_delete {
+                        if self
+                            .sleep_interruptible(Duration::from_millis(antiban.delete_delay_ms))
+                            .await
+                        {
+                            return Err("emergency stop pressed while waiting to delete".into());
+                        }
+                        match client.delete_message(&scenario.channel_id, &sent.id).await {
+                            Ok(()) => {
+                                if let Ok(mut d) = self.deleted_today.lock() {
+                                    *d += 1;
+                                }
+                                let _ = self.store.log_send(&SendLogEntry {
+                                    scenario_id: scenario.id.clone(),
+                                    scenario_name: scenario.name.clone(),
+                                    channel_id: scenario.channel_id.clone(),
+                                    status: "deleted".into(),
+                                    detail: format!("deleted message {}", sent.id),
+                                });
+                            }
+                            Err(e) => {
+                                tracing::warn!("auto-delete failed for {}: {e}", sent.id);
+                            }
+                        }
+                    }
+                    // Auto Break (Discord-BLUE): after a random 15–25
+                    // sends, rest for a random 10–30 minutes.
+                    if antiban.auto_break {
+                        let break_sleep = {
+                            let mut st = self.break_state.lock().await;
+                            if st.next_break_at == 0 {
+                                st.next_break_at = antiban.break_after_target(&mut rng);
+                            }
+                            st.sent_since_break += 1;
+                            if st.sent_since_break >= st.next_break_at {
+                                let reached = st.next_break_at;
+                                let dur = antiban.break_duration_secs(&mut rng);
+                                st.sent_since_break = 0;
+                                st.next_break_at = antiban.break_after_target(&mut rng);
+                                Some((reached, Duration::from_secs(dur)))
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some((reached, d)) = break_sleep {
+                            tracing::info!(
+                                "auto-break: resting {} minutes after {} sends",
+                                d.as_secs() / 60,
+                                reached
+                            );
+                            if self.sleep_interruptible(d).await {
+                                return Err("emergency stop pressed during auto-break".into());
+                            }
+                        }
+                    }
                     return Ok(sent.id);
                 }
                 Err(DiscordError::RateLimited {
@@ -307,16 +457,25 @@ impl Engine {
                         tokio::time::sleep(Duration::from_secs(retry_after_secs.max(1))).await;
                     }
                     if attempt >= 3 {
+                        if let Ok(mut f) = self.failed_today.lock() {
+                            *f += 1;
+                        }
                         return Err(format!(
                             "rate limited repeatedly (last retry_after {retry_after_secs}s)"
                         ));
                     }
                 }
                 Err(DiscordError::Unauthorized(m)) | Err(DiscordError::Forbidden(m)) => {
+                    if let Ok(mut f) = self.failed_today.lock() {
+                        *f += 1;
+                    }
                     return Err(format!("stopped immediately: {m}"));
                 }
                 Err(DiscordError::Other(m)) => {
                     if attempt >= 3 {
+                        if let Ok(mut f) = self.failed_today.lock() {
+                            *f += 1;
+                        }
                         return Err(format!("failed after 3 attempts: {m}"));
                     }
                     let backoff = 2u64.pow(attempt) * 2;
