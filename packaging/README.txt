@@ -29,8 +29,8 @@ Hãy dùng tài khoản phụ, đừng dùng tài khoản chính.
 Giới hạn
 --------
 - Chỉ gửi vào 1 kênh duy nhất.
-- Tối đa 300 tin nhắn mỗi ngày. Giới hạn này reset lúc 00:00 giờ UTC
-  mỗi ngày.
+- Có giới hạn gửi mỗi ngày để bảo vệ tài khoản. Hết giới hạn thì
+  app tự dừng và gửi tiếp vào ngày hôm sau.
 
 Lưu ý
 -----
