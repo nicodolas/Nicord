@@ -1,17 +1,43 @@
 name: Release
 
-# NOTE: this workflow runs on every push to main for now (no tag trigger yet),
-# so the final push of the v0.1.0 release files starts it. Tighten the trigger
-# to tags (e.g. v*) later if releases should only happen on demand.
+# Releases come from the `product` branch only: every push to `product`
+# creates a NEW version (patch auto-bumped from the latest release tag).
+# Development happens on `main`; pushing to `main` never releases.
+# To cut a release: sync `main` into `product` (one push = one release).
 on:
   push:
-    branches: [main]
+    branches: [product]
 
 permissions:
   contents: write
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.bump.outputs.tag }}
+      zip: ${{ steps.bump.outputs.zip }}
+    steps:
+      - name: Determine next version
+        id: bump
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          latest=$(gh api "repos/${{ github.repository }}/releases/latest" --jq .tag_name 2>/dev/null || echo "v0.1.0")
+          latest=${latest#v}
+          IFS=. read -r major minor patch <<< "$latest"
+          patch=$((patch + 1))
+          tag="v$major.$minor.$patch"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "zip=Nicord-$tag-windows-x64.zip" >> "$GITHUB_OUTPUT"
+          echo "Next release: $tag"
+
   windows:
+    needs: version
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -42,6 +68,8 @@ jobs:
           if (-not (Test-Path icon.ico)) { throw 'icon.ico was not created' }
       - name: Assemble zip
         shell: pwsh
+        env:
+          ZIP_NAME: ${{ needs.version.outputs.zip }}
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           # Cargo builds target\release\nicord.exe; ship it as Nicord.exe.
@@ -49,19 +77,19 @@ jobs:
           Copy-Item packaging\README.txt dist\README.txt
           Copy-Item LICENSE dist\LICENSE
           Copy-Item icon.ico dist\icon.ico
-          Compress-Archive -Path dist\* -DestinationPath Nicord-v0.1.0-windows-x64.zip
-      - name: Create/update GitHub Release v0.1.0
+          Compress-Archive -Path dist\* -DestinationPath $env:ZIP_NAME
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v0.1.0
-          name: Nicord v0.1.0
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: Nicord ${{ needs.version.outputs.tag }}
           body: |
-            Nicord v0.1.0 — bản phát hành đầu tiên cho Windows.
+            Nicord ${{ needs.version.outputs.tag }} — bản phát hành cho Windows.
 
-            Tải file Nicord-v0.1.0-windows-x64.zip bên dưới, giải nén ra bất cứ đâu rồi chạy Nicord.exe. Không cần cài đặt.
+            Tải file zip bên dưới, giải nén ra bất cứ đâu rồi chạy Nicord.exe. Không cần cài đặt.
 
             Lưu ý: Nicord gửi tin nhắn bằng chính tài khoản Discord của bạn. Việc này có thể khiến tài khoản bị khóa, nên hãy dùng tài khoản phụ. Xem file README.txt trong gói zip để biết cách dùng.
-          files: Nicord-v0.1.0-windows-x64.zip
+          files: ${{ needs.version.outputs.zip }}
 
   linux:
     # Build check only: no artifact is published from this job.
