@@ -33,6 +33,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 dirs = "6"
 
+# Windows-only: system tray + autostart (the release target is Windows;
+# Linux builds are check-only and never compile these).
+[target.'cfg(windows)'.dependencies]
+tray-icon = "0.20"
+winreg = "0.55"
+
 [dev-dependencies]
 rand_chacha = "0.9"
 
