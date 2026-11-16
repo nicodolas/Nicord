@@ -1,0 +1,77 @@
+name: Release
+
+# NOTE: this workflow runs on every push to main for now (no tag trigger yet),
+# so the final push of the v0.1.0 release files starts it. Tighten the trigger
+# to tags (e.g. v*) later if releases should only happen on demand.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build release binary
+        run: cargo build --release
+      - name: Generate icon.ico from base64 PNG
+        shell: pwsh
+        run: |
+          # Decode the base64 text file shipped in the repo (the GitHub write
+          # route used for this repo cannot carry binary files, so the icon
+          # is generated here in CI instead of being committed as .ico).
+          $b64 = (Get-Content assets/icon-256.b64 -Raw) -replace '\s', ''
+          [IO.File]::WriteAllBytes('icon-256.png', [Convert]::FromBase64String($b64))
+          # ImageMagick via Chocolatey (preinstalled on windows-latest).
+          # refreshenv picks up the new PATH in this session; fall back to
+          # the install folder if magick is still not on PATH.
+          choco install imagemagick -y
+          Import-Module $env:ChocolateyInstall\helpers\chocolateyProfile.psm1
+          refreshenv
+          $magick = (Get-Command magick -ErrorAction SilentlyContinue).Source
+          if (-not $magick) {
+            $magick = Get-ChildItem 'C:\Program Files\ImageMagick-*\magick.exe' -ErrorAction SilentlyContinue |
+              Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-not $magick) { throw 'ImageMagick not found after install' }
+          & $magick icon-256.png -define icon:auto-resize=256,128,64,48,32,16 icon.ico
+          if (-not (Test-Path icon.ico)) { throw 'icon.ico was not created' }
+      - name: Assemble zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          # Cargo builds target\release\nicord.exe; ship it as Nicord.exe.
+          Copy-Item target\release\nicord.exe dist\Nicord.exe
+          Copy-Item packaging\README.txt dist\README.txt
+          Copy-Item LICENSE dist\LICENSE
+          Copy-Item icon.ico dist\icon.ico
+          Compress-Archive -Path dist\* -DestinationPath Nicord-v0.1.0-windows-x64.zip
+      - name: Create/update GitHub Release v0.1.0
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v0.1.0
+          name: Nicord v0.1.0
+          body: |
+            Nicord v0.1.0 — bản phát hành đầu tiên cho Windows.
+
+            Tải file Nicord-v0.1.0-windows-x64.zip bên dưới, giải nén ra bất cứ đâu rồi chạy Nicord.exe. Không cần cài đặt.
+
+            Lưu ý: Nicord gửi tin nhắn bằng chính tài khoản Discord của bạn. Việc này có thể khiến tài khoản bị khóa, nên hãy dùng tài khoản phụ. Xem file README.txt trong gói zip để biết cách dùng.
+          files: Nicord-v0.1.0-windows-x64.zip
+
+  linux:
+    # Build check only: no artifact is published from this job.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system deps (egui / winit / glow)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb1-dev libxkbcommon-dev libxkbcommon-x11-0 libgl1-mesa-dev libx11-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build release binary (check only)
+        run: cargo build --release
