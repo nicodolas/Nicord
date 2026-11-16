@@ -1,0 +1,22 @@
+# Rust build output
+/target/
+
+# Local config — may contain an ENCRYPTED token.
+# Never commit real config.
+config.json
+*.key
+*.pem
+nicord.db
+nicord.db-journal
+
+# Generated icon binaries (source is assets/icon.svg; the window icon is
+# embedded as base64 text in assets/icon-256.b64). Regenerate, don't commit.
+assets/icon-*.png
+assets/icon.ico
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
