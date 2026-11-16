@@ -17,7 +17,6 @@ tens of MB of RAM. The interface is simple on purpose — speed over beauty.
 | HTTP | reqwest 0.12 (`rustls-tls`) | Discord REST only; no gateway needed for scheduled sends |
 | Storage | rusqlite (bundled) + JSON config | Scenarios + logs in SQLite; config as versioned JSON |
 | Token crypto | AES-256-GCM, machine-tied key | Token never in plaintext, never logged, never uploaded |
-| License | ed25519-dalek, offline verify | `base64(payload).base64(signature)`, 7-day grace period |
 | Time | chrono + chrono-tz | Scheduling, sleep window, per-scenario timezones |
 
 ## Build & run
@@ -35,7 +34,7 @@ the OS config directory (`%APPDATA%/nicord` on Windows,
 On Linux, install the system libraries egui/winit needs first:
 
 ```bash
-sudo apt-get install -y libxcb1-dev libxkbcommon-dev libxkbcommon-x11-0 libgl1-mesa-dev libx11-dev
+sudo apt-get install -y libxcb1-dev libxkbcommon-dev libxkbcommon-x11-0 libxcb-xkb1 libgl1-mesa-dev libx11-dev
 ```
 
 Development checks:
@@ -56,10 +55,8 @@ src/
   scenario.rs   # scenario model, schedule + cron parser, spin-text, validation
   scheduler.rs  # send engine, per-channel queue, retry, 429 handling
   discord.rs    # Discord REST client (user token)
-  license.rs    # Ed25519 license verification (offline)
   crypto.rs     # AES-256-GCM token encryption, machine-tied key
   store.rs      # SQLite (scenarios/logs/meta) + JSON config
-  bin/nicord-keygen.rs  # generate Ed25519 keypairs + sign license keys (offline)
 docs/ARCHITECTURE.md
 examples/scenario-example.json
 ```
@@ -67,30 +64,14 @@ examples/scenario-example.json
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full data flow and a
 per-module description.
 
-## License keys — issuing keys (Nico, offline)
+## License keys — removed in v0.1.0
 
-A key looks like `base64(payload).base64(signature)`, signed with Ed25519
-and verified offline against a public key embedded in the app. Enter once,
-7-day grace period after expiry.
-
-```bash
-# 1. Generate a keypair ONCE, on a machine that never goes into the repo:
-cargo run --bin nicord-keygen -- gen
-#    Prints a private key (store offline, never commit) and a public key.
-
-# 2. Paste the public key into EMBEDDED_PUBLIC_KEY in src/license.rs
-#    (replacing the [0u8; 32] placeholder). Until you do this, every key
-#    is rejected and the app runs as Free — by design.
-
-# 3. Sign a key for a buyer (expiry date optional):
-cargo run --bin nicord-keygen -- sign <PRIVATE_KEY_BASE64> pro 2027-01-01
-```
-
-**Honest limitation:** open source + client-side key checking **cannot
-prevent copying absolutely** — someone skilled can rebuild the app and skip
-the check. Nicord is open-core: the paid value is a good buying experience,
-updates, Pro templates and future server-side services (cloud runner, sync)
-— not just the key check.
+There is no license-key system anymore: Nicord is a single product for
+everyone (1 channel, 300 messages/day, cap resets 00:00 UTC). The old
+Ed25519 key verification (`src/license.rs`) and the offline keygen tool
+(`src/bin/nicord-keygen.rs`) were removed in v0.1.0. They are recoverable
+from git history if ever needed again — users must not know about
+internal/dev mechanisms; they only receive the finished product.
 
 ## Anti-ban — 5 layers (reduces risk, does not remove it)
 
@@ -120,12 +101,14 @@ UtilityRandomPick (rotation) and UtilitySetVariable (template vars). Any
 other node kind is rejected by `Scenario::validate` with a clear error —
 never silently ignored.
 
-Warm-up / caps: the daily cap is the plan cap (Free 100, Pro 1000) with
-warm-up (30% for the first 3 days since first run, from the
+Warm-up / caps: the daily cap is 300/day for everyone, resetting at
+00:00 UTC. The bucket is the UTC date everywhere — engine and persisted
+send log — so changing the machine timezone cannot grant extra messages.
+Warm-up is 30% (90/day) for the first 3 days since first run (from the
 `meta.first_seen` row), additionally capped by a per-scenario limit when
 one is set (0 = no per-scenario limit). "Sent today" is read from the
-persisted send log, so it survives restarts. Free = 1 distinct channel
-across all enabled scenarios, enforced on enable, on channel change, on
+persisted send log, so it survives restarts. 1 distinct channel across
+all enabled scenarios, enforced on enable, on channel change, on
 import, and in the engine loop. Template vars (`{{username}}`,
 `{{server}}`, `{{date}}`, `{{time}}`) use the real username / first
 server name fetched once at engine start (`get_me` + `list_guilds`).
@@ -139,6 +122,14 @@ server name fetched once at engine start (`get_me` + `list_guilds`).
   (`token_last4`); the full token is never written to disk or logs in
   plaintext.
 - Logs contain message IDs and status only — never the token.
+
+## App icon
+
+The icon source is `assets/icon.svg` (white speech bubble with a clock on
+a blurple gradient). PNG sizes (64/128/256/512) and `icon.ico` for Windows
+packaging are generated from it and live in `assets/`. The window icon is
+embedded in the binary as base64 text (`assets/icon-256.b64`, decoded in
+`src/main.rs`), so a checkout builds without extra steps.
 
 ## Known limitations
 
