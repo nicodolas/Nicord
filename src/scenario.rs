@@ -420,8 +420,8 @@ fn wall_clock_due(
 ///
 /// EXECUTED node kinds (the scheduler actually runs these — see
 /// `scheduler.rs`): TriggerSchedule, TriggerManual, ActionSendMessage,
-/// ActionSendEmbed (content sent as text), ConditionTimeWindow,
-/// UtilityWait, UtilityRandomPick, UtilitySetVariable.
+/// ActionSendEmbed (content sent as text), ActionSendCommand,
+/// ConditionTimeWindow, UtilityWait, UtilityRandomPick, UtilitySetVariable.
 /// Every other kind is REJECTED by `Scenario::validate` with a clear error.
 /// Do not add a kind here without implementing it in the scheduler.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -433,6 +433,9 @@ pub enum NodeKind {
     TriggerMemberJoin,
     ActionSendMessage,
     ActionSendEmbed,
+    /// Send a Discord command: a prefix/text command (`!rank arg1`)
+    /// or a slash command (`/daily`). See `CommandConfig`.
+    ActionSendCommand,
     ActionSendFile,
     ActionAddReaction,
     ActionReply,
@@ -459,6 +462,7 @@ impl NodeKind {
                 | NodeKind::TriggerManual
                 | NodeKind::ActionSendMessage
                 | NodeKind::ActionSendEmbed
+                | NodeKind::ActionSendCommand
                 | NodeKind::ConditionTimeWindow
                 | NodeKind::UtilityWait
                 | NodeKind::UtilityRandomPick
@@ -477,6 +481,7 @@ impl NodeKind {
             NodeKind::TriggerMemberJoin => "Trigger: Member Join",
             NodeKind::ActionSendMessage => "Action: Send Message *",
             NodeKind::ActionSendEmbed => "Action: Send Embed *",
+            NodeKind::ActionSendCommand => "Action: Send Command *",
             NodeKind::ActionSendFile => "Action: Send File",
             NodeKind::ActionAddReaction => "Action: Add Reaction",
             NodeKind::ActionReply => "Action: Reply",
@@ -501,6 +506,7 @@ impl NodeKind {
             | NodeKind::TriggerMemberJoin => "Trigger",
             NodeKind::ActionSendMessage
             | NodeKind::ActionSendEmbed
+            | NodeKind::ActionSendCommand
             | NodeKind::ActionSendFile
             | NodeKind::ActionAddReaction
             | NodeKind::ActionReply
@@ -531,6 +537,187 @@ impl Node {
             kind,
             config: serde_json::json!({}),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Discord commands (`ActionSendCommand`): a prefix/text command or a
+// slash command, configured per node — name, parameters, and (for slash)
+// the bot's application ID. Maximally flexible by design: every field
+// the user may need is a plain config value, never hardcoded.
+// ---------------------------------------------------------------------------
+
+/// Discord application-command option type codes.
+/// 3 string, 4 integer, 5 boolean, 6 user, 7 channel, 8 role, 10 number.
+pub fn slash_option_kind_label(kind: u8) -> &'static str {
+    match kind {
+        3 => "Chuỗi",
+        4 => "Số nguyên",
+        5 => "Đúng / Sai",
+        6 => "Người dùng",
+        7 => "Kênh",
+        8 => "Vai trò",
+        10 => "Số thực",
+        _ => "Chuỗi",
+    }
+}
+
+/// All option kinds the editor offers, in UI order.
+pub const SLASH_OPTION_KINDS: &[(u8, &str)] = &[
+    (3, "Chuỗi"),
+    (4, "Số nguyên"),
+    (10, "Số thực"),
+    (5, "Đúng / Sai"),
+    (6, "Người dùng"),
+    (7, "Kênh"),
+    (8, "Vai trò"),
+];
+
+/// One slash-command parameter (name + type + raw value; the value is
+/// parsed per type when the interaction payload is built).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SlashOption {
+    #[serde(default)]
+    pub name: String,
+    /// Discord option type code (see `slash_option_kind_label`).
+    #[serde(default = "default_slash_option_kind")]
+    pub kind: u8,
+    /// Raw value as typed by the user (number/bool parsed at send time;
+    /// user/channel/role values are snowflake IDs as text).
+    #[serde(default)]
+    pub value: String,
+}
+
+impl Default for SlashOption {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            // NOTE: a derived Default would give kind 0 (invalid type);
+            // the serde default fn only applies on deserialization.
+            kind: default_slash_option_kind(),
+            value: String::new(),
+        }
+    }
+}
+
+fn default_slash_option_kind() -> u8 {
+    3
+}
+
+/// Config of an `ActionSendCommand` node, stored in `Node.config`.
+/// Unknown/missing fields fall back to defaults, so old scenarios
+/// (and hand-edited JSON) still load.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandConfig {
+    /// "prefix" (default) or "slash".
+    #[serde(default = "default_command_kind")]
+    pub kind: String,
+    /// Prefix for text commands, e.g. "!" (default) or "/" for bots
+    /// that take slash-style text. Empty means "!".
+    #[serde(default = "default_command_prefix")]
+    pub prefix: String,
+    /// Command name without any prefix, e.g. "rank" or "daily".
+    #[serde(default)]
+    pub name: String,
+    /// Ordered arguments for a prefix command, e.g. ["arg1", "arg2"].
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// The bot's application ID (slash only, user-provided).
+    #[serde(default)]
+    pub application_id: String,
+    /// Application command ID (slash only). Empty = auto-resolve via
+    /// the channel's application-commands search; if that fails, the
+    /// user must paste the ID manually.
+    #[serde(default)]
+    pub command_id: String,
+    /// Application command version (slash only, optional).
+    #[serde(default)]
+    pub version: String,
+    /// Slash command parameters.
+    #[serde(default)]
+    pub options: Vec<SlashOption>,
+}
+
+fn default_command_kind() -> String {
+    "prefix".to_string()
+}
+
+fn default_command_prefix() -> String {
+    "!".to_string()
+}
+
+impl Default for CommandConfig {
+    fn default() -> Self {
+        Self {
+            kind: default_command_kind(),
+            prefix: default_command_prefix(),
+            name: String::new(),
+            args: Vec::new(),
+            application_id: String::new(),
+            command_id: String::new(),
+            version: String::new(),
+            options: Vec::new(),
+        }
+    }
+}
+
+impl CommandConfig {
+    /// Parse a node's config (tolerant: unknown fields ignored).
+    pub fn from_node(node: &Node) -> Self {
+        serde_json::from_value(node.config.clone()).unwrap_or_default()
+    }
+
+    pub fn is_slash(&self) -> bool {
+        self.kind.trim().eq_ignore_ascii_case("slash")
+    }
+
+    /// Short display name for node lists: `!rank` or `/daily`.
+    pub fn display_name(&self) -> String {
+        let name = self.name.trim();
+        if self.is_slash() {
+            format!("/{name}")
+        } else {
+            format!("{}{name}", self.effective_prefix())
+        }
+    }
+
+    /// The prefix actually used (empty config means "!").
+    pub fn effective_prefix(&self) -> String {
+        let p = self.prefix.trim();
+        if p.is_empty() {
+            "!".to_string()
+        } else {
+            p.to_string()
+        }
+    }
+
+    /// Compose a prefix command's message text: `{prefix}{name}` plus
+    /// non-empty args joined by spaces. Empty args are skipped.
+    pub fn compose_prefix(&self) -> String {
+        let mut out = format!("{}{}", self.effective_prefix(), self.name.trim());
+        for a in &self.args {
+            let a = a.trim();
+            if !a.is_empty() {
+                out.push(' ');
+                out.push_str(a);
+            }
+        }
+        out
+    }
+
+    /// Validate before running: a name is always required; slash also
+    /// needs the bot's application ID. Command ID / version are
+    /// optional (auto-resolved when empty).
+    pub fn validate(&self) -> Result<(), String> {
+        if self.name.trim().is_empty() {
+            return Err("Send Command node needs a command name".into());
+        }
+        if self.is_slash() && self.application_id.trim().is_empty() {
+            return Err(
+                "Slash command needs the bot's Application ID (paste it in the node editor)".into(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -651,19 +838,27 @@ impl Scenario {
                 return Err(format!(
                     "Node '{}' is not implemented in this version — remove it \
                      (supported: Schedule/Manual trigger, Send Message, Send Embed, \
-                     Time Window condition, Wait, Random Pick, Set Variable)",
+                     Send Command, Time Window condition, Wait, Random Pick, Set Variable)",
                     node.kind.label()
                 ));
+            }
+            if node.kind == NodeKind::ActionSendCommand {
+                CommandConfig::from_node(node)
+                    .validate()
+                    .map_err(|e| format!("Send Command node {}: {e}", node.id))?;
             }
         }
         if let Some(s) = &self.schedule {
             s.validate()?;
         }
-        // Every Send Message node needs non-empty content (or a message list).
+        // Every Send Message node needs non-empty content (or a message list)
+        // — unless the scenario runs a command instead: then the message
+        // nodes are ignored and need no content.
+        let has_command = self.command_node().is_some();
         for node in &self.nodes {
             if node.kind == NodeKind::ActionSendMessage || node.kind == NodeKind::ActionSendEmbed {
                 let content = node_content(node);
-                if content.trim().is_empty() && self.messages.is_empty() {
+                if content.trim().is_empty() && self.messages.is_empty() && !has_command {
                     return Err(format!(
                         "Send Message node {} has empty content and no message list",
                         node.id
@@ -672,6 +867,16 @@ impl Scenario {
             }
         }
         Ok(())
+    }
+
+    /// First `ActionSendCommand` node, if any. One scheduled firing
+    /// runs exactly that node (and ignores message nodes) — running
+    /// several commands per firing would duplicate earlier commands
+    /// when a later one fails and the run is retried.
+    pub fn command_node(&self) -> Option<&Node> {
+        self.nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::ActionSendCommand)
     }
 
     /// Pick the next message to send, rotating without repeating the last one.
@@ -1189,6 +1394,102 @@ mod tests {
         let (i1, _) = s.pick_message_with_index(None, &mut rng).unwrap();
         let (i2, _) = s.pick_message_with_index(Some(i1), &mut rng).unwrap();
         assert_ne!(i1, i2);
+    }
+
+    #[test]
+    fn prefix_command_composes_with_args_and_skips_empty() {
+        let cfg = CommandConfig {
+            name: "rank".into(),
+            args: vec!["@nico".into(), "".into(), "  ".into(), "top".into()],
+            ..Default::default()
+        };
+        assert_eq!(cfg.compose_prefix(), "!rank @nico top");
+        assert_eq!(cfg.display_name(), "!rank");
+        // No args: just prefix + name.
+        let bare = CommandConfig {
+            name: "daily".into(),
+            ..Default::default()
+        };
+        assert_eq!(bare.compose_prefix(), "!daily");
+        // Empty prefix falls back to "!"; a custom prefix is kept.
+        let slashy = CommandConfig {
+            prefix: "/".into(),
+            name: "work".into(),
+            ..Default::default()
+        };
+        assert_eq!(slashy.compose_prefix(), "/work");
+        let no_prefix = CommandConfig {
+            prefix: "   ".into(),
+            name: "x".into(),
+            ..Default::default()
+        };
+        assert_eq!(no_prefix.effective_prefix(), "!");
+    }
+
+    #[test]
+    fn slash_command_config_validation() {
+        // Prefix needs a name.
+        let mut cfg = CommandConfig::default();
+        assert!(cfg.validate().is_err());
+        cfg.name = "rank".into();
+        assert!(cfg.validate().is_ok());
+        // Slash needs application_id + name; command_id/version optional.
+        cfg.kind = "slash".into();
+        assert!(cfg.validate().is_err());
+        cfg.application_id = "123456789".into();
+        assert!(cfg.validate().is_ok());
+        assert_eq!(cfg.display_name(), "/rank");
+        assert!(cfg.is_slash());
+    }
+
+    #[test]
+    fn command_node_wins_and_validates() {
+        let mut s = Scenario::new("cmd");
+        s.channel_id = "123".to_string();
+        // Fresh scenario has a Send Message node + a message list, so it
+        // validates; add a command node with an empty name -> error.
+        let mut node = Node::new(NodeKind::ActionSendCommand);
+        node.config = serde_json::json!({"kind": "prefix", "name": ""});
+        s.nodes.push(node);
+        assert!(s.validate().is_err());
+        // Fill in the name: valid, and command_node() finds it.
+        let cmd = s.command_node().unwrap();
+        assert_eq!(CommandConfig::from_node(cmd).name, "");
+        if let Some(n) = s
+            .nodes
+            .iter_mut()
+            .find(|n| n.kind == NodeKind::ActionSendCommand)
+        {
+            n.config = serde_json::json!({"kind": "prefix", "name": "rank"});
+        }
+        assert!(s.validate().is_ok());
+        assert_eq!(
+            CommandConfig::from_node(s.command_node().unwrap()).display_name(),
+            "!rank"
+        );
+        // A scenario with ONLY a command node (no messages at all) is
+        // valid: the message-content check is skipped for commands.
+        let mut s2 = Scenario::new("cmd2");
+        s2.channel_id = "123".to_string();
+        s2.messages.clear();
+        s2.nodes.retain(|n| n.kind == NodeKind::TriggerSchedule);
+        let mut node2 = Node::new(NodeKind::ActionSendCommand);
+        node2.config =
+            serde_json::json!({"kind": "slash", "name": "daily", "application_id": "999"});
+        s2.nodes.push(node2);
+        assert!(s2.validate().is_ok());
+    }
+
+    #[test]
+    fn slash_option_kind_labels() {
+        assert_eq!(slash_option_kind_label(3), "Chuỗi");
+        assert_eq!(slash_option_kind_label(4), "Số nguyên");
+        assert_eq!(slash_option_kind_label(5), "Đúng / Sai");
+        assert_eq!(slash_option_kind_label(6), "Người dùng");
+        assert_eq!(slash_option_kind_label(7), "Kênh");
+        assert_eq!(slash_option_kind_label(8), "Vai trò");
+        assert_eq!(slash_option_kind_label(10), "Số thực");
+        assert_eq!(slash_option_kind_label(99), "Chuỗi");
     }
 
     #[test]
