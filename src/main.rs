@@ -7,12 +7,16 @@
 
 mod antiban;
 mod app;
+mod autostart;
 mod crypto;
 mod discord;
 mod scenario;
 mod scheduler;
+mod spintax;
 mod store;
 mod theme;
+#[cfg(target_os = "windows")]
+mod tray;
 
 use app::NicordApp;
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
