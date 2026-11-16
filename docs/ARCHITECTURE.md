@@ -7,8 +7,9 @@
 - **NOT a Bot API bot.** Sends as the user's own Discord account
   (user-account / self-bot automation). Users paste their own Discord token
   themselves, like a dev token — that is their responsibility.
-- **License key:** only unlocks features, entered once, stored locally.
-  Free = 1 channel, 1 scenario, 100 msgs/day.
+- **Single product, no tiers, no license keys.** 1 channel,
+  300 messages/day, cap resets 00:00 UTC. (The license-key system was
+  removed in v0.1.0; it is recoverable from git history.)
 - **Stack:** Rust + eframe/egui. **No React, no Electron, no WebView.**
   Priority: fast, light, low RAM — not beauty.
 
@@ -22,7 +23,6 @@
 | HTTP | reqwest 0.12 (`rustls-tls`) | Discord REST only; no gateway needed for scheduled sends |
 | Storage | rusqlite (bundled) + JSON config | Scenarios + logs in SQLite; config as versioned JSON |
 | Token crypto | AES-256-GCM, machine-tied key | Token never in plaintext, never logged, never uploaded |
-| License | ed25519-dalek, offline verify | `base64(payload).base64(signature)`, 7-day grace period |
 | Time | chrono | Scheduling, sleep window, next-run display |
 
 ## Data flow (one send)
@@ -39,7 +39,7 @@
 
 - `main.rs` — eframe window (1100×700), tracing init, store open.
 - `app.rs` — egui screens. Onboarding shows the red ToS warning first and
-  requires an explicit accept checkbox before key/token entry.
+  requires an explicit accept checkbox before token entry.
 - `scenario.rs` — scenario JSON (schemaVersion 1), schedules, node kinds,
   validation, spin-text, message rotation.
 - `scheduler.rs` — `Engine`: per-channel `last_sent`, daily cap, sleep
@@ -47,31 +47,15 @@
   3-consecutive-errors pause (10 min), emergency stop.
 - `discord.rs` — REST client: `send_message`, `get_me`, `list_guilds`,
   `list_channels`. `parse_retry_after` for 429 bodies.
-- `license.rs` — `Plan` limits, `verify_license_key`. Placeholder public
-  key is `[0u8; 32]` and must be replaced.
 - `crypto.rs` — `machine_key()` = SHA-256(`nicord-machine-key-v1` +
   `/etc/machine-id` + OS user); AES-256-GCM encrypt/decrypt; `mask_token`.
 - `store.rs` — SQLite tables `scenarios` / `send_logs`; JSON `AppConfig`.
 
-## Generating a real license keypair (Nico, offline)
+## License keys — removed in v0.1.0
 
-The app only embeds the **public** key. Generate a pair once, on a machine
-that never goes into the repo, with the included tool:
-
-```bash
-cargo run --bin nicord-keygen -- gen
-# Prints PRIVATE_KEY_BASE64 (keep OFFLINE, never commit it) and the
-# 32-byte public key as a Rust array — paste it into EMBEDDED_PUBLIC_KEY
-# in src/license.rs, replacing the [0u8; 32] placeholder.
-
-cargo run --bin nicord-keygen -- sign <PRIVATE_KEY_BASE64> pro 2027-01-01
-# Prints the license key: base64(payload).base64(signature).
-# Payload = {"plan":"pro","expires_at":"2027-01-01T00:00:00Z","key_version":1}
-# (expiry date optional; omit it for a never-expiring key)
-```
-
-Until `EMBEDDED_PUBLIC_KEY` is replaced, **every** key is rejected and the
-app runs as Free — by design, so a placeholder can never unlock Pro.
+The license-key system (`src/license.rs`, `src/bin/nicord-keygen.rs`)
+was removed in v0.1.0 when Nicord became a single product with no tiers.
+It is recoverable from git history if ever needed again.
 
 ## Scheduler — firing exactly once per scheduled time (fixed)
 
@@ -91,14 +75,15 @@ the window), UtilityRandomPick (rotation) and UtilitySetVariable
 (template vars). Any other node kind is rejected by `Scenario::validate`
 with a clear error — never silently ignored.
 
-Warm-up / caps: the daily cap is the plan cap (Free 100, Pro 1000)
-with warm-up (30% for the first 3 days since first run, from the
-`meta.first_seen` row), additionally capped by a per-scenario limit
-when one is set (0 = no per-scenario limit). "Sent today" is read from
-the persisted send log, so it survives restarts. Rotation keeps the
-last message index per scenario in engine memory. Free = 1 distinct
-channel across all enabled scenarios, enforced on enable, on channel
-change, on import, and in the engine loop. Template vars use the real
+Warm-up / caps: the daily cap is 300/day for everyone, resetting at
+00:00 UTC (the UTC date is the bucket key everywhere, so changing the
+machine timezone cannot grant extra messages), with warm-up (30%, i.e.
+90/day, for the first 3 days since first run, from the `meta.first_seen`
+row), additionally capped by a per-scenario limit when one is set (0 = no
+per-scenario limit). "Sent today" is read from the persisted send log, so
+it survives restarts. Rotation keeps the last message index per scenario
+in engine memory. 1 distinct channel across all enabled scenarios,
+enforced on enable, on channel change, on import, and in the engine loop. Template vars use the real
 username / first server name fetched once at engine start (`get_me` +
 `list_guilds`); "you"/"server" is only a logged fallback.
 
