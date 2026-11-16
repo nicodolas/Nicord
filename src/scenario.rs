@@ -857,35 +857,6 @@ pub fn render_template_with_vars(
     out
 }
 
-/// Spin-text: `{a|b|c}` — pick one variant, never the previous one if possible.
-pub fn spin_text(input: &str, rng: &mut impl Rng) -> String {
-    let mut out = String::new();
-    let mut rest = input;
-    while let Some(start) = rest.find('{') {
-        out.push_str(&rest[..start]);
-        let after = &rest[start + 1..];
-        match after.find('}') {
-            Some(end) => {
-                let options: Vec<&str> = after[..end].split('|').collect();
-                if options.len() > 1 {
-                    let pick = options[rng.random_range(0..options.len())];
-                    out.push_str(pick);
-                } else {
-                    out.push_str(after[..end].trim());
-                }
-                rest = &after[end + 1..];
-            }
-            None => {
-                out.push_str(&rest[start..]);
-                rest = "";
-                break;
-            }
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -903,14 +874,6 @@ mod tests {
             .single()
             .unwrap()
             .with_timezone(&Local)
-    }
-
-    #[test]
-    fn spin_text_picks_one_variant() {
-        let mut rng = ChaCha8Rng::seed_from_u64(1);
-        let out = spin_text("{chào|hello|hi} bạn", &mut rng);
-        assert!(out == "chào bạn" || out == "hello bạn" || out == "hi bạn");
-        assert!(!out.contains('{'));
     }
 
     #[test]
