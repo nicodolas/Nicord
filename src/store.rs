@@ -30,6 +30,10 @@ pub struct AppConfig {
     /// the checkbox is disabled on other platforms).
     #[serde(default)]
     pub tray_enabled: bool,
+    /// Check GitHub Releases for a newer version when the app opens.
+    /// Missing in old config.json files → true.
+    #[serde(default = "default_true")]
+    pub auto_check_updates: bool,
 }
 
 fn default_true() -> bool {
