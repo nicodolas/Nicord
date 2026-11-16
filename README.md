@@ -74,8 +74,7 @@ Một kịch bản gồm: **nội dung + lịch gửi**.
 Nicord là một sản phẩm duy nhất, đơn giản cho mọi người dùng:
 
 - **1 channel** duy nhất để gửi tin.
-- **300 tin nhắn mỗi ngày**. Giới hạn reset lúc **00:00 UTC** (không theo giờ máy của bạn, nên đổi múi giờ cũng không gửi thêm được).
-- **3 ngày đầu** dùng app, giới hạn là **90 tin/ngày** (giai đoạn làm quen, để giảm rủi ro bị khoá tài khoản).
+- Có **giới hạn gửi mỗi ngày** để giảm rủi ro bị khoá tài khoản. Hết giới hạn thì app tự dừng và gửi tiếp vào ngày hôm sau.
 
 ---
 
@@ -131,4 +130,4 @@ Giấy phép: MIT.
 
 ## English summary
 
-Nicord is a lightweight desktop app that sends scheduled messages to a Discord server channel using your own account. Set a message and a schedule, and it sends for you. Automating a normal Discord account ("self-bot") violates Discord's Terms of Service and can get your account permanently banned — use a spare account. One simple app for everyone: 1 channel, 300 messages/day, resetting at 00:00 UTC. See [docs/TECHNICAL.md](docs/TECHNICAL.md) for technical details.
+Nicord is a lightweight desktop app that sends scheduled messages to a Discord server channel using your own account. Set a message and a schedule, and it sends for you. Automating a normal Discord account ("self-bot") violates Discord's Terms of Service and can get your account permanently banned — use a spare account. One simple app for everyone: 1 channel, with a daily sending limit to protect your account. See [docs/TECHNICAL.md](docs/TECHNICAL.md) for technical details.
