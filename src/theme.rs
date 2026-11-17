@@ -538,6 +538,19 @@ pub fn progress_bar(ui: &mut egui::Ui, frac: f32, text: &str) {
 mod tests {
     use super::*;
 
+    /// Tests that call `apply_theme` share the process-wide palette
+    /// (`CURRENT_PALETTE`), so they must not run concurrently: one
+    /// test setting Dark while another asserts Light is a race.
+    /// It failed reliably on CI's multi-core runners (run #57, all
+    /// three OSes) while passing on a 1.5-CPU VM. Every test that
+    /// calls `apply_theme` holds this lock for its whole body,
+    /// including its restore step.
+    static PALETTE_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_palette_for_test() -> std::sync::MutexGuard<'static, ()> {
+        PALETTE_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn theme_choice_codes_and_palettes() {
         assert_eq!(ThemeChoice::from_code("dark"), ThemeChoice::Dark);
@@ -572,6 +585,7 @@ mod tests {
 
     #[test]
     fn apply_theme_scales_text_sizes() {
+        let _guard = lock_palette_for_test();
         let ctx = egui::Context::default();
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             apply_theme(ctx, ThemeChoice::Dark, UiScale::Large);
@@ -588,6 +602,7 @@ mod tests {
 
     #[test]
     fn apply_theme_light_sets_light_visuals() {
+        let _guard = lock_palette_for_test();
         let ctx = egui::Context::default();
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             apply_theme(ctx, ThemeChoice::Light, UiScale::Medium);
@@ -618,6 +633,7 @@ mod tests {
 
     #[test]
     fn apply_theme_installs_fonts_and_sizes() {
+        let _guard = lock_palette_for_test();
         let ctx = egui::Context::default();
         // Pass 1: install the theme. Fonts set via `set_fonts` are
         // (re)loaded on the *next* pass, so glyph checks need pass 2.
