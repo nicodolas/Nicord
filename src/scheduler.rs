@@ -130,7 +130,6 @@ pub struct Engine {
     gateway: Arc<Gateway>,
     /// Failed sends this session (dashboard success rate). Skips
     /// ("skip: ...") are not failures and are never counted here.
-    failed_today: std::sync::Mutex<u32>,
     /// Messages deleted by Auto Delete this session.
     deleted_today: std::sync::Mutex<u32>,
     /// When this engine was created (dashboard send rate / uptime).
@@ -167,7 +166,6 @@ impl Engine {
                 next_break_at: 0,
             }),
             gateway: Arc::new(Gateway::new()),
-            failed_today: std::sync::Mutex::new(0),
             deleted_today: std::sync::Mutex::new(0),
             started_at: Instant::now(),
         }
@@ -266,11 +264,6 @@ impl Engine {
         if let Ok(mut map) = self.dest_errors.lock() {
             map.remove(dest_id);
         }
-    }
-
-    /// Failed sends this session (dashboard).
-    pub fn failed_count(&self) -> u32 {
-        self.failed_today.lock().map(|c| *c).unwrap_or(0)
     }
 
     /// Messages deleted by Auto Delete this session (dashboard).
@@ -777,18 +770,12 @@ impl Engine {
                         return Err("emergency stop pressed during rate-limit pause".into());
                     }
                     if attempt >= 3 {
-                        if let Ok(mut f) = self.failed_today.lock() {
-                            *f += 1;
-                        }
                         return Err(format!(
                             "rate limited repeatedly (last retry_after {retry_after_secs}s)"
                         ));
                     }
                 }
                 Err(DiscordError::Unauthorized(m)) | Err(DiscordError::Forbidden(m)) => {
-                    if let Ok(mut f) = self.failed_today.lock() {
-                        *f += 1;
-                    }
                     if let Some(dest) = destination {
                         let _ = self.store.set_destination_failure(
                             &dest.id,
@@ -800,9 +787,6 @@ impl Engine {
                     return Err(format!("stopped immediately: {m}"));
                 }
                 Err(DiscordError::NotFound(m)) => {
-                    if let Ok(mut f) = self.failed_today.lock() {
-                        *f += 1;
-                    }
                     // A gone webhook pauses the destination (persisted):
                     // further sends would only 404 again. The user
                     // resumes it from Destinations after fixing it.
@@ -818,9 +802,6 @@ impl Engine {
                 }
                 Err(DiscordError::Other(m)) => {
                     if attempt >= 3 {
-                        if let Ok(mut f) = self.failed_today.lock() {
-                            *f += 1;
-                        }
                         return Err(format!("failed after 3 attempts: {m}"));
                     }
                     let backoff = 2u64.pow(attempt) * 2;
@@ -1131,9 +1112,6 @@ impl Engine {
                         return Err("emergency stop pressed during rate-limit pause".into());
                     }
                     if attempt >= 3 {
-                        if let Ok(mut f) = self.failed_today.lock() {
-                            *f += 1;
-                        }
                         return Err(format!(
                             "rate limited repeatedly (last retry_after {retry_after_secs}s)"
                         ));
@@ -1142,16 +1120,10 @@ impl Engine {
                 Err(DiscordError::Unauthorized(m))
                 | Err(DiscordError::Forbidden(m))
                 | Err(DiscordError::NotFound(m)) => {
-                    if let Ok(mut f) = self.failed_today.lock() {
-                        *f += 1;
-                    }
                     return Err(format!("stopped immediately: {m}"));
                 }
                 Err(DiscordError::Other(m)) => {
                     if attempt >= 3 {
-                        if let Ok(mut f) = self.failed_today.lock() {
-                            *f += 1;
-                        }
                         return Err(format!("failed after 3 attempts: {m}"));
                     }
                     let backoff = 2u64.pow(attempt) * 2;
