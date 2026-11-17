@@ -21,6 +21,7 @@ mod notify;
 mod preview;
 mod scenario;
 mod scheduler;
+mod secret_store;
 mod spintax;
 mod store;
 mod theme;
