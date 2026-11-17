@@ -1,12 +1,17 @@
 name: Release
 
-# Releases come from the `product` branch only: every push to `product`
-# creates a NEW version (patch auto-bumped from the latest release tag).
-# Development happens on `main`; pushing to `main` never releases.
-# To cut a release: sync `main` into `product` (one push = one release).
+# Releases are cut from TAGS on main: pushing a tag `vX.Y.Z` builds
+# and publishes that version. There is no release branch — MAIN ONLY
+# (see docs/ARCHITECTURE.md). To cut a release:
+#   1. Bump `version` in Cargo.toml to X.Y.Z and commit on main.
+#      (The in-app updater compares the release tag against
+#      CARGO_PKG_VERSION, so the tag must be NEWER than the version
+#      in the binary users already run.)
+#   2. git tag vX.Y.Z && git push origin vX.Y.Z
+# The tag name IS the version; no version is computed in CI.
 on:
   push:
-    branches: [product]
+    tags: ['v*']
 
 permissions:
   contents: write
@@ -16,28 +21,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  version:
-    runs-on: ubuntu-latest
-    outputs:
-      tag: ${{ steps.bump.outputs.tag }}
-      zip: ${{ steps.bump.outputs.zip }}
-    steps:
-      - name: Determine next version
-        id: bump
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          latest=$(gh api "repos/${{ github.repository }}/releases/latest" --jq .tag_name 2>/dev/null || echo "v0.1.0")
-          latest=${latest#v}
-          IFS=. read -r major minor patch <<< "$latest"
-          patch=$((patch + 1))
-          tag="v$major.$minor.$patch"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "zip=Nicord-$tag-windows-x64.zip" >> "$GITHUB_OUTPUT"
-          echo "Next release: $tag"
-
   windows:
-    needs: version
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -66,40 +50,39 @@ jobs:
           if (-not $magick) { throw 'ImageMagick not found after install' }
           & $magick icon-256.png -define icon:auto-resize=256,128,64,48,32,16 icon.ico
           if (-not (Test-Path icon.ico)) { throw 'icon.ico was not created' }
-      - name: Assemble zip
+      - name: Assemble zip + checksums
         shell: pwsh
-        env:
-          ZIP_NAME: ${{ needs.version.outputs.zip }}
         run: |
+          # The zip name must match `expected_asset_name` in
+          # src/updater.rs exactly, or the in-app updater will not
+          # find this release.
+          $zip = "Nicord-$env:GITHUB_REF_NAME-windows-x64.zip"
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           # Cargo builds target\release\nicord.exe; ship it as Nicord.exe.
           Copy-Item target\release\nicord.exe dist\Nicord.exe
           Copy-Item packaging\README.txt dist\README.txt
           Copy-Item LICENSE dist\LICENSE
           Copy-Item icon.ico dist\icon.ico
-          Compress-Archive -Path dist\* -DestinationPath $env:ZIP_NAME
+          Compress-Archive -Path dist\* -DestinationPath $zip
+          # SHA256SUMS.txt: the in-app updater verifies the zip
+          # against this file before extracting it. Format is the
+          # conventional "<hash>  <filename>" (two spaces).
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  $zip" | Out-File -Encoding ascii SHA256SUMS.txt
+          echo "ZIP_NAME=$zip" >> $env:GITHUB_ENV
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ needs.version.outputs.tag }}
-          name: Nicord ${{ needs.version.outputs.tag }}
+          tag_name: ${{ github.ref_name }}
+          name: Nicord ${{ github.ref_name }}
           body: |
-            Nicord ${{ needs.version.outputs.tag }} — bản phát hành cho Windows.
+            Nicord ${{ github.ref_name }} — bản phát hành cho Windows.
 
             Tải file zip bên dưới, giải nén ra bất cứ đâu rồi chạy Nicord.exe. Không cần cài đặt.
 
-            Lưu ý: Nicord gửi tin nhắn bằng chính tài khoản Discord của bạn. Việc này có thể khiến tài khoản bị khóa, nên hãy dùng tài khoản phụ. Xem file README.txt trong gói zip để biết cách dùng.
-          files: ${{ needs.version.outputs.zip }}
+            Chế độ Webhook (chính thức, khuyên dùng) gửi tin qua webhook của Discord. Chế độ tài khoản gửi bằng chính tài khoản Discord của bạn, việc này có thể khiến tài khoản bị khóa, nên hãy dùng tài khoản phụ. Xem file README.txt trong gói zip để biết cách dùng.
 
-  linux:
-    # Build check only: no artifact is published from this job.
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install system deps (egui / winit / glow)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libxcb1-dev libxkbcommon-dev libxkbcommon-x11-0 libgl1-mesa-dev libx11-dev
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Build release binary (check only)
-        run: cargo build --release
+            SHA256SUMS.txt kèm theo chứa mã băm SHA-256 của file zip; ứng dụng tự kiểm tra mã băm khi cập nhật trong app.
+          files: |
+            ${{ env.ZIP_NAME }}
+            SHA256SUMS.txt

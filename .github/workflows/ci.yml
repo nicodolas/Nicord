@@ -8,10 +8,20 @@ on:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    # Nicord ships on Windows, macOS, and Linux, and Windows-only
+    # code (tray, winreg) is invisible to a Linux-only build. Every
+    # platform runs the full sequence so cfg-gated code can never
+    # silently rot. fail-fast is off: a failure on one platform must
+    # not hide the result on the others.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: Install system deps (egui / winit / glow)
+      - name: Install system deps (egui / winit / glow, Linux only)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libxcb1-dev libxkbcommon-dev libxkbcommon-x11-0 libgl1-mesa-dev libx11-dev
