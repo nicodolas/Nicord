@@ -99,6 +99,11 @@ Webhook mode (same tick, queue, cap, and retry policy; simpler send):
   `/etc/machine-id` + OS user); AES-256-GCM encrypt/decrypt; `mask_token`;
   explicit-key encrypt/decrypt for exports; hand-written HMAC-SHA256
   + PBKDF2-HMAC-SHA256 (RFC 4231 / RFC 6070 vectors in tests).
+- `secret_store.rs` — secret storage: OS keyring first (`keyring`
+  crate; entries `account-token`, `legacy-webhook`,
+  `destination:<id>` under service `Nicord`), machine-blob
+  fallback; `kr:` references; startup migration with verified
+  round-trip; `Keyring` trait + in-memory mock for tests.
 - `backup.rs` — config export/import: versioned JSON format,
   Portable/Safe/Local modes, passphrase KDF, replacement import
   with validation + warnings. See `docs/CONFIG-RULES.md`.
@@ -170,12 +175,15 @@ These reduce risk only. They do not make self-botting compliant.
   enabled in Settings. Autostart is real on both Windows (Run key)
   and Linux (XDG desktop entry) — see `src/autostart.rs`. On Linux
   there is no tray icon, so the window must stay open.
-- **Release workflow conflict:** `.github/workflows/release.yml`
-  releases only from pushes to a `product` branch; pushing to `main`
-  never releases. This conflicts with a main-only workflow and must
-  be resolved (e.g. tag-based or main-based releases) before cutting
-  a release without a `product` branch. Do not create a `product`
-  branch as a workaround without an explicit decision.
+- **Releases are tag-based from `main`.** Pushing a tag `vX.Y.Z`
+  runs `.github/workflows/release.yml`, which builds the Windows
+  zip and publishes it with a `SHA256SUMS.txt` checksum file (the
+  in-app updater verifies the zip against it). There is no release
+  branch. No release has been cut yet — the workflow itself is
+  unverified until a real tag is pushed (an explicit decision).
+  CI (`.github/workflows/ci.yml`) runs the full check sequence on
+  Linux, Windows, and macOS, so cfg-gated platform code is always
+  compiled in automation.
 - Release packaging: Windows installer (MSI via `cargo-packager` or WiX)
   is not yet set up.
 - Export/import of scenarios (JSON file) and log filter/export (CSV)
