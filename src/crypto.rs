@@ -1,5 +1,10 @@
 //! Token encryption: AES-256-GCM, key tied to this machine (Spec §9).
 //! The token is NEVER stored in plaintext, NEVER logged, NEVER uploaded.
+//!
+//! User secrets are stored through `secret_store`, which prefers the
+//! OS keyring and falls back to these machine-key functions. Use
+//! `encrypt_token`/`decrypt_token` directly only for the fallback
+//! path and for values that are not user secrets.
 
 use aes_gcm::{
     aead::{Aead, KeyInit},
