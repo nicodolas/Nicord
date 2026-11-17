@@ -1,12 +1,15 @@
 //! Config export/import for backup and cross-machine use.
 //!
 //! The problem: secrets in `config.json` and the destinations table
-//! are encrypted with a machine-tied key (see `crypto::machine_key`),
-//! so copying those files to another machine leaves the secrets
-//! undecryptable. Portable exports solve this by re-encrypting every
-//! secret under a passphrase-derived key (PBKDF2-HMAC-SHA256,
-//! 600k iterations, AES-256-GCM). Import decrypts with the
-//! passphrase and re-encrypts with the LOCAL machine key.
+//! are stored machine-locally — either as OS-keyring references or
+//! as blobs encrypted with a machine-tied key (see `secret_store`
+//! and `crypto::machine_key`) — so copying those files to another
+//! machine leaves the secrets unusable there. Portable exports
+//! solve this by resolving every secret and re-encrypting it under
+//! a passphrase-derived key (PBKDF2-HMAC-SHA256, 600k iterations,
+//! AES-256-GCM). Import decrypts with the passphrase and stores
+//! each secret locally again (keyring when available, else a
+//! machine blob).
 //!
 //! Three modes:
 //! - `portable`: secrets included, passphrase-encrypted. For moving
@@ -15,9 +18,10 @@
 //! - `safe`: secrets omitted (destinations arrive without URLs,
 //!   token/webhook fields empty). For sharing a setup or a public
 //!   backup. The user re-enters credentials on the other machine.
-//! - `local`: secrets kept machine-encrypted (copied as-is). Only
-//!   restorable on the SAME machine. Used for the automatic backup
-//!   taken before an import replaces the current config.
+//! - `local`: stored secret values copied as-is (keyring
+//!   references or machine blobs). Only restorable on the SAME
+//!   machine. Used for the automatic backup taken before an import
+//!   replaces the current config.
 //!
 //! What is exported: AppConfig (minus secrets, which live in the
 //! `secrets` block), destinations, scenarios, templates. What is
@@ -33,12 +37,12 @@
 //! silently dropped.
 
 use crate::{
-    crypto::{
-        decrypt_token, decrypt_with_key, encrypt_token, encrypt_with_key, pbkdf2_hmac_sha256,
-        random_salt,
-    },
+    crypto::{decrypt_with_key, encrypt_with_key, pbkdf2_hmac_sha256, random_salt},
     destination::Destination,
     scenario::Scenario,
+    secret_store::{
+        destination_entry, load_secret, store_secret, ENTRY_ACCOUNT_TOKEN, ENTRY_LEGACY_WEBHOOK,
+    },
     store::{AppConfig, Store},
 };
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
@@ -116,13 +120,15 @@ fn export_key(passphrase: &str, salt: &[u8], iterations: u32) -> [u8; 32] {
 }
 
 /// Build an export file from the current state. `passphrase` is
-/// required for portable mode, ignored otherwise.
+/// required for portable mode, ignored otherwise. The returned
+/// warnings name database rows too corrupt to parse that were left
+/// out of the export; the caller must show them.
 pub fn build_export(
     store: &Store,
     config: &AppConfig,
     mode: ExportMode,
     passphrase: &str,
-) -> Result<ExportFile, String> {
+) -> Result<(ExportFile, Vec<String>), String> {
     build_export_with_iterations(store, config, mode, passphrase, EXPORT_KDF_ITERATIONS)
 }
 
@@ -135,7 +141,7 @@ fn build_export_with_iterations(
     mode: ExportMode,
     passphrase: &str,
     iterations: u32,
-) -> Result<ExportFile, String> {
+) -> Result<(ExportFile, Vec<String>), String> {
     if mode == ExportMode::Portable && passphrase.is_empty() {
         return Err("a passphrase is required for a portable export".into());
     }
@@ -144,8 +150,9 @@ fn build_export_with_iterations(
     app_config.encrypted_token.clear();
     app_config.encrypted_webhook_url.clear();
 
-    let destinations = store.load_destinations()?;
-    let scenarios = store.load_scenarios()?;
+    let (destinations, mut load_warnings) = store.load_destinations_with_warnings()?;
+    let (scenarios, scenario_warnings) = store.load_scenarios_with_warnings()?;
+    load_warnings.extend(scenario_warnings);
     let templates = store
         .load_templates()?
         .into_iter()
@@ -223,32 +230,36 @@ fn build_export_with_iterations(
         }
     };
 
-    Ok(ExportFile {
-        format: EXPORT_FORMAT.to_string(),
-        version: EXPORT_VERSION,
-        exported_at: chrono::Utc::now().to_rfc3339(),
-        mode,
-        app_config,
-        secrets,
-        destinations,
-        scenarios,
-        templates,
-    })
+    Ok((
+        ExportFile {
+            format: EXPORT_FORMAT.to_string(),
+            version: EXPORT_VERSION,
+            exported_at: chrono::Utc::now().to_rfc3339(),
+            mode,
+            app_config,
+            secrets,
+            destinations,
+            scenarios,
+            templates,
+        },
+        load_warnings,
+    ))
 }
 
-/// Decrypt a machine-encrypted value and re-encrypt it under the
-/// export key. Empty input stays empty. Failures append a warning
-/// and yield an empty string (the caller decides whether to abort).
+/// Resolve a stored secret (keyring reference or machine blob)
+/// and re-encrypt it under the export key. Empty input stays empty.
+/// Failures append a warning and yield an empty string (the caller
+/// decides whether to abort).
 fn portable_reencrypt(
-    machine_blob: &str,
+    stored: &str,
     key: &[u8; 32],
     warnings: &mut Vec<String>,
     what: &str,
 ) -> String {
-    if machine_blob.trim().is_empty() {
+    if stored.trim().is_empty() {
         return String::new();
     }
-    match decrypt_token(machine_blob).and_then(|plain| encrypt_with_key(key, &plain)) {
+    match load_secret(stored).and_then(|plain| encrypt_with_key(key, &plain)) {
         Ok(re) => re,
         Err(_) => {
             warnings.push(what.to_string());
@@ -325,34 +336,51 @@ pub fn apply_import(
         None
     };
 
-    // Secrets: resolve to machine-encrypted values (or empty).
+    // Secrets: resolve to stored values — keyring references
+    // when the keyring is available, else machine blobs (or empty).
     match file.mode {
         ExportMode::Safe => {
             config.encrypted_token.clear();
             config.encrypted_webhook_url.clear();
         }
         ExportMode::Local => {
-            // Values are already machine-encrypted for this machine.
-            // Keep them as-is (they came from `app_config`).
+            // Values are already stored for this machine (keyring
+            // references or machine blobs). Keep them as-is (they
+            // came from `app_config`).
         }
         ExportMode::Portable => {
             let secrets = file.secrets.as_ref().unwrap();
             let key = portable_key.as_ref().unwrap();
-            config.encrypted_token = portable_decrypt(&secrets.token, key, "account token")?;
-            config.encrypted_webhook_url =
-                portable_decrypt(&secrets.webhook_url, key, "webhook URL")?;
+            config.encrypted_token = portable_decrypt_to_secret(
+                &secrets.token,
+                key,
+                "account token",
+                ENTRY_ACCOUNT_TOKEN,
+            )?;
+            config.encrypted_webhook_url = portable_decrypt_to_secret(
+                &secrets.webhook_url,
+                key,
+                "webhook URL",
+                ENTRY_LEGACY_WEBHOOK,
+            )?;
         }
     }
 
     // Destinations: validate each; skip invalid ones with warnings.
     let mut imported_dests: Vec<Destination> = Vec::new();
     for mut d in file.destinations.clone() {
-        // Portable: re-encrypt the URL under the machine key
-        // (reusing the key derived once above).
+        // Portable: decrypt the URL and store it under the
+        // destination's keyring entry (reusing the key derived
+        // once above).
         if file.mode == ExportMode::Portable && !d.encrypted_url.trim().is_empty() {
             let key = portable_key.as_ref().unwrap();
-            match portable_decrypt(&d.encrypted_url, key, &d.display_name()) {
-                Ok(machine_blob) => d.encrypted_url = machine_blob,
+            match portable_decrypt_to_secret(
+                &d.encrypted_url,
+                key,
+                &d.display_name(),
+                &destination_entry(&d.id),
+            ) {
+                Ok(stored) => d.encrypted_url = stored,
                 Err(e) => {
                     report.destinations_skipped += 1;
                     report
@@ -438,28 +466,21 @@ pub fn apply_import(
     // there is no foreign key, so any order works. Destinations
     // first, so a failure mid-way leaves the old scenarios pointing
     // at destinations that still exist (they are replaced right after).
-    let existing_dests = store.load_destinations()?;
-    for d in &existing_dests {
-        store.delete_destination(&d.id)?;
-    }
+    // Deletion is table-wide, not load-then-delete: rows too corrupt
+    // to parse must not survive a "replace everything" import.
+    store.delete_all_destinations()?;
     for d in &imported_dests {
         store.save_destination(d)?;
     }
     report.destinations_imported = imported_dests.len();
 
-    let existing_scenarios = store.load_scenarios()?;
-    for s in &existing_scenarios {
-        store.delete_scenario(&s.id)?;
-    }
+    store.delete_all_scenarios()?;
     for s in &imported_scenarios {
         store.save_scenario(s)?;
     }
     report.scenarios_imported = imported_scenarios.len();
 
-    let existing_templates = store.load_templates()?;
-    for (id, _, _) in &existing_templates {
-        store.delete_template(id)?;
-    }
+    store.delete_all_templates()?;
     for t in &imported_templates {
         store.save_template(&t.name, &t.content)?;
     }
@@ -473,18 +494,27 @@ pub fn apply_import(
 /// Decrypt a portable-encrypted value and re-encrypt it under the
 /// machine key. Empty input stays empty. A wrong passphrase fails
 /// here with a clear, secret-free error.
-fn portable_decrypt(blob: &str, key: &[u8; 32], what: &str) -> Result<String, String> {
+/// Decrypt a portable-encrypted value and store it under
+/// `entry` (OS keyring when available, else a machine blob).
+/// Empty input stays empty.
+fn portable_decrypt_to_secret(
+    blob: &str,
+    key: &[u8; 32],
+    what: &str,
+    entry: &str,
+) -> Result<String, String> {
     if blob.trim().is_empty() {
         return Ok(String::new());
     }
     let plain = decrypt_with_key(key, blob)
         .map_err(|_| format!("cannot decrypt {what} — wrong passphrase or corrupt export file"))?;
-    encrypt_token(&plain).map_err(|e| format!("cannot re-encrypt {what}: {e}"))
+    store_secret(entry, &plain).map_err(|e| format!("cannot store {what}: {e}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::encrypt_token;
 
     fn test_store() -> Store {
         Store::open_memory().unwrap()
@@ -500,7 +530,8 @@ mod tests {
         let mut d = Destination::new("D1");
         d.encrypted_url = encrypt_token("https://discord.com/api/webhooks/1/abc").unwrap();
         store.save_destination(&d).unwrap();
-        let file = build_export(&store, &cfg, ExportMode::Safe, "").unwrap();
+        let (file, warnings) = build_export(&store, &cfg, ExportMode::Safe, "").unwrap();
+        assert!(warnings.is_empty());
         assert!(file.app_config.encrypted_token.is_empty());
         assert!(file.secrets.is_none());
         assert!(file.destinations[0].encrypted_url.is_empty());
@@ -522,19 +553,20 @@ mod tests {
         store.save_destination(&d).unwrap();
         // Low iteration count for test speed; import honors the
         // count recorded in the file.
-        let file =
+        let (file, warnings) =
             build_export_with_iterations(&store, &cfg, ExportMode::Portable, "correct horse", 1000)
                 .unwrap();
+        assert!(warnings.is_empty());
         assert!(file.secrets.is_some());
         // Wrong passphrase fails cleanly, changing nothing.
         assert!(apply_import(&store, &file, "wrong").is_err());
         // Right passphrase restores machine-encrypted values.
         let (imported, report) = apply_import(&store, &file, "correct horse").unwrap();
         assert_eq!(report.destinations_imported, 1);
-        assert_eq!(decrypt_token(&imported.encrypted_token).unwrap(), "tok-abc");
+        assert_eq!(load_secret(&imported.encrypted_token).unwrap(), "tok-abc");
         let dests = store.load_destinations().unwrap();
         assert_eq!(
-            decrypt_token(&dests[0].encrypted_url).unwrap(),
+            load_secret(&dests[0].encrypted_url).unwrap(),
             "https://discord.com/api/webhooks/9/xyz"
         );
     }
@@ -545,7 +577,7 @@ mod tests {
         let cfg = AppConfig::default();
         let mut bad = Destination::new("");
         bad.name = String::new();
-        let mut file = build_export(&store, &cfg, ExportMode::Safe, "").unwrap();
+        let (mut file, _) = build_export(&store, &cfg, ExportMode::Safe, "").unwrap();
         file.destinations = vec![bad];
         let mut bad_scenario = Scenario::new("");
         bad_scenario.name = String::new();
@@ -560,7 +592,7 @@ mod tests {
     #[test]
     fn parse_export_rejects_wrong_format_and_version() {
         assert!(parse_export("{}").is_err());
-        let mut file =
+        let (mut file, _) =
             build_export(&test_store(), &AppConfig::default(), ExportMode::Safe, "").unwrap();
         file.version = 99;
         let json = export_to_json(&file).unwrap();
