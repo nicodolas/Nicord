@@ -225,9 +225,31 @@ server name fetched once at engine start (`get_me` + `list_guilds`).
 
 ## Token security
 
-- The Discord token is encrypted with AES-256-GCM before it is stored.
-  The encryption key is derived from the machine ID + OS user, so a config
-  file copied to another machine cannot be decrypted there.
+- Secrets (account token, webhook URLs) are stored through
+  `src/secret_store.rs`, which prefers the OS keyring — Windows
+  Credential Manager, macOS Keychain, Linux Secret Service
+  (via the `keyring` crate) — and falls back to AES-256-GCM
+  blobs encrypted with a machine-tied key when the keyring is
+  unavailable or a write fails. A stored value is either empty,
+  a `kr:<entry>` keyring reference (no secret material in the
+  file), or a machine blob. The `kr:` prefix can never collide
+  with a blob: base64 output contains no `:`.
+- The machine key is derived from the machine ID + OS user, so a
+  config file copied to another machine cannot be decrypted
+  there. It is obfuscation against casual copying, not a
+  keyring — the keyring is the real protection where available.
+- At startup, existing blobs are migrated into the keyring when
+  it is available, one entry per secret (`account-token`,
+  `legacy-webhook`, `destination:<id>`). Migration verifies the
+  keyring round-trip before replacing the blob; anything that
+  cannot migrate stays a blob and keeps working. Deleting a
+  destination removes its keyring entry too.
+- A `kr:` reference whose entry cannot be read fails closed with
+  a clear error ("cannot read secret from the OS keyring") and is
+  treated as "no usable credential"; re-entering the secret always
+  works (the write path falls back to a blob). No migration ever
+  deletes a blob before its round-trip is verified, so there is
+  no lockout path.
 - Only the last 4 characters of the token are stored for display
   (`token_last4`); the full token is never written to disk or logs in
   plaintext.
@@ -291,8 +313,24 @@ treated as "no update" and logged quietly — no error dialog.
   (`-linux-x64.zip` on Linux), exact name first, then any `.zip`
   for the platform; a wrong-platform file is never picked.
 - Download streams with reqwest (`stream` feature) into a temp
-  staging dir with a progress bar; extraction uses the `zip` crate
-  and rejects unsafe paths (`enclosed_name`, Zip Slip guard).
+  staging dir with a progress bar; at most 100 MiB are accepted
+  (`MAX_DOWNLOAD_BYTES` — a declared Content-Length above the cap
+  is rejected before any byte is written, a body growing past it
+  aborts mid-stream), and a failed download removes its partial
+  file. Extraction uses the `zip` crate and rejects unsafe paths
+  (`enclosed_name`, Zip Slip guard), with file-count/size limits
+  (`MAX_ZIP_*`).
+- Before anything is extracted or executed, the zip is verified
+  against the release's `SHA256SUMS.txt` asset (SHA-256,
+  `verify_download`): a missing checksum file, a missing entry, or
+  a digest mismatch fails the update closed. The checksum file
+  itself is capped at 64 KiB.
+- The helper script (`.bat` on Windows, `.sh` on Linux) quotes
+  every baked-in path: the `.sh` script single-quotes values
+  (`sh_quote`, so `$`/backticks/newlines are literal), and the
+  `.bat` script refuses install paths containing `"`, `%`, or
+  line breaks (`validate_bat_value`, cmd.exe has no reliable
+  escaping for them).
 - Install (Windows): a running exe cannot overwrite itself, so a
   helper `.bat` (`.sh` on Linux) waits for Nicord's PID to exit,
   backs the old exe up to `Nicord.exe.bak`, copies the staged files
@@ -304,6 +342,28 @@ treated as "no update" and logged quietly — no error dialog.
 - Settings has a "Cập nhật" card: "Kiểm tra cập nhật" button +
   auto-check toggle (default ON, persisted in `config.json` as
   `auto_check_updates`).
+
+## CI & releases
+
+- CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`,
+  `cargo clippy --all-targets -- -D warnings`, `cargo test`, and
+  `cargo check --release` on **Linux, Windows, and macOS** for
+  every push to `main`. The matrix exists because Windows-only
+  code (`src/tray.rs`, `winreg`) is invisible to a Linux build;
+  before the matrix, no automation ever compiled it.
+- Releases are cut from **tags on `main`** (no release branch):
+  bump `version` in `Cargo.toml`, commit on `main`, then
+  `git tag vX.Y.Z && git push origin vX.Y.Z`. The release workflow
+  builds the Windows zip (`Nicord-vX.Y.Z-windows-x64.zip` — the
+  name must match `expected_asset_name` in `src/updater.rs`) and
+  publishes a `SHA256SUMS.txt` asset (`"<hash>  <filename>"`)
+  that the in-app updater verifies before extracting.
+- No release has been cut yet, so the release workflow has never
+  run end to end. Cutting the first tag is an explicit decision,
+  not a routine step.
+- Linux/macOS release artifacts do not exist yet (the updater
+  already looks for a `-linux-x64.zip` on Linux, so the flow works
+  when one is published). Windows installer (MSI) is not set up.
 
 ## Webhook mode (official, recommended)
 
@@ -495,15 +555,18 @@ Send logs are history, not config, and are never exported.
 - **Safe**: secrets omitted. Destinations arrive without URLs and
   disabled; the user re-enters credentials on the new machine.
   Safe for sharing a setup.
-- **Local**: secrets copied machine-encrypted as-is. Restorable
-  only on the same machine. Used for the automatic backup taken
-  before every import.
+- **Local**: stored secret values copied as-is (keyring
+  references or machine blobs). Restorable only on the same
+  machine. Used for the automatic backup taken before every
+  import.
 
-Why this exists: secrets are encrypted with a machine-tied key,
-so copying `config.json` / the database to another machine leaves
-them undecryptable. Portable export re-encrypts them under the
-passphrase instead. Exporting a secret that cannot be decrypted
-locally aborts the export rather than writing a broken file.
+Why this exists: secrets are stored machine-locally (OS-keyring
+references or blobs encrypted with a machine-tied key), so
+copying `config.json` / the database to another machine leaves
+them unusable there. Portable export resolves and re-encrypts
+them under the passphrase instead. Exporting a secret that cannot
+be resolved locally aborts the export rather than writing a
+broken file.
 
 Import **replaces** the current setup (never merges). It requires
 the engine to be stopped + an explicit confirmation, writes a
@@ -588,6 +651,48 @@ storage or runtime changes — they print, never assert on timing):
   changed. In particular the per-frame `load_destinations()` calls
   in the Logs filter and the engine's per-tick queries were left
   alone — measure before touching them.
+
+## Correctness fixes (Package A)
+
+A batch of small, independently verified fixes for behaviours found
+by reading the code (no new features):
+
+- **Test send targets the selected scenario.** The Dashboard "Test
+  send" button used to send the first scenario, ignoring the
+  Builder selection. It now sends the selected scenario when one is
+  selected and in range, else the first — and the button names the
+  target scenario, so a REAL message never goes out by surprise.
+- **Corrupt rows warn instead of vanishing.** `load_scenarios` and
+  `load_destinations` silently dropped rows that failed to parse.
+  Both now have `*_with_warnings` variants returning one warning
+  per bad row (row id + truncated parse error). Startup collects
+  them into the health report; exports name them in the status
+  message; the automatic pre-import backup warns when it skipped
+  rows. Import-replace deletes whole tables (`delete_all_*`)
+  instead of load-then-delete, so corrupt rows cannot survive a
+  "replace everything" import.
+- **Per-scenario cap default unified.** `ScenarioLimits::default()`
+  was 300 while the serde default for a missing `daily_cap` was 0
+  ("inherit the account/global cap"), so new and imported scenarios
+  behaved differently. Both are now 0, matching the scheduler (0
+  maps to "unlimited", min-ed with the account/global cap) and
+  guarded by `limits_default_matches_serde_default`. Effective
+  behaviour is unchanged at the default caps.
+- **Dashboard success rate is fully persisted.** It used to mix the
+  persisted sent-today count with a session-only failure counter,
+  so restarting the app reset the rate to 100%. Both sides now come
+  from the send log (`count_status_today`). The engine's
+  session-only failure counter was removed with it; the "Deleted"
+  card stays honestly session-only.
+- **Engine reads credentials fresh.** `start_engine` captured a
+  config clone, so token/webhook changes needed an engine restart.
+  The sender resolver now reloads the config from disk on every
+  resolution (destinations already resolved fresh from the store),
+  so Settings edits apply to a running engine.
+- **SQLite busy timeout.** The file database now waits up to 5 s
+  for a lock (`busy_timeout`), so a second Nicord instance holding
+  the database no longer makes writes fail instantly with
+  "database is locked".
 
 ## Known limitations
 
