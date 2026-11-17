@@ -39,6 +39,7 @@ uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 dirs = "6"
+keyring = "4.2.0"
 
 # Windows-only: system tray + autostart (the release target is Windows;
 # Linux builds are check-only and never compile these).
