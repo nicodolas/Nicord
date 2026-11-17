@@ -12,7 +12,7 @@
 
 use crate::i18n::{t, Lang};
 use crate::{
-    crypto::{decrypt_token, encrypt_token, mask_token},
+    crypto::mask_token,
     destination::Destination,
     discord::{Channel, DiscordClient, DiscordError, Guild, Me},
     preview::{char_count, expand_shortcodes, over_limit, parse_markdown},
@@ -21,6 +21,10 @@ use crate::{
         SlashOption, SLASH_OPTION_KINDS,
     },
     scheduler::{channels_violation, Engine},
+    secret_store::{
+        delete_secret, destination_entry, load_secret, migrate_secret, store_secret,
+        ENTRY_ACCOUNT_TOKEN, ENTRY_LEGACY_WEBHOOK,
+    },
     store::{
         config_dir, csv_escape, load_config, save_config, scrub_secrets, AppConfig, SendMode,
         Store, WebhookHealth,
@@ -122,6 +126,10 @@ pub struct NicordApp {
     /// demand; dismissing is session-only.
     pub health_issues: Vec<crate::health::HealthIssue>,
     pub health_dismissed: bool,
+    /// Database rows too corrupt to parse, found at startup. Kept
+    /// for the health report so they are visible instead of silently
+    /// dropped (see `load_*_with_warnings`).
+    pub load_warnings: Vec<String>,
     /// Result of the last "Kiểm tra token" (Token Validator).
     pub token_info: Arc<Mutex<Option<Me>>>,
     /// Auto-update state, shared with the background check/download
@@ -141,11 +149,11 @@ pub struct NicordApp {
 /// resolves per-scenario destinations (see below).
 fn sender_for_config(config: &AppConfig) -> Option<MessageSender> {
     match config.send_mode {
-        SendMode::UserToken => decrypt_token(&config.encrypted_token)
+        SendMode::UserToken => load_secret(&config.encrypted_token)
             .ok()
             .map(|t| MessageSender::User(DiscordClient::new(&t))),
         SendMode::Webhook => {
-            let url = decrypt_token(&config.encrypted_webhook_url).ok()?;
+            let url = load_secret(&config.encrypted_webhook_url).ok()?;
             let parsed = parse_webhook_url(&url).ok()?;
             Some(MessageSender::Webhook(WebhookClient::new(
                 parsed,
@@ -173,7 +181,7 @@ fn resolve_sender_for_scenario(
         SendMode::Webhook => {
             let dest_id = scenario.destination_id.as_deref()?;
             let dest = store.load_destination(dest_id).ok()??;
-            let url = decrypt_token(&dest.encrypted_url).ok()?;
+            let url = load_secret(&dest.encrypted_url).ok()?;
             let parsed = parse_webhook_url(&url).ok()?;
             let client = WebhookClient::new(parsed, &dest.username_override)
                 .with_avatar_url(&dest.avatar_url_override)
@@ -186,7 +194,7 @@ fn resolve_sender_for_scenario(
 /// Build a sender for one destination (Destinations "Gửi thử").
 /// None when the destination has no usable URL.
 fn sender_for_destination(dest: &Destination) -> Option<MessageSender> {
-    let url = decrypt_token(&dest.encrypted_url).ok()?;
+    let url = load_secret(&dest.encrypted_url).ok()?;
     let parsed = parse_webhook_url(&url).ok()?;
     Some(MessageSender::Webhook(
         WebhookClient::new(parsed, &dest.username_override)
@@ -209,10 +217,41 @@ impl NicordApp {
         if migrated {
             let _ = save_config(&config);
         }
+        // One-time secret migration: move machine-encrypted blobs
+        // into the OS keyring when it is available. Best-effort and
+        // idempotent — anything that cannot migrate stays a blob
+        // and keeps working (see `secret_store::migrate_secret`).
+        let mut secrets_migrated = false;
+        if let Some(m) = migrate_secret(&config.encrypted_token, ENTRY_ACCOUNT_TOKEN) {
+            config.encrypted_token = m;
+            secrets_migrated = true;
+        }
+        if let Some(m) = migrate_secret(&config.encrypted_webhook_url, ENTRY_LEGACY_WEBHOOK) {
+            config.encrypted_webhook_url = m;
+            secrets_migrated = true;
+        }
+        if secrets_migrated {
+            let _ = save_config(&config);
+        }
+        if let Ok(dests) = store.load_destinations() {
+            for mut d in dests {
+                let entry = destination_entry(&d.id);
+                if let Some(m) = migrate_secret(&d.encrypted_url, &entry) {
+                    d.encrypted_url = m;
+                    let _ = store.save_destination(&d);
+                }
+            }
+        }
         // Read before the struct literal below moves `config`.
         #[cfg(target_os = "windows")]
         let tray_enabled = config.tray_enabled;
-        let scenarios = store.load_scenarios().unwrap_or_default();
+        let (scenarios, mut load_warnings) =
+            store.load_scenarios_with_warnings().unwrap_or_default();
+        let (_, dest_warnings) = store.load_destinations_with_warnings().unwrap_or_default();
+        load_warnings.extend(dest_warnings);
+        for w in &load_warnings {
+            tracing::warn!("{w}");
+        }
         // Read before the struct literal below moves `config`.
         let webhook_health_init = config.webhook_health;
         let webhook_last_checked_init = config.webhook_last_checked_at.clone();
@@ -284,6 +323,7 @@ impl NicordApp {
             backup_warnings: Vec::new(),
             health_issues: Vec::new(),
             health_dismissed: false,
+            load_warnings,
             token_info: Arc::new(Mutex::new(None)),
             update_status: Arc::new(Mutex::new(updater::UpdateStatus::default())),
             #[cfg(target_os = "windows")]
@@ -336,6 +376,25 @@ impl NicordApp {
         let destinations = self.store.load_destinations().unwrap_or_default();
         let scenarios = self.scenarios.lock().map(|l| l.clone()).unwrap_or_default();
         self.health_issues = crate::health::startup_checks(&self.config, &destinations, &scenarios);
+        // Corrupt rows found at startup: visible here (max 5, then a
+        // collapse line, matching the health module's convention).
+        for w in self.load_warnings.iter().take(5) {
+            self.health_issues.push(crate::health::HealthIssue {
+                severity: crate::health::Severity::Warning,
+                message: w.clone(),
+                target: None,
+            });
+        }
+        if self.load_warnings.len() > 5 {
+            self.health_issues.push(crate::health::HealthIssue {
+                severity: crate::health::Severity::Warning,
+                message: format!(
+                    "... và thêm {} hàng lỗi khác.",
+                    self.load_warnings.len() - 5
+                ),
+                target: None,
+            });
+        }
     }
 
     /// Current UI language (from config, applied instantly).
@@ -361,16 +420,26 @@ impl NicordApp {
         }
     }
 
+    /// The scenario a Dashboard "Test send" would send: the
+    /// Builder-selected one when set and in range, else the first.
+    /// The Dashboard button names this scenario so the user always
+    /// sees the target before a REAL message goes out.
+    fn test_send_target(&self) -> Option<Scenario> {
+        let list = self.scenarios.lock().ok()?;
+        if let Some(idx) = self.selected {
+            if let Some(s) = list.get(idx) {
+                return Some(s.clone());
+            }
+        }
+        list.first().cloned()
+    }
+
     /// Spawn a background thread that sends one test message for the
-    /// first scenario, using the current send mode's stored credential.
-    /// In webhook mode the scenario's own destination is used.
+    /// selected-or-first scenario (see `test_send_target`), using
+    /// the current send mode's stored credential. In webhook mode
+    /// the scenario's own destination is used.
     fn test_send(&self) {
-        let Some(scenario) = self
-            .scenarios
-            .lock()
-            .map(|l| l.first().cloned())
-            .unwrap_or(None)
-        else {
+        let Some(scenario) = self.test_send_target() else {
             self.set_status("No scenario yet — create one first.");
             return;
         };
@@ -450,7 +519,7 @@ impl NicordApp {
     /// `GET /users/@me` in a background thread and show the account
     /// (username, id, email, 2FA, Nitro). The token itself is never shown.
     fn check_token(&self) {
-        let token = match decrypt_token(&self.config.encrypted_token) {
+        let token = match load_secret(&self.config.encrypted_token) {
             Ok(t) => t,
             Err(e) => {
                 self.set_status(&format!("No valid token stored: {e}"));
@@ -631,7 +700,16 @@ impl NicordApp {
             .iter_mut()
             .find(|d| !self.config.webhook_id.is_empty() && d.webhook_id == self.config.webhook_id)
         {
-            existing.encrypted_url = self.config.encrypted_webhook_url.clone();
+            // Resolve + re-store under the destination's own keyring
+            // entry: copying the config's stored value would copy a
+            // keyring reference bound to the config slot. If the
+            // stored URL cannot be resolved, leave the destination's
+            // existing URL alone instead of propagating breakage.
+            if let Ok(plain) = load_secret(&self.config.encrypted_webhook_url) {
+                if let Ok(stored) = store_secret(&destination_entry(&existing.id), &plain) {
+                    existing.encrypted_url = stored;
+                }
+            }
             existing.webhook_name = self.config.webhook_name.clone();
             existing.username_override = self.config.webhook_username.clone();
             existing.failure_state = crate::destination::FailureState::Ok;
@@ -640,7 +718,14 @@ impl NicordApp {
             let _ = self.store.save_destination(existing);
         } else {
             let mut dest = Destination::new(&name);
-            dest.encrypted_url = self.config.encrypted_webhook_url.clone();
+            // Same resolve + re-store as above: the new destination
+            // gets its own keyring entry, never the config slot's
+            // reference. Unresolvable input leaves the URL empty.
+            if let Ok(plain) = load_secret(&self.config.encrypted_webhook_url) {
+                if let Ok(stored) = store_secret(&destination_entry(&dest.id), &plain) {
+                    dest.encrypted_url = stored;
+                }
+            }
             dest.webhook_id = self.config.webhook_id.clone();
             dest.webhook_name = self.config.webhook_name.clone();
             dest.username_override = self.config.webhook_username.clone();
@@ -660,7 +745,7 @@ impl NicordApp {
     /// Re-check the STORED webhook URL (Settings "Kiểm tra lại").
     /// Decrypts the saved URL and runs the same check as a paste.
     fn recheck_stored_webhook(&self) {
-        match decrypt_token(&self.config.encrypted_webhook_url) {
+        match load_secret(&self.config.encrypted_webhook_url) {
             Ok(url) => self.check_webhook(url),
             Err(e) => self.set_status(&format!("No valid webhook URL stored: {e}")),
         }
@@ -676,7 +761,7 @@ impl NicordApp {
             self.set_status("Webhook mode cannot send commands.");
             return;
         }
-        let token = match decrypt_token(&self.config.encrypted_token) {
+        let token = match load_secret(&self.config.encrypted_token) {
             Ok(t) => t,
             Err(e) => {
                 self.set_status(&format!("No valid token stored: {e}"));
@@ -907,18 +992,26 @@ impl NicordApp {
                 &info.asset.url,
                 &zip_path,
                 progress,
+                updater::MAX_DOWNLOAD_BYTES,
             ));
             let _ = pump.join();
+            // Verify the download against the release checksums
+            // BEFORE anything is extracted or executed. A release
+            // without a checksum file fails closed here.
+            let result = result.and_then(|()| {
+                rt.block_on(updater::download_and_verify_checksums(
+                    &info, &zip_path, &stage_dir,
+                ))
+            });
             match result {
                 Err(e) => {
                     let _ = std::fs::remove_dir_all(&stage_dir);
                     if let Ok(mut u) = shared.lock() {
-                        u.state =
-                            UpdateState::Failed(format!("Tải bản mới thất bại, thử lại sau ({e})"));
+                        u.state = UpdateState::Failed(format!("Tải bản mới thất bại ({e})"));
                         u.dialog = true;
                     }
                     if let Ok(mut s) = status.lock() {
-                        *s = "Tải bản mới thất bại, thử lại sau.".to_string();
+                        *s = "Tải bản mới thất bại.".to_string();
                     }
                 }
                 Ok(()) => match updater::prepare_install(&zip_path) {
@@ -1002,7 +1095,6 @@ impl NicordApp {
         self.engine.resume();
         let engine = self.engine.clone();
         let scenarios = self.scenarios.clone();
-        let config = self.config.clone();
         let store = self.store.clone();
         std::thread::spawn(move || {
             let rt = match shared_runtime() {
@@ -1014,11 +1106,15 @@ impl NicordApp {
             rt.block_on(async move {
                 // Per-scenario sender resolution: destinations in
                 // webhook mode, the account sender in user mode.
-                // Destinations are read fresh from the store on every
-                // resolution, so UI edits apply without restarting.
+                // Both the config and the destinations are read fresh
+                // on every resolution, so credential and destination
+                // edits in Settings apply without an engine restart.
+                // (Capturing a config clone here used to freeze the
+                // credentials until restart.)
                 let store2 = store.clone();
                 let resolve_sender = move |scenario: &Scenario| {
-                    resolve_sender_for_scenario(&store2, &config, scenario)
+                    let cfg = load_config();
+                    resolve_sender_for_scenario(&store2, &cfg, scenario)
                 };
                 let scenarios_fn = move || scenarios2.lock().map(|l| l.clone()).unwrap_or_default();
                 engine2.run_loop(resolve_sender, scenarios_fn).await;
@@ -1029,7 +1125,7 @@ impl NicordApp {
 
     /// Load the account's servers in a background thread (channel picker).
     fn load_guilds(&self) {
-        let token = match decrypt_token(&self.config.encrypted_token) {
+        let token = match load_secret(&self.config.encrypted_token) {
             Ok(t) => t,
             Err(e) => {
                 self.set_status(&format!("No valid token stored: {e}"));
@@ -1065,7 +1161,7 @@ impl NicordApp {
 
     /// Load text channels of one server in a background thread.
     fn load_channels(&self, guild_id: String) {
-        let token = match decrypt_token(&self.config.encrypted_token) {
+        let token = match load_secret(&self.config.encrypted_token) {
             Ok(t) => t,
             Err(e) => {
                 self.set_status(&format!("No valid token stored: {e}"));
@@ -1452,7 +1548,7 @@ impl NicordApp {
                     self.set_status("Webhook URL is empty.");
                 } else {
                     match parse_webhook_url(&input) {
-                        Ok(parsed) => match encrypt_token(&input) {
+                        Ok(parsed) => match store_secret(ENTRY_LEGACY_WEBHOOK, &input) {
                             Ok(enc) => {
                                 self.config.encrypted_webhook_url = enc;
                                 self.config.webhook_id = parsed.id.clone();
@@ -1539,7 +1635,7 @@ impl NicordApp {
                 if self.token_input.trim().is_empty() {
                     self.set_status("Token is empty.");
                 } else {
-                    match encrypt_token(self.token_input.trim()) {
+                    match store_secret(ENTRY_ACCOUNT_TOKEN, self.token_input.trim()) {
                         Ok(enc) => {
                             // SECURITY: store ONLY the last 4 chars for display.
                             // The full token must never be written to config.json
@@ -1739,10 +1835,13 @@ impl NicordApp {
             Ok(Some(t)) => t.format("%d/%m %H:%M").to_string(),
             _ => "—".to_string(),
         };
-        // Group B stats: success rate and send rate need the session
-        // counters from the engine (failures and deletes are session-only;
-        // sent today comes from the persisted log).
-        let failed = self.engine.failed_count();
+        // Success rate uses persisted counts for both sides: sent
+        // today AND failed today come from the log, so restarting the
+        // app cannot reset the rate to 100%. (The session-only
+        // failure counter still exists on the engine for live
+        // status; the "Deleted" card below is honestly labeled
+        // session-only.)
+        let failed = self.store.count_status_today("failed");
         let deleted = self.engine.deleted_count();
         let total = self.sent_today + failed;
         let success_pct = if total == 0 {
@@ -1831,7 +1930,14 @@ impl NicordApp {
                     self.engine.stop_all();
                     self.set_status("Engine stopped.");
                 }
-                if ui.button("Test send (sends a REAL message)").clicked() {
+                let test_label = match self.test_send_target() {
+                    Some(s) => {
+                        let name: String = s.name.chars().take(24).collect();
+                        format!("Test send '{name}' (sends a REAL message)")
+                    }
+                    None => "Test send (sends a REAL message)".to_string(),
+                };
+                if ui.button(test_label).clicked() {
                     self.test_send();
                 }
                 if ui.button("Minimise (engine keeps running)").clicked() {
@@ -3430,7 +3536,7 @@ impl NicordApp {
         let url_input = self.dest_url_input.trim().to_string();
         if !url_input.is_empty() {
             match parse_webhook_url(&url_input) {
-                Ok(parsed) => match encrypt_token(&url_input) {
+                Ok(parsed) => match store_secret(&destination_entry(&draft.id), &url_input) {
                     Ok(enc) => {
                         draft.encrypted_url = enc;
                         draft.webhook_id = parsed.id.clone();
@@ -3908,6 +4014,12 @@ impl NicordApp {
                                 }
                             }
                             self.save_scenarios();
+                            // Remove the destination's keyring entry
+                            // too, so deleting a destination does not
+                            // orphan a live credential.
+                            if let Ok(Some(d)) = self.store.load_destination(&confirm_id) {
+                                delete_secret(&d.encrypted_url);
+                            }
                             let _ = self.store.delete_destination(&confirm_id);
                             self.dest_delete_confirm = None;
                             self.dest_selected_id = None;
@@ -4206,7 +4318,7 @@ impl NicordApp {
                     return;
                 }
             };
-            let url = match crate::crypto::decrypt_token(&dest.encrypted_url)
+            let url = match load_secret(&dest.encrypted_url)
                 .ok()
                 .and_then(|u| crate::webhook::parse_webhook_url(&u).ok())
             {
@@ -4327,9 +4439,10 @@ impl NicordApp {
                         mode,
                         &self.backup_passphrase,
                     )
-                    .and_then(|f| crate::backup::export_to_json(&f))
-                    {
-                        Ok(json) => {
+                    .and_then(|(f, warnings)| {
+                        crate::backup::export_to_json(&f).map(|json| (json, warnings))
+                    }) {
+                        Ok((json, warnings)) => {
                             let path = if self.backup_export_path.trim().is_empty() {
                                 let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
                                 config_dir().join(format!("nicord-config-{ts}.json"))
@@ -4342,10 +4455,24 @@ impl NicordApp {
                                     // health report's backup reminder.
                                     self.config.last_export_at = chrono::Utc::now().to_rfc3339();
                                     let _ = save_config(&self.config);
-                                    self.set_status(&format!(
-                                        "Config exported to {}",
-                                        path.display()
-                                    ));
+                                    if warnings.is_empty() {
+                                        self.set_status(&format!(
+                                            "Config exported to {}",
+                                            path.display()
+                                        ));
+                                    } else {
+                                        // The export is incomplete:
+                                        // corrupt rows were left out.
+                                        // Name the first one; the rest
+                                        // are in the startup health
+                                        // report.
+                                        self.set_status(&format!(
+                                            "Config exported to {} — WARNING: {} unreadable row(s) skipped: {}",
+                                            path.display(),
+                                            warnings.len(),
+                                            warnings[0]
+                                        ));
+                                    }
                                     self.backup_passphrase.clear();
                                     self.backup_passphrase_confirm.clear();
                                 }
@@ -4445,10 +4572,25 @@ impl NicordApp {
             crate::backup::ExportMode::Local,
             "",
         )
-        .and_then(|f| crate::backup::export_to_json(&f))
-        .and_then(|json| std::fs::write(&backup_path, json).map_err(|e| e.to_string()))
-        {
-            Ok(()) => format!("Backup saved to {}.", backup_path.display()),
+        .and_then(|(f, warnings)| crate::backup::export_to_json(&f).map(|json| (json, warnings)))
+        .and_then(|(json, warnings)| {
+            std::fs::write(&backup_path, json)
+                .map_err(|e| e.to_string())
+                .map(|()| warnings)
+        }) {
+            Ok(warnings) => {
+                if warnings.is_empty() {
+                    format!("Backup saved to {}.", backup_path.display())
+                } else {
+                    // The safety net itself is incomplete: say so
+                    // before the replace happens.
+                    format!(
+                        "Backup saved to {} — WARNING: {} unreadable row(s) were skipped from the backup.",
+                        backup_path.display(),
+                        warnings.len()
+                    )
+                }
+            }
             Err(e) => {
                 self.set_status(&format!(
                     "Import aborted: cannot write automatic backup ({e}). Nothing was changed."
@@ -4462,10 +4604,20 @@ impl NicordApp {
                 self.config = new_config;
                 let _ = save_config(&self.config);
                 // Reload scenarios + live-apply caps to the engine.
-                if let Ok(list) = self.store.load_scenarios() {
+                // Import replaced the whole database, so the startup
+                // load warnings are stale: refresh them (and the
+                // health report) from the new state.
+                if let Ok((list, warnings)) = self.store.load_scenarios_with_warnings() {
                     if let Ok(mut mine) = self.scenarios.lock() {
                         *mine = list;
                     }
+                    self.load_warnings = warnings;
+                    let (_, dest_warnings) = self
+                        .store
+                        .load_destinations_with_warnings()
+                        .unwrap_or_default();
+                    self.load_warnings.extend(dest_warnings);
+                    self.refresh_health();
                 }
                 self.engine
                     .set_global_daily_cap(self.config.global_daily_cap);
@@ -4592,7 +4744,7 @@ impl NicordApp {
                             self.set_status("Webhook URL is empty.");
                         } else {
                             match parse_webhook_url(&input) {
-                                Ok(parsed) => match encrypt_token(&input) {
+                                Ok(parsed) => match store_secret(ENTRY_LEGACY_WEBHOOK, &input) {
                                     Ok(enc) => {
                                         self.config.encrypted_webhook_url = enc;
                                         self.config.webhook_id = parsed.id.clone();
