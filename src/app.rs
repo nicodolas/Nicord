@@ -10,17 +10,24 @@
 //! One simple app for everyone: 1 channel, 300 messages/day
 //! (cap resets 00:00 UTC). No tiers.
 
+use crate::i18n::{t, Lang};
 use crate::{
     crypto::{decrypt_token, encrypt_token, mask_token},
+    destination::Destination,
     discord::{Channel, DiscordClient, DiscordError, Guild, Me},
+    preview::{char_count, expand_shortcodes, over_limit, parse_markdown},
     scenario::{
-        slash_option_kind_label, CommandConfig, Node, NodeKind, Scenario, SlashOption,
-        SLASH_OPTION_KINDS,
+        analyze_import, slash_option_kind_label, CommandConfig, Node, NodeKind, Scenario, Schedule,
+        SlashOption, SLASH_OPTION_KINDS,
     },
     scheduler::{channels_violation, Engine},
-    store::{config_dir, load_config, save_config, AppConfig, Store},
+    store::{
+        config_dir, csv_escape, load_config, save_config, scrub_secrets, AppConfig, SendMode,
+        Store, WebhookHealth,
+    },
     theme,
     updater::{self, CheckResult, UpdateState},
+    webhook::{parse_webhook_url, MessageSender, WebhookClient, WebhookInfo},
 };
 use egui::RichText;
 use std::sync::{Arc, Mutex};
@@ -30,6 +37,7 @@ pub enum Screen {
     Onboarding,
     Dashboard,
     Builder,
+    Destinations,
     Logs,
     Settings,
 }
@@ -43,6 +51,14 @@ pub struct NicordApp {
     pub status: Arc<Mutex<String>>,
     pub tos_checked: bool,
     pub token_input: String,
+    /// Onboarding mode choice (new users default to Webhook).
+    pub onboarding_mode: SendMode,
+    /// Webhook URL being typed (never stored in plaintext).
+    pub webhook_url_input: String,
+    /// Result of the last "Kiểm tra webhook".
+    pub webhook_info: Arc<Mutex<Option<WebhookInfo>>>,
+    /// Status text for the webhook check (shared with its thread).
+    pub webhook_check_status: Arc<Mutex<String>>,
     pub new_scenario_name: String,
     pub new_message: String,
     pub selected: Option<usize>,
@@ -54,7 +70,47 @@ pub struct NicordApp {
     pub channels: Arc<Mutex<Vec<Channel>>>,
     pub picker_guild_id: String,
     pub log_filter: String,
+    /// Logs status filter ("" = all, else "sent"/"failed"/"deleted").
+    pub log_status_filter: String,
+    /// Logs scenario filter ("" = all, else a scenario id).
+    pub log_scenario_filter: String,
+    /// Logs destination filter ("" = all, else a channel id).
+    pub log_channel_filter: String,
     pub import_path: String,
+    /// Warnings from the last import analysis (QoL, shown in Builder).
+    pub import_warnings: Vec<String>,
+    /// Live webhook health, shared with the check thread; synced
+    /// into `config` (and saved) from `update()`.
+    pub webhook_health_shared: Arc<Mutex<WebhookHealth>>,
+    /// Live last-checked timestamp (RFC 3339 UTC), same sharing.
+    pub webhook_last_checked_shared: Arc<Mutex<String>>,
+    /// Destination editor: selected id (None = creating new) + the
+    /// working copy being edited (None = no editor open).
+    pub dest_selected_id: Option<String>,
+    pub dest_draft: Option<Destination>,
+    /// Pasted URL for the destination editor (never prefilled).
+    pub dest_url_input: String,
+    /// New default message being composed in the editor.
+    pub dest_new_message: String,
+    /// Destination id awaiting delete confirmation (None = none).
+    pub dest_delete_confirm: Option<String>,
+    /// Reassignment target on delete ("" = disable the scenarios).
+    pub dest_delete_target: String,
+    /// Name for a new template saved from the compose field (Q6).
+    pub template_name: String,
+    /// Whether the emoji picker grid is open (Q10).
+    pub show_emoji_picker: bool,
+    /// Custom emoji markup/URL being composed (Q10).
+    pub custom_emoji_input: String,
+    /// Backup/export UI state.
+    pub backup_export_mode_portable: bool,
+    pub backup_passphrase: String,
+    pub backup_passphrase_confirm: String,
+    pub backup_export_path: String,
+    pub backup_import_path: String,
+    pub backup_import_passphrase: String,
+    pub backup_import_confirm: bool,
+    pub backup_warnings: Vec<String>,
     /// Result of the last "Kiểm tra token" (Token Validator).
     pub token_info: Arc<Mutex<Option<Me>>>,
     /// Auto-update state, shared with the background check/download
@@ -68,22 +124,101 @@ pub struct NicordApp {
     pub allow_quit: bool,
 }
 
+/// Build a sender from a config snapshot, following its send mode.
+/// None when the active mode has no usable credential.
+/// User-token mode only in practice for the engine: webhook mode
+/// resolves per-scenario destinations (see below).
+fn sender_for_config(config: &AppConfig) -> Option<MessageSender> {
+    match config.send_mode {
+        SendMode::UserToken => decrypt_token(&config.encrypted_token)
+            .ok()
+            .map(|t| MessageSender::User(DiscordClient::new(&t))),
+        SendMode::Webhook => {
+            let url = decrypt_token(&config.encrypted_webhook_url).ok()?;
+            let parsed = parse_webhook_url(&url).ok()?;
+            Some(MessageSender::Webhook(WebhookClient::new(
+                parsed,
+                &config.webhook_username,
+            )))
+        }
+    }
+}
+
+/// Resolve a scenario's sender + destination from a config snapshot.
+/// Webhook mode: the scenario's `destination_id` selects the
+/// destination; the sender is built from that destination's own
+/// encrypted URL and username override. None when the scenario has
+/// no destination, the destination is missing, or its URL cannot be
+/// decrypted/parsed — the engine skips such scenarios instead of
+/// silently sending to a different channel. User-token mode:
+/// the account sender, no destination.
+fn resolve_sender_for_scenario(
+    store: &Store,
+    config: &AppConfig,
+    scenario: &Scenario,
+) -> Option<(MessageSender, Option<Destination>)> {
+    match config.send_mode {
+        SendMode::UserToken => sender_for_config(config).map(|s| (s, None)),
+        SendMode::Webhook => {
+            let dest_id = scenario.destination_id.as_deref()?;
+            let dest = store.load_destination(dest_id).ok()??;
+            let url = decrypt_token(&dest.encrypted_url).ok()?;
+            let parsed = parse_webhook_url(&url).ok()?;
+            let client = WebhookClient::new(parsed, &dest.username_override)
+                .with_avatar_url(&dest.avatar_url_override)
+                .with_thread_id(&dest.thread_id);
+            Some((MessageSender::Webhook(client), Some(dest)))
+        }
+    }
+}
+
+/// Build a sender for one destination (Destinations "Gửi thử").
+/// None when the destination has no usable URL.
+fn sender_for_destination(dest: &Destination) -> Option<MessageSender> {
+    let url = decrypt_token(&dest.encrypted_url).ok()?;
+    let parsed = parse_webhook_url(&url).ok()?;
+    Some(MessageSender::Webhook(
+        WebhookClient::new(parsed, &dest.username_override)
+            .with_avatar_url(&dest.avatar_url_override)
+            .with_thread_id(&dest.thread_id),
+    ))
+}
+
 impl NicordApp {
     pub fn new(store: Arc<Store>) -> Self {
         let mut config = load_config();
         // The autostart toggle shows the real OS state, not just the
         // last saved flag (the user may have changed it outside Nicord).
         config.autostart = crate::autostart::is_enabled();
+        // One-time migration: legacy single webhook -> destinations
+        // table. Idempotent; the config is saved below when it changed.
+        let migrated = store
+            .ensure_destinations_migrated(&mut config)
+            .unwrap_or(false);
+        if migrated {
+            let _ = save_config(&config);
+        }
         // Read before the struct literal below moves `config`.
         #[cfg(target_os = "windows")]
         let tray_enabled = config.tray_enabled;
         let scenarios = store.load_scenarios().unwrap_or_default();
-        let screen = if !config.tos_accepted {
+        // Read before the struct literal below moves `config`.
+        let webhook_health_init = config.webhook_health;
+        let webhook_last_checked_init = config.webhook_last_checked_at.clone();
+        // Onboarding is skipped when the self-bot ToS was accepted OR a
+        // webhook is already saved (webhook users never accept the
+        // self-bot warning — it does not apply to them).
+        let screen = if !config.tos_accepted && config.encrypted_webhook_url.is_empty() {
             Screen::Onboarding
         } else {
             Screen::Dashboard
         };
-        let engine = Arc::new(Engine::new(store.clone(), config.antiban.clone()));
+        let engine = Arc::new(Engine::new(
+            store.clone(),
+            config.antiban.clone(),
+            config.global_daily_cap,
+            config.consecutive_error_limit,
+        ));
         let has_enabled = scenarios.iter().any(|s| s.enabled);
         let app = Self {
             store,
@@ -94,6 +229,10 @@ impl NicordApp {
             status: Arc::new(Mutex::new(String::new())),
             tos_checked: false,
             token_input: String::new(),
+            onboarding_mode: SendMode::Webhook,
+            webhook_url_input: String::new(),
+            webhook_info: Arc::new(Mutex::new(None)),
+            webhook_check_status: Arc::new(Mutex::new(String::new())),
             new_scenario_name: String::new(),
             new_message: String::new(),
             selected: None,
@@ -103,7 +242,30 @@ impl NicordApp {
             channels: Arc::new(Mutex::new(Vec::new())),
             picker_guild_id: String::new(),
             log_filter: String::new(),
+            log_status_filter: String::new(),
+            log_scenario_filter: String::new(),
+            log_channel_filter: String::new(),
             import_path: String::new(),
+            import_warnings: Vec::new(),
+            webhook_health_shared: Arc::new(Mutex::new(webhook_health_init)),
+            webhook_last_checked_shared: Arc::new(Mutex::new(webhook_last_checked_init)),
+            dest_selected_id: None,
+            dest_draft: None,
+            dest_url_input: String::new(),
+            dest_new_message: String::new(),
+            dest_delete_confirm: None,
+            dest_delete_target: String::new(),
+            template_name: String::new(),
+            show_emoji_picker: false,
+            custom_emoji_input: String::new(),
+            backup_export_mode_portable: true,
+            backup_passphrase: String::new(),
+            backup_passphrase_confirm: String::new(),
+            backup_export_path: String::new(),
+            backup_import_path: String::new(),
+            backup_import_passphrase: String::new(),
+            backup_import_confirm: false,
+            backup_warnings: Vec::new(),
             token_info: Arc::new(Mutex::new(None)),
             update_status: Arc::new(Mutex::new(updater::UpdateStatus::default())),
             #[cfg(target_os = "windows")]
@@ -117,19 +279,40 @@ impl NicordApp {
         };
         // Auto-resume: enabled scenarios keep running across restarts.
         // The engine is started here (not only from the Dashboard button)
-        // when there is anything enabled and a token is stored.
-        if has_enabled && !app.config.encrypted_token.is_empty() && app.config.tos_accepted {
+        // when there is anything enabled and the active mode has a
+        // credential (user-token mode additionally requires ToS acceptance).
+        let can_start = match app.config.send_mode {
+            SendMode::UserToken => {
+                app.config.tos_accepted && !app.config.encrypted_token.is_empty()
+            }
+            SendMode::Webhook => {
+                // Any destination with a URL (or the legacy URL, kept
+                // as a fallback until migration is confirmed stable).
+                !app.config.encrypted_webhook_url.is_empty()
+                    || app
+                        .store
+                        .load_destinations()
+                        .map(|ds| ds.iter().any(|d| !d.encrypted_url.trim().is_empty()))
+                        .unwrap_or(false)
+            }
+        };
+        if has_enabled && can_start {
             app.start_engine();
             app.set_status("Resumed enabled scenarios from last session.");
         }
-        // Auto-update: one quiet check on startup (only after the ToS
-        // is accepted — the dialog never appears on Onboarding). A
-        // failed check or "no releases yet" stays silent; only a newer
-        // release opens the dialog.
-        if app.config.auto_check_updates && app.config.tos_accepted {
+        // Auto-update: one quiet check on startup (never on Onboarding,
+        // so the dialog cannot appear before setup is done). A failed
+        // check or "no releases yet" stays silent; only a newer release
+        // opens the dialog.
+        if app.config.auto_check_updates && app.screen != Screen::Onboarding {
             app.check_updates(false);
         }
         app
+    }
+
+    /// Current UI language (from config, applied instantly).
+    fn lang(&self) -> Lang {
+        Lang::from_code(&self.config.language)
     }
 
     fn set_status(&self, msg: &str) {
@@ -151,16 +334,28 @@ impl NicordApp {
     }
 
     /// Spawn a background thread that sends one test message for the
-    /// selected (or first) scenario, using the stored encrypted token.
+    /// first scenario, using the current send mode's stored credential.
+    /// In webhook mode the scenario's own destination is used.
     fn test_send(&self) {
-        let token = match decrypt_token(&self.config.encrypted_token) {
-            Ok(t) => t,
-            Err(e) => {
-                self.set_status(&format!("No valid token stored: {e}"));
-                return;
-            }
+        let Some(scenario) = self
+            .scenarios
+            .lock()
+            .map(|l| l.first().cloned())
+            .unwrap_or(None)
+        else {
+            self.set_status("No scenario yet — create one first.");
+            return;
         };
-        let scenarios = self.scenarios.clone();
+        let (sender, destination) =
+            match resolve_sender_for_scenario(&self.store, &self.config, &scenario) {
+                Some(pair) => pair,
+                None => {
+                    self.set_status(
+                    "No valid credential/destination for this scenario in the current send mode.",
+                );
+                    return;
+                }
+            };
         let engine = self.engine.clone();
         let status = self.status.clone();
         std::thread::spawn(move || {
@@ -173,35 +368,41 @@ impl NicordApp {
                     return;
                 }
             };
-            let scenario = {
-                let list = scenarios.lock().unwrap();
-                list.first().cloned()
+            // Template identity: per-destination in webhook mode
+            // (stored name, no network), account identity in user mode.
+            let (username, server_name) = if let Some(dest) = &destination {
+                (dest.effective_username(), String::new())
+            } else {
+                rt.block_on(async {
+                    match &sender {
+                        MessageSender::User(client) => {
+                            let u = client
+                                .get_me_typed()
+                                .await
+                                .map(|m| m.display_name())
+                                .unwrap_or_else(|_| "you".to_string());
+                            let s = client
+                                .list_guilds()
+                                .await
+                                .ok()
+                                .and_then(|g| g.first().map(|x| x.name.clone()))
+                                .unwrap_or_else(|| "server".to_string());
+                            (u, s)
+                        }
+                        MessageSender::Webhook(_) => ("you".to_string(), String::new()),
+                    }
+                })
             };
-            let Some(scenario) = scenario else {
-                if let Ok(mut s) = status.lock() {
-                    *s = "No scenario yet — create one first.".to_string();
-                }
-                return;
-            };
-            let client = DiscordClient::new(&token);
-            // Real identity for template vars (fallback only on failure).
-            let (username, server_name) = rt.block_on(async {
-                let u = client
-                    .get_me_typed()
-                    .await
-                    .map(|m| m.display_name())
-                    .unwrap_or_else(|_| "you".to_string());
-                let s = client
-                    .list_guilds()
-                    .await
-                    .ok()
-                    .and_then(|g| g.first().map(|x| x.name.clone()))
-                    .unwrap_or_else(|| "server".to_string());
-                (u, s)
-            });
-            let result = rt.block_on(engine.send_once(&scenario, &client, &username, &server_name));
+            let result = rt.block_on(engine.send_once(
+                &scenario,
+                &sender,
+                destination.as_ref(),
+                &username,
+                &server_name,
+            ));
             if let Ok(mut s) = status.lock() {
                 *s = match result {
+                    Ok(id) if id.is_empty() => "Test sent! (webhook, no id returned)".to_string(),
                     Ok(id) => format!("Test sent! message id {id}"),
                     Err(e) => format!("Test failed: {e}"),
                 };
@@ -259,11 +460,186 @@ impl NicordApp {
         });
     }
 
+    /// Webhook check: GET the webhook from a pasted URL (not yet saved)
+    /// in a background thread and show its name + channel. The URL
+    /// itself is never shown or logged. `url` is the raw pasted text.
+    fn check_webhook(&self, url: String) {
+        let parsed = match parse_webhook_url(&url) {
+            Ok(p) => p,
+            Err(e) => {
+                self.set_status(&e);
+                if let Ok(mut i) = self.webhook_info.lock() {
+                    *i = None;
+                }
+                return;
+            }
+        };
+        let info = self.webhook_info.clone();
+        let check_status = self.webhook_check_status.clone();
+        let status = self.status.clone();
+        let health_shared = self.webhook_health_shared.clone();
+        let checked_shared = self.webhook_last_checked_shared.clone();
+        let engine = self.engine.clone();
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    if let Ok(mut s) = status.lock() {
+                        *s = format!("cannot start runtime: {e}");
+                    }
+                    return;
+                }
+            };
+            let client = WebhookClient::new(parsed, "");
+            let now = chrono::Utc::now().to_rfc3339();
+            match rt.block_on(client.get_webhook()) {
+                Ok(w) => {
+                    let msg = format!(
+                        "Webhook hợp lệ: {} (kênh {})",
+                        w.display_name(),
+                        w.channel_id.clone().unwrap_or_default()
+                    );
+                    let checked_id = w.id.clone();
+                    if let Ok(mut i) = info.lock() {
+                        *i = Some(w);
+                    }
+                    if let Ok(mut h) = health_shared.lock() {
+                        *h = WebhookHealth::Ok;
+                    }
+                    if let Ok(mut c) = checked_shared.lock() {
+                        *c = now;
+                    }
+                    // A good check clears the pause of any destination
+                    // backed by this webhook.
+                    if let Ok(dests) = engine.store.load_destinations() {
+                        for d in dests {
+                            if d.webhook_id == checked_id {
+                                let _ = engine.store.set_destination_failure(
+                                    &d.id,
+                                    crate::destination::FailureState::Ok,
+                                    "",
+                                );
+                            }
+                        }
+                    }
+                    if let Ok(mut s) = check_status.lock() {
+                        *s = msg.clone();
+                    }
+                    if let Ok(mut s) = status.lock() {
+                        *s = msg;
+                    }
+                }
+                Err(e) => {
+                    if let Ok(mut i) = info.lock() {
+                        *i = None;
+                    }
+                    // Rate limits are transient: keep the previous
+                    // health instead of crying wolf.
+                    let (health, msg) = match &e {
+                        DiscordError::NotFound(_) => (
+                            Some(WebhookHealth::NotFound),
+                            "Webhook không tồn tại (đã xóa hoặc URL sai).".to_string(),
+                        ),
+                        DiscordError::Forbidden(_) | DiscordError::Unauthorized(_) => (
+                            Some(WebhookHealth::Forbidden),
+                            format!("Không kiểm tra được webhook: {e}"),
+                        ),
+                        DiscordError::RateLimited { .. } => (
+                            None,
+                            "Discord đang giới hạn (429) — thử kiểm tra lại sau.".to_string(),
+                        ),
+                        DiscordError::Other(_) => (
+                            Some(WebhookHealth::NetworkError),
+                            format!("Không kiểm tra được webhook: {e}"),
+                        ),
+                    };
+                    if let Some(h) = health {
+                        if let Ok(mut hs) = health_shared.lock() {
+                            *hs = h;
+                        }
+                        if let Ok(mut c) = checked_shared.lock() {
+                            *c = now;
+                        }
+                    }
+                    if let Ok(mut s) = check_status.lock() {
+                        *s = msg.clone();
+                    }
+                    if let Ok(mut s) = status.lock() {
+                        *s = msg;
+                    }
+                }
+            }
+        });
+    }
+
+    /// Dual-write: after a legacy webhook URL is saved (onboarding
+    /// or Settings), mirror it into the destinations table so the
+    /// engine — which sends via destinations — can use it. Updates
+    /// the destination with the same webhook id, or creates one.
+    /// Best-effort: a failure here never blocks the config save.
+    fn upsert_destination_from_legacy(&self) {
+        if self.config.encrypted_webhook_url.trim().is_empty() {
+            return;
+        }
+        let Ok(mut dests) = self.store.load_destinations() else {
+            return;
+        };
+        let name = if !self.config.webhook_friendly_name.trim().is_empty() {
+            self.config.webhook_friendly_name.trim().to_string()
+        } else if !self.config.webhook_name.trim().is_empty() {
+            self.config.webhook_name.trim().to_string()
+        } else {
+            "Webhook chính".to_string()
+        };
+        if let Some(existing) = dests
+            .iter_mut()
+            .find(|d| !self.config.webhook_id.is_empty() && d.webhook_id == self.config.webhook_id)
+        {
+            existing.encrypted_url = self.config.encrypted_webhook_url.clone();
+            existing.webhook_name = self.config.webhook_name.clone();
+            existing.username_override = self.config.webhook_username.clone();
+            existing.failure_state = crate::destination::FailureState::Ok;
+            existing.last_error.clear();
+            existing.paused_at = None;
+            let _ = self.store.save_destination(existing);
+        } else {
+            let mut dest = Destination::new(&name);
+            dest.encrypted_url = self.config.encrypted_webhook_url.clone();
+            dest.webhook_id = self.config.webhook_id.clone();
+            dest.webhook_name = self.config.webhook_name.clone();
+            dest.username_override = self.config.webhook_username.clone();
+            // Fill channel/guild from the last matching check.
+            if let Ok(info) = self.webhook_info.lock() {
+                if let Some(w) = info.as_ref() {
+                    if w.id == self.config.webhook_id {
+                        dest.channel_id = w.channel_id.clone().unwrap_or_default();
+                        dest.guild_id = w.guild_id.clone().unwrap_or_default();
+                    }
+                }
+            }
+            let _ = self.store.save_destination(&dest);
+        }
+    }
+
+    /// Re-check the STORED webhook URL (Settings "Kiểm tra lại").
+    /// Decrypts the saved URL and runs the same check as a paste.
+    fn recheck_stored_webhook(&self) {
+        match decrypt_token(&self.config.encrypted_webhook_url) {
+            Ok(url) => self.check_webhook(url),
+            Err(e) => self.set_status(&format!("No valid webhook URL stored: {e}")),
+        }
+    }
+
     /// Send one command node once, right now (Builder "Test lệnh").
     /// Builds a minimal scenario (trigger + that command node only)
     /// and runs it through the normal send pipeline (daily cap, slot,
     /// typing for prefix; gateway + interaction for slash).
+    /// User-token mode only: webhooks cannot send commands.
     fn test_command(&self, i: usize, node_id: &str) {
+        if self.config.send_mode == SendMode::Webhook {
+            self.set_status("Webhook mode cannot send commands.");
+            return;
+        }
         let token = match decrypt_token(&self.config.encrypted_token) {
             Ok(t) => t,
             Err(e) => {
@@ -317,7 +693,9 @@ impl NicordApp {
                     .unwrap_or_else(|| "server".to_string());
                 (u, s)
             });
-            let result = rt.block_on(engine.send_once(&scenario, &client, &username, &server_name));
+            let sender = MessageSender::User(client);
+            let result =
+                rt.block_on(engine.send_once(&scenario, &sender, None, &username, &server_name));
             if let Ok(mut s) = status.lock() {
                 *s = match result {
                     Ok(id) => format!("Lệnh {name} đã gửi! ({id})"),
@@ -578,10 +956,18 @@ impl NicordApp {
     }
 
     fn start_engine(&self) {
+        // Do not spawn a second loop while one is active (including
+        // wind-down after Stop). The atomic claim in `run_loop` is the
+        // correctness guard; this avoids spawning a wasted thread.
+        if self.engine.is_loop_active() {
+            self.set_status("Engine is already running.");
+            return;
+        }
         self.engine.resume();
         let engine = self.engine.clone();
         let scenarios = self.scenarios.clone();
         let config = self.config.clone();
+        let store = self.store.clone();
         std::thread::spawn(move || {
             let rt = match tokio::runtime::Runtime::new() {
                 Ok(rt) => rt,
@@ -590,13 +976,16 @@ impl NicordApp {
             let engine2 = engine.clone();
             let scenarios2 = scenarios.clone();
             rt.block_on(async move {
-                let get_client = move || {
-                    decrypt_token(&config.encrypted_token)
-                        .ok()
-                        .map(|t| DiscordClient::new(&t))
+                // Per-scenario sender resolution: destinations in
+                // webhook mode, the account sender in user mode.
+                // Destinations are read fresh from the store on every
+                // resolution, so UI edits apply without restarting.
+                let store2 = store.clone();
+                let resolve_sender = move |scenario: &Scenario| {
+                    resolve_sender_for_scenario(&store2, &config, scenario)
                 };
                 let scenarios_fn = move || scenarios2.lock().map(|l| l.clone()).unwrap_or_default();
-                engine2.run_loop(get_client, scenarios_fn).await;
+                engine2.run_loop(resolve_sender, scenarios_fn).await;
             });
         });
         self.set_status("Engine started — running in background.");
@@ -680,6 +1069,28 @@ impl eframe::App for NicordApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // "Sent today" is the persisted count, not a memory counter.
         self.sent_today = self.store.count_sends_today();
+        // Sync webhook health from the check thread into the config
+        // (persisted). Runs at most once per change: after syncing,
+        // shared and config agree, so no save happens next frame.
+        {
+            let health = self
+                .webhook_health_shared
+                .lock()
+                .map(|h| *h)
+                .unwrap_or(WebhookHealth::Unknown);
+            let checked = self
+                .webhook_last_checked_shared
+                .lock()
+                .map(|s| s.clone())
+                .unwrap_or_default();
+            if health != self.config.webhook_health
+                || checked != self.config.webhook_last_checked_at
+            {
+                self.config.webhook_health = health;
+                self.config.webhook_last_checked_at = checked;
+                let _ = save_config(&self.config);
+            }
+        }
 
         // System tray (Windows only): closing the window hides Nicord
         // to the tray instead of quitting; the tray menu can show it
@@ -742,10 +1153,26 @@ impl eframe::App for NicordApp {
                 if self.screen != Screen::Onboarding {
                     let (title, subtitle) = match self.screen {
                         Screen::Onboarding => ("", ""),
-                        Screen::Dashboard => ("Dashboard", "Tổng quan"),
-                        Screen::Builder => ("Scenario Builder", "Tạo và chỉnh sửa kịch bản"),
-                        Screen::Logs => ("Logs", "Lịch sử gửi tin"),
-                        Screen::Settings => ("Settings", "Cài đặt"),
+                        Screen::Dashboard => (
+                            t(self.lang(), "title.dashboard"),
+                            t(self.lang(), "subtitle.dashboard"),
+                        ),
+                        Screen::Builder => (
+                            t(self.lang(), "title.builder"),
+                            t(self.lang(), "subtitle.builder"),
+                        ),
+                        Screen::Destinations => (
+                            t(self.lang(), "title.destinations"),
+                            t(self.lang(), "subtitle.destinations"),
+                        ),
+                        Screen::Logs => (
+                            t(self.lang(), "title.logs"),
+                            t(self.lang(), "subtitle.logs"),
+                        ),
+                        Screen::Settings => (
+                            t(self.lang(), "title.settings"),
+                            t(self.lang(), "subtitle.settings"),
+                        ),
                     };
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
@@ -780,6 +1207,7 @@ impl eframe::App for NicordApp {
                     Screen::Onboarding => self.show_onboarding(ui),
                     Screen::Dashboard => self.show_dashboard(ui),
                     Screen::Builder => self.show_builder(ui),
+                    Screen::Destinations => self.show_destinations(ui),
                     Screen::Logs => self.show_logs(ui),
                     Screen::Settings => self.show_settings(ui),
                 }
@@ -807,10 +1235,11 @@ impl NicordApp {
         ui.add_space(12.0);
         if self.screen != Screen::Onboarding {
             for (label, screen) in [
-                ("Dashboard", Screen::Dashboard),
-                ("Builder", Screen::Builder),
-                ("Logs", Screen::Logs),
-                ("Settings", Screen::Settings),
+                (t(self.lang(), "nav.dashboard"), Screen::Dashboard),
+                (t(self.lang(), "nav.builder"), Screen::Builder),
+                (t(self.lang(), "nav.destinations"), Screen::Destinations),
+                (t(self.lang(), "nav.logs"), Screen::Logs),
+                (t(self.lang(), "nav.settings"), Screen::Settings),
             ] {
                 if theme::nav_button(ui, label, self.screen == screen).clicked() {
                     self.screen = screen;
@@ -909,79 +1338,25 @@ impl NicordApp {
                 ui.heading("Welcome to Nicord");
                 theme::muted(ui, "Gửi tin nhắn Discord tự động, theo lịch của bạn");
                 ui.add_space(10.0);
-                // Red ToS warning (kept verbatim, now in a red-bordered card).
-                theme::danger_frame().show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.label(
-                        RichText::new("WARNING — READ FIRST")
-                            .color(theme::DANGER)
-                            .text_style(egui::TextStyle::Name("SectionTitle".into())),
-                    );
-                    ui.label(
-                        "Automating a normal Discord user account (self-bot) is forbidden \
-                         by Discord's Terms of Service and can result in PERMANENT account \
-                         termination. Nicord makes no guarantee you will never be banned. \
-                         Use a SPARE account, never your main account.",
-                    );
-                });
-                ui.add_space(10.0);
-                ui.checkbox(
-                    &mut self.tos_checked,
-                    "I understand the risk and accept responsibility for my own account.",
-                );
-                ui.add_space(10.0);
-                theme::section_title(ui, "Step 1 — Your Discord token");
-                ui.label("Paste once, stored encrypted locally.");
-                ui.label("Get it yourself from Discord like a developer token. Never share it with anyone — not even Nicord support.");
-                if !self.config.token_last4.is_empty() {
-                    // token_last4 holds ONLY the last 4 chars (never the full token);
-                    // mask_token shows at most those 4, so even an old config that
-                    // still contains a full token can never leak it on screen.
-                    ui.label(format!(
-                        "Token stored: {}",
-                        mask_token(&self.config.token_last4)
-                    ));
-                }
-                ui.add_space(4.0);
+                theme::section_title(ui, "Chọn cách gửi");
                 ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.token_input)
-                            .password(true)
-                            .hint_text("paste your Discord token here"),
+                    ui.radio_value(
+                        &mut self.onboarding_mode,
+                        SendMode::Webhook,
+                        "Webhook (khuyến nghị)",
                     );
-                    if theme::primary_button(ui, "Save token").clicked() {
-                        if self.token_input.trim().is_empty() {
-                            self.set_status("Token is empty.");
-                        } else {
-                            match encrypt_token(self.token_input.trim()) {
-                                Ok(enc) => {
-                                    // SECURITY: store ONLY the last 4 chars for display.
-                                    // The full token must never be written to config.json
-                                    // in plaintext (Spec §9).
-                                    let tok = self.token_input.trim();
-                                    self.config.token_last4 = tok
-                                        .chars()
-                                        .rev()
-                                        .take(4)
-                                        .collect::<Vec<_>>()
-                                        .into_iter()
-                                        .rev()
-                                        .collect();
-                                    self.config.encrypted_token = enc;
-                                    self.config.tos_accepted = self.tos_checked;
-                                    if save_config(&self.config).is_ok() {
-                                        self.token_input.clear();
-                                        self.screen = Screen::Dashboard;
-                                        self.set_status("Token saved (encrypted, local only).");
-                                    } else {
-                                        self.set_status("Failed to save config.");
-                                    }
-                                }
-                                Err(e) => self.set_status(&format!("Cannot encrypt token: {e}")),
-                            }
-                        }
-                    }
+                    ui.radio_value(
+                        &mut self.onboarding_mode,
+                        SendMode::UserToken,
+                        "Tài khoản Discord",
+                    );
                 });
+                ui.add_space(10.0);
+                if self.onboarding_mode == SendMode::Webhook {
+                    self.show_onboarding_webhook(ui);
+                } else {
+                    self.show_onboarding_token(ui);
+                }
                 ui.add_space(10.0);
                 if theme::ghost_button(ui, "Skip for now -> Dashboard").clicked() {
                     self.config.tos_accepted = self.tos_checked;
@@ -989,6 +1364,251 @@ impl NicordApp {
                     self.screen = Screen::Dashboard;
                 }
             });
+        });
+    }
+
+    /// Onboarding — Webhook path (official, recommended). The URL is
+    /// the credential: it is validated, checked against Discord, then
+    /// stored encrypted. It is never shown in full.
+    fn show_onboarding_webhook(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            "Webhook là cách chính thức của Discord để gửi tin nhắn tự động \
+             tới 1 kênh. Tạo webhook trong Cài đặt kênh -> Tích hợp -> Webhook, \
+             rồi dán URL vào đây. URL webhook là mật khẩu — đừng chia sẻ. \
+             Webhook chỉ gửi tin nhắn, không gửi được lệnh.",
+        );
+        ui.add_space(8.0);
+        if !self.config.webhook_id.is_empty() {
+            ui.label(format!(
+                "Webhook đã lưu: {} (ID {})",
+                self.config.webhook_display_name(),
+                self.config.webhook_id
+            ));
+        }
+        ui.add_space(4.0);
+        ui.add(
+            egui::TextEdit::singleline(&mut self.webhook_url_input)
+                .password(true)
+                .hint_text("paste your webhook URL here"),
+        );
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if theme::ghost_button(ui, "Kiểm tra webhook").clicked() {
+                let url = self.webhook_url_input.clone();
+                self.check_webhook(url);
+            }
+            if theme::primary_button(ui, "Lưu webhook").clicked() {
+                let input = self.webhook_url_input.trim().to_string();
+                if input.is_empty() {
+                    self.set_status("Webhook URL is empty.");
+                } else {
+                    match parse_webhook_url(&input) {
+                        Ok(parsed) => match encrypt_token(&input) {
+                            Ok(enc) => {
+                                self.config.encrypted_webhook_url = enc;
+                                self.config.webhook_id = parsed.id.clone();
+                                // Keep a checked name when it matches this webhook.
+                                if let Ok(info) = self.webhook_info.lock() {
+                                    if let Some(w) = info.as_ref() {
+                                        if w.id == parsed.id {
+                                            self.config.webhook_name = w.display_name();
+                                        }
+                                    }
+                                }
+                                self.config.send_mode = SendMode::Webhook;
+                                if save_config(&self.config).is_ok() {
+                                    self.upsert_destination_from_legacy();
+                                    self.webhook_url_input.clear();
+                                    self.screen = Screen::Dashboard;
+                                    self.set_status("Webhook saved (encrypted, local only).");
+                                } else {
+                                    self.set_status("Failed to save config.");
+                                }
+                            }
+                            Err(e) => self.set_status(&format!("Cannot encrypt webhook URL: {e}")),
+                        },
+                        Err(e) => self.set_status(&e),
+                    }
+                }
+            }
+        });
+        let check_msg = self
+            .webhook_check_status
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_default();
+        if !check_msg.is_empty() {
+            ui.add_space(4.0);
+            ui.label(check_msg);
+        }
+    }
+
+    /// Onboarding — user-token (self-bot) path. Kept verbatim, including
+    /// the ToS warning: this mode carries a ban risk.
+    fn show_onboarding_token(&mut self, ui: &mut egui::Ui) {
+        // Red ToS warning (kept verbatim, now in a red-bordered card).
+        theme::danger_frame().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(
+                RichText::new("WARNING — READ FIRST")
+                    .color(theme::DANGER)
+                    .text_style(egui::TextStyle::Name("SectionTitle".into())),
+            );
+            ui.label(
+                "Automating a normal Discord user account (self-bot) is forbidden \
+                 by Discord's Terms of Service and can result in PERMANENT account \
+                 termination. Nicord makes no guarantee you will never be banned. \
+                 Use a SPARE account, never your main account.",
+            );
+        });
+        ui.add_space(10.0);
+        ui.checkbox(
+            &mut self.tos_checked,
+            "I understand the risk and accept responsibility for my own account.",
+        );
+        ui.add_space(10.0);
+        theme::section_title(ui, "Step 1 — Your Discord token");
+        ui.label("Paste once, stored encrypted locally.");
+        ui.label("Get it yourself from Discord like a developer token. Never share it with anyone — not even Nicord support.");
+        if !self.config.token_last4.is_empty() {
+            // token_last4 holds ONLY the last 4 chars (never the full token);
+            // mask_token shows at most those 4, so even an old config that
+            // still contains a full token can never leak it on screen.
+            ui.label(format!(
+                "Token stored: {}",
+                mask_token(&self.config.token_last4)
+            ));
+        }
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.token_input)
+                    .password(true)
+                    .hint_text("paste your Discord token here"),
+            );
+            if theme::primary_button(ui, "Save token").clicked() {
+                if self.token_input.trim().is_empty() {
+                    self.set_status("Token is empty.");
+                } else {
+                    match encrypt_token(self.token_input.trim()) {
+                        Ok(enc) => {
+                            // SECURITY: store ONLY the last 4 chars for display.
+                            // The full token must never be written to config.json
+                            // in plaintext (Spec §9).
+                            let tok = self.token_input.trim();
+                            self.config.token_last4 = tok
+                                .chars()
+                                .rev()
+                                .take(4)
+                                .collect::<Vec<_>>()
+                                .into_iter()
+                                .rev()
+                                .collect();
+                            self.config.encrypted_token = enc;
+                            self.config.tos_accepted = self.tos_checked;
+                            self.config.send_mode = SendMode::UserToken;
+                            if save_config(&self.config).is_ok() {
+                                self.token_input.clear();
+                                self.screen = Screen::Dashboard;
+                                self.set_status("Token saved (encrypted, local only).");
+                            } else {
+                                self.set_status("Failed to save config.");
+                            }
+                        }
+                        Err(e) => self.set_status(&format!("Cannot encrypt token: {e}")),
+                    }
+                }
+            }
+        });
+    }
+
+    /// Destination card (QoL Q2/Q4): one card for the active
+    /// destination — health + last check (webhook mode), last send,
+    /// persisted failures today, and the next scheduled run.
+    fn show_destination_card(&self, ui: &mut egui::Ui, next_text: &str) {
+        let is_webhook = self.config.send_mode == SendMode::Webhook;
+        let failed_today = self.store.count_status_today("failed");
+        let last_send = self
+            .store
+            .last_send_time()
+            .unwrap_or_else(|| "Chưa gửi lần nào".to_string());
+        if self.engine.is_globally_paused() {
+            theme::card(ui, |ui| {
+                ui.label(
+                    RichText::new(
+                        "Discord yêu cầu chờ toàn cục (429) — mọi đích đến đang tạm chờ, sẽ tự tiếp tục.",
+                    )
+                    .color(theme::DANGER),
+                );
+            });
+            ui.add_space(8.0);
+        }
+        theme::card(ui, |ui| {
+            theme::section_title(ui, t(self.lang(), "dash.destination"));
+            if is_webhook {
+                let dests = self.store.load_destinations().unwrap_or_default();
+                if dests.is_empty() {
+                    theme::muted(
+                        ui,
+                        "Chưa có đích đến nào — thêm một webhook trong Đích đến.",
+                    );
+                }
+                for dest in &dests {
+                    let sent = if dest.channel_id.is_empty() {
+                        0
+                    } else {
+                        self.store.count_sends_today_for_channel(&dest.channel_id)
+                    };
+                    let state_color = if !dest.enabled {
+                        theme::TEXT_SECONDARY
+                    } else if dest.failure_state.is_paused() {
+                        theme::DANGER
+                    } else {
+                        theme::SUCCESS
+                    };
+                    let state_text = if !dest.enabled {
+                        "Đã tắt"
+                    } else {
+                        dest.failure_state.label()
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label(theme::semibold(&dest.display_name(), 15.0));
+                        ui.label(RichText::new(state_text).color(state_color));
+                        theme::muted(ui, &format!("đã gửi hôm nay: {sent}"));
+                    });
+                    // Next run for this destination (Q7), with the
+                    // scenario's timezone shown.
+                    let next_for_dest = self.scenarios.lock().map(|l| {
+                        l.iter()
+                            .filter(|s| {
+                                s.enabled && s.destination_id.as_deref() == Some(dest.id.as_str())
+                            })
+                            .filter_map(|s| {
+                                s.schedule.as_ref().map(|sc| {
+                                    (sc.next_after(chrono::Local::now()), s.timezone.clone())
+                                })
+                            })
+                            .min_by_key(|(t, _)| *t)
+                    });
+                    if let Ok(Some((t, tz))) = next_for_dest {
+                        theme::muted(
+                            ui,
+                            &format!("Lịch tới: {} ({})", t.format("%d/%m %H:%M"), tz),
+                        );
+                    }
+                    if dest.failure_state.is_paused() && !dest.last_error.is_empty() {
+                        theme::muted(ui, &format!("Lỗi: {}", dest.last_error));
+                    }
+                }
+            } else {
+                ui.label(format!(
+                    "Tài khoản: {}",
+                    mask_token(&self.config.token_last4)
+                ));
+            }
+            theme::muted(ui, &format!("Gửi gần nhất: {last_send}"));
+            theme::muted(ui, &format!("Thất bại hôm nay: {failed_today}"));
+            theme::muted(ui, &format!("Lịch tới: {next_text}"));
         });
     }
 
@@ -1067,6 +1687,27 @@ impl NicordApp {
                     .color(theme::TEXT_MUTED),
             );
         });
+        ui.add_space(4.0);
+        // Send mode + destination, so the user always knows how sends go out.
+        let mode_text = match self.config.send_mode {
+            SendMode::Webhook => format!(
+                "Chế độ: Webhook — {} (ID {})",
+                self.config.webhook_display_name(),
+                self.config.webhook_id
+            ),
+            SendMode::UserToken => format!(
+                "Chế độ: Tài khoản — {}",
+                mask_token(&self.config.token_last4)
+            ),
+        };
+        ui.horizontal(|ui| {
+            ui.label(theme::dot(theme::TEXT_MUTED));
+            ui.label(RichText::new(mode_text).small().color(theme::TEXT_MUTED));
+        });
+        ui.add_space(12.0);
+        // Destination card (QoL Q2/Q4): health, last check, last send,
+        // and persisted failure count for the active destination.
+        self.show_destination_card(ui, &next_text);
         ui.add_space(12.0);
         // Actions.
         theme::card(ui, |ui| {
@@ -1232,7 +1873,7 @@ impl NicordApp {
                 }
                 None => {
                     theme::card(&mut cols[1], |ui| {
-                        theme::section_title(ui, "Editor");
+                        theme::section_title(ui, t(self.lang(), "builder.editor"));
                         theme::muted(
                             ui,
                             "Select a scenario on the left to edit it, or create a new one in the list.",
@@ -1263,7 +1904,17 @@ impl NicordApp {
                     } else {
                         self.new_scenario_name.trim().to_string()
                     };
-                    let s = Scenario::new(&name);
+                    let mut s = Scenario::new(&name);
+                    // Webhook mode: pre-select the first enabled
+                    // destination so the scenario can be enabled
+                    // without an extra step (user can change it).
+                    if self.config.send_mode == SendMode::Webhook {
+                        if let Ok(dests) = self.store.load_destinations() {
+                            if let Some(first) = dests.iter().find(|d| d.is_sendable()) {
+                                s.destination_id = Some(first.id.clone());
+                            }
+                        }
+                    }
                     if let Ok(mut list) = self.scenarios.lock() {
                         list.push(s);
                     }
@@ -1276,6 +1927,7 @@ impl NicordApp {
             let mut selected = self.selected;
             let mut to_delete: Option<usize> = None;
             let mut to_toggle: Option<usize> = None;
+            let mut to_clone: Option<usize> = None;
             {
                 let list = self.scenarios.lock().unwrap();
                 if list.is_empty() {
@@ -1305,6 +1957,10 @@ impl NicordApp {
                             {
                                 to_toggle = Some(i);
                             }
+                            ui.add_space(6.0);
+                            if ui.button("Clone").clicked() {
+                                to_clone = Some(i);
+                            }
                         });
                     });
                     if !s.channel_id.is_empty() {
@@ -1316,17 +1972,32 @@ impl NicordApp {
             self.selected = selected;
             if let Some(i) = to_toggle {
                 let mut msg: Option<String> = None;
+                let is_webhook = self.config.send_mode == SendMode::Webhook;
                 if let Ok(mut list) = self.scenarios.lock() {
                     let was_enabled = list.get(i).map(|s| s.enabled).unwrap_or(false);
                     if !was_enabled {
-                        // Hypothetical list with this scenario enabled: only
-                        // 1 distinct channel is allowed across enabled scenarios.
-                        let mut hypo = list.clone();
-                        if let Some(s) = hypo.get_mut(i) {
-                            s.enabled = true;
-                        }
-                        if let Some(v) = channels_violation(&hypo) {
-                            msg = Some(v);
+                        // Mode-aware validation first: an invalid scenario
+                        // must not be enabled (it would only fail in the engine).
+                        let valid = match list.get(i) {
+                            Some(s) if is_webhook => s.validate_for_webhook(),
+                            Some(s) => s.validate(),
+                            None => Err("scenario not found".to_string()),
+                        };
+                        if let Err(e) = valid {
+                            msg = Some(format!("Cannot enable: {e}"));
+                        } else if !is_webhook {
+                            // Hypothetical list with this scenario enabled: only
+                            // 1 distinct channel is allowed across enabled scenarios
+                            // (user mode; webhook mode ignores channel_id).
+                            let mut hypo = list.clone();
+                            if let Some(s) = hypo.get_mut(i) {
+                                s.enabled = true;
+                            }
+                            if let Some(v) = channels_violation(&hypo) {
+                                msg = Some(v);
+                            } else if let Some(s) = list.get_mut(i) {
+                                s.enabled = true;
+                            }
                         } else if let Some(s) = list.get_mut(i) {
                             s.enabled = true;
                         }
@@ -1348,6 +2019,27 @@ impl NicordApp {
                     }
                 }
                 self.selected = None;
+            }
+            if let Some(i) = to_clone {
+                // Clone (QoL Q5): fresh id, disabled, no run history,
+                // name marked as a copy. The clone is selected so the
+                // user can edit it right away.
+                if let Ok(mut list) = self.scenarios.lock() {
+                    if let Some(orig) = list.get(i).cloned() {
+                        let mut copy = orig;
+                        copy.id = uuid::Uuid::new_v4().to_string();
+                        copy.name = format!("{} (bản sao)", copy.name);
+                        copy.enabled = false;
+                        copy.last_run_at = None;
+                        copy.created_at = None;
+                        list.push(copy.clone());
+                        let idx = list.len() - 1;
+                        let _ = self.store.save_scenario(&copy);
+                        selected = Some(idx);
+                    }
+                }
+                self.selected = selected;
+                self.set_status("Scenario cloned (disabled — review it, then enable).");
             }
         });
     }
@@ -1377,66 +2069,143 @@ impl NicordApp {
             }
         }
         theme::card(ui, |ui| {
-            theme::section_title(ui, "Editor");
-            ui.label("Channel picker (loads your servers/channels from Discord):");
-            ui.horizontal(|ui| {
-                if ui.button("Load servers").clicked() {
-                    self.load_guilds();
-                }
-                let guilds = self.guilds.lock().map(|g| g.clone()).unwrap_or_default();
-                if !guilds.is_empty() {
-                    let mut picked = self.picker_guild_id.clone();
-                    egui::ComboBox::from_label("Server")
-                        .selected_text(
-                            guilds
-                                .iter()
-                                .find(|g| g.id == picked)
-                                .map(|g| g.name.clone())
-                                .unwrap_or_else(|| "pick a server".to_string()),
-                        )
+            theme::section_title(ui, t(self.lang(), "builder.editor"));
+            if self.config.send_mode == SendMode::Webhook {
+                // Destination picker: each scenario sends to exactly
+                // one destination. A scenario without one cannot be
+                // enabled (validation blocks it with a clear error).
+                let dests = self.store.load_destinations().unwrap_or_default();
+                let current_dest_id = {
+                    self.scenarios
+                        .lock()
+                        .map(|l| {
+                            l.get(i)
+                                .and_then(|s| s.destination_id.clone())
+                                .unwrap_or_default()
+                        })
+                        .unwrap_or_default()
+                };
+                let current_label = dests
+                    .iter()
+                    .find(|d| d.id == current_dest_id)
+                    .map(|d| d.display_name())
+                    .unwrap_or_else(|| "— Chưa chọn đích đến —".to_string());
+                ui.horizontal(|ui| {
+                    ui.label("Gửi tới:");
+                    egui::ComboBox::from_id_salt("builder_destination")
+                        .selected_text(current_label)
                         .show_ui(ui, |ui| {
-                            for g in &guilds {
+                            for d in dests.iter().filter(|d| d.enabled) {
                                 if ui
-                                    .selectable_value(&mut picked, g.id.clone(), &g.name)
+                                    .selectable_label(d.id == current_dest_id, d.display_name())
                                     .clicked()
                                 {
-                                    self.picker_guild_id = g.id.clone();
-                                    self.load_channels(g.id.clone());
+                                    if let Ok(mut list) = self.scenarios.lock() {
+                                        if let Some(s) = list.get_mut(i) {
+                                            s.destination_id = Some(d.id.clone());
+                                            let _ = self.store.save_scenario(s);
+                                        }
+                                    }
                                 }
                             }
-                        });
-                }
-                let channels = self.channels.lock().map(|c| c.clone()).unwrap_or_default();
-                if !channels.is_empty() {
-                    let mut picked = channel_id.clone();
-                    egui::ComboBox::from_label("Channel")
-                        .selected_text(
-                            channels
-                                .iter()
-                                .find(|c| c.id == picked)
-                                .map(|c| format!("#{}", c.name))
-                                .unwrap_or_else(|| "pick a channel".to_string()),
-                        )
-                        .show_ui(ui, |ui| {
-                            for c in &channels {
-                                if ui
-                                    .selectable_value(
-                                        &mut picked,
-                                        c.id.clone(),
-                                        format!("#{}", c.name),
-                                    )
-                                    .clicked()
-                                {
-                                    channel_id = c.id.clone();
-                                }
+                            if dests.iter().any(|d| !d.enabled) {
+                                ui.separator();
+                                theme::muted(ui, "Đích đến đã tắt không hiện ở đây.");
                             }
                         });
+                    if ui.button("Sửa đích đến").clicked() {
+                        self.screen = Screen::Destinations;
+                    }
+                });
+                if let Some(dest) = dests.iter().find(|d| d.id == current_dest_id) {
+                    theme::muted(
+                        ui,
+                        &format!(
+                            "Giới hạn: {}/ngày, cách nhau tối thiểu {}s{}",
+                            if dest.daily_cap == 0 {
+                                "theo toàn cục".to_string()
+                            } else {
+                                dest.daily_cap.to_string()
+                            },
+                            dest.min_interval_secs,
+                            match (&dest.quiet_start, &dest.quiet_end) {
+                                (Some(s), Some(e)) => format!(", im lặng {s}–{e}"),
+                                _ => String::new(),
+                            }
+                        ),
+                    );
+                } else if dests.is_empty() {
+                    theme::muted(
+                        ui,
+                        "Chưa có đích đến nào — thêm một webhook trong Đích đến.",
+                    );
+                } else {
+                    theme::muted(ui, "Chọn một đích đến để bật kịch bản này.");
                 }
-            });
-            ui.label("Destination channel ID (or pick above):");
-            ui.add(
-                egui::TextEdit::singleline(&mut channel_id).hint_text("e.g. 123456789012345678"),
-            );
+                theme::muted(ui, "Lệnh (Send Command) không hoạt động ở chế độ Webhook.");
+                ui.add_space(6.0);
+            } else {
+                ui.label("Channel picker (loads your servers/channels from Discord):");
+                ui.horizontal(|ui| {
+                    if ui.button("Load servers").clicked() {
+                        self.load_guilds();
+                    }
+                    let guilds = self.guilds.lock().map(|g| g.clone()).unwrap_or_default();
+                    if !guilds.is_empty() {
+                        let mut picked = self.picker_guild_id.clone();
+                        egui::ComboBox::from_label("Server")
+                            .selected_text(
+                                guilds
+                                    .iter()
+                                    .find(|g| g.id == picked)
+                                    .map(|g| g.name.clone())
+                                    .unwrap_or_else(|| "pick a server".to_string()),
+                            )
+                            .show_ui(ui, |ui| {
+                                for g in &guilds {
+                                    if ui
+                                        .selectable_value(&mut picked, g.id.clone(), &g.name)
+                                        .clicked()
+                                    {
+                                        self.picker_guild_id = g.id.clone();
+                                        self.load_channels(g.id.clone());
+                                    }
+                                }
+                            });
+                    }
+                    let channels = self.channels.lock().map(|c| c.clone()).unwrap_or_default();
+                    if !channels.is_empty() {
+                        let mut picked = channel_id.clone();
+                        egui::ComboBox::from_label("Channel")
+                            .selected_text(
+                                channels
+                                    .iter()
+                                    .find(|c| c.id == picked)
+                                    .map(|c| format!("#{}", c.name))
+                                    .unwrap_or_else(|| "pick a channel".to_string()),
+                            )
+                            .show_ui(ui, |ui| {
+                                for c in &channels {
+                                    if ui
+                                        .selectable_value(
+                                            &mut picked,
+                                            c.id.clone(),
+                                            format!("#{}", c.name),
+                                        )
+                                        .clicked()
+                                    {
+                                        channel_id = c.id.clone();
+                                    }
+                                }
+                            });
+                    }
+                });
+                ui.label("Destination channel ID (or pick above):");
+                ui.add(
+                    egui::TextEdit::singleline(&mut channel_id)
+                        .hint_text("e.g. 123456789012345678"),
+                );
+            } // end user-mode channel picker
             ui.label("Messages (rotate, spin-text {a|b} supported):");
             if messages.is_empty() {
                 theme::muted(ui, "No messages yet — add one below.");
@@ -1446,7 +2215,16 @@ impl NicordApp {
                 .max_height(90.0)
                 .show(ui, |ui| {
                     for m in &messages {
-                        ui.label(format!("• {m}"));
+                        if over_limit(m) {
+                            ui.label(
+                                RichText::new(format!(
+                                    "• {m} (quá 2000 ký tự — sẽ bị chặn khi bật)"
+                                ))
+                                .color(theme::DANGER),
+                            );
+                        } else {
+                            ui.label(format!("• {m}"));
+                        }
                     }
                 });
             ui.horizontal(|ui| {
@@ -1458,9 +2236,16 @@ impl NicordApp {
                         .hint_text("Add a message...")
                         .desired_width(field_w),
                 );
-                if theme::primary_button(ui, "+ Add message").clicked()
-                    && !self.new_message.trim().is_empty()
-                {
+                // Over the Discord limit: the button is disabled and
+                // the preview below shows why (QoL Q1).
+                let too_long = over_limit(self.new_message.trim());
+                let add_clicked = ui
+                    .add_enabled(
+                        !self.new_message.trim().is_empty() && !too_long,
+                        egui::Button::new("+ Add message"),
+                    )
+                    .clicked();
+                if add_clicked {
                     if let Ok(mut list) = self.scenarios.lock() {
                         if let Some(s) = list.get_mut(i) {
                             s.messages.push(self.new_message.trim().to_string());
@@ -1470,7 +2255,33 @@ impl NicordApp {
                     self.save_scenarios();
                 }
             });
+            // Emoji picker (Q10) + content source line (Q6).
+            self.show_emoji_picker(ui);
+            ui.add_space(4.0);
+            self.show_content_source(ui, i);
+            ui.add_space(6.0);
             ui.label("Nodes (in order — click a command node to edit it):");
+            // Q1 preview: live Discord-style preview of the text
+            // being composed, with a 2000-character counter.
+            self.show_message_preview(ui);
+            ui.add_space(6.0);
+            // Schedule editor (Q7) + template library (Q6) + embed (Q8).
+            self.show_schedule_editor(ui, i);
+            ui.add_space(6.0);
+            self.show_template_library(ui, i);
+            ui.add_space(6.0);
+            self.show_embed_composer(ui, i);
+            ui.add_space(6.0);
+            // Import warnings from the last import (Q3), if any.
+            if !self.import_warnings.is_empty() {
+                theme::card(ui, |ui| {
+                    theme::section_title(ui, "Cảnh báo import");
+                    for w in &self.import_warnings {
+                        theme::muted(ui, &format!("• {w}"));
+                    }
+                });
+                ui.add_space(6.0);
+            }
             for (kind, id, cmd_name) in &nodes {
                 let label = if kind == &NodeKind::ActionSendCommand {
                     format!("• {} — Lệnh: {cmd_name}", kind.group())
@@ -1505,6 +2316,655 @@ impl NicordApp {
                 }
             }
         });
+    }
+
+    /// Content source line (Q6): which messages will actually send,
+    /// and — when the choice is unambiguous — the exact next message.
+    /// Rotation is random (never repeats the last pick), so with
+    /// several candidates the UI says so honestly instead of
+    /// predicting a message it cannot know.
+    fn show_content_source(&mut self, ui: &mut egui::Ui, i: usize) {
+        let (scenario, dest) = {
+            let list = self.scenarios.lock().map(|l| l.get(i).cloned());
+            let scenario = list.unwrap_or(None);
+            let dest = scenario
+                .as_ref()
+                .and_then(|s| s.destination_id.clone())
+                .and_then(|id| self.store.load_destination(&id).ok().flatten());
+            (scenario, dest)
+        };
+        let Some(scenario) = scenario else {
+            return;
+        };
+        // Checkbox: use destination messages outright (webhook mode).
+        if self.config.send_mode == SendMode::Webhook {
+            if let Some(d) = &dest {
+                let mut use_dest = scenario.use_destination_messages;
+                if ui
+                    .checkbox(
+                        &mut use_dest,
+                        "Dùng bộ tin của đích đến thay cho tin của kịch bản",
+                    )
+                    .changed()
+                {
+                    if let Ok(mut list) = self.scenarios.lock() {
+                        if let Some(s) = list.get_mut(i) {
+                            s.use_destination_messages = use_dest;
+                            let _ = self.store.save_scenario(s);
+                        }
+                    }
+                }
+                let _ = d;
+            }
+        }
+        // Source line.
+        if let Some(node_msg) = scenario.node_message() {
+            theme::muted(ui, &format!("Tin tiếp theo (từ node): {node_msg}"));
+        } else if scenario.use_destination_messages {
+            match &dest {
+                Some(d) if !d.default_messages.is_empty() => {
+                    if d.default_messages.len() == 1 {
+                        theme::muted(
+                            ui,
+                            &format!("Tin tiếp theo (bộ tin đích đến): {}", d.default_messages[0]),
+                        );
+                    } else {
+                        theme::muted(ui, &format!(
+                            "Nguồn tin: bộ tin của đích đến ({} tin, chọn ngẫu nhiên, không lặp lại tin vừa gửi)",
+                            d.default_messages.len()
+                        ));
+                    }
+                }
+                _ => {
+                    ui.label(
+                        RichText::new(
+                            "Cảnh báo: đang dùng bộ tin của đích đến nhưng đích đến chưa có tin nào — kịch bản sẽ không gửi được.",
+                        )
+                        .color(theme::DANGER),
+                    );
+                }
+            }
+        } else if !scenario.messages.is_empty() {
+            if scenario.messages.len() == 1 {
+                theme::muted(ui, &format!("Tin tiếp theo: {}", scenario.messages[0]));
+            } else {
+                theme::muted(
+                    ui,
+                    &format!(
+                    "Nguồn tin: {} tin của kịch bản (chọn ngẫu nhiên, không lặp lại tin vừa gửi)",
+                    scenario.messages.len()
+                ),
+                );
+            }
+        } else if let Some(d) = &dest {
+            if !d.default_messages.is_empty() {
+                theme::muted(ui, &format!(
+                    "Nguồn tin: bộ tin của đích đến ({} tin) — kịch bản đang trống nên dùng bộ tin này.",
+                    d.default_messages.len()
+                ));
+            } else {
+                ui.label(
+                    RichText::new(
+                        "Cảnh báo: kịch bản và đích đến đều chưa có tin nào — kịch bản sẽ không gửi được.",
+                    )
+                    .color(theme::DANGER),
+                );
+            }
+        } else if scenario.messages.is_empty() {
+            ui.label(RichText::new("Cảnh báo: kịch bản chưa có tin nào.").color(theme::DANGER));
+        }
+    }
+
+    /// Schedule editor (Q7): type + fields + presets + timezone.
+    /// Reads a snapshot, renders controls, writes back on change.
+    /// Invalid input (bad time, bad cron, unknown timezone) is shown
+    /// as an error and never written (fail-closed).
+    fn show_schedule_editor(&mut self, ui: &mut egui::Ui, i: usize) {
+        let (mut schedule, mut timezone) = self
+            .scenarios
+            .lock()
+            .map(|l| {
+                l.get(i)
+                    .map(|s| (s.schedule.clone(), s.timezone.clone()))
+                    .unwrap_or((None, "Asia/Ho_Chi_Minh".to_string()))
+            })
+            .unwrap_or((None, "Asia/Ho_Chi_Minh".to_string()));
+        let mut changed = false;
+        let mut error: Option<String> = None;
+        theme::card(ui, |ui| {
+            theme::section_title(ui, t(self.lang(), "builder.schedule"));
+            // Presets (Q7).
+            ui.label("Mẫu nhanh:");
+            ui.horizontal_wrapped(|ui| {
+                let presets: [(&str, Schedule); 6] = [
+                    ("Mỗi 30 phút", Schedule::EveryMinutes { minutes: 30 }),
+                    ("Mỗi giờ", Schedule::EveryHours { hours: 1 }),
+                    (
+                        "Sáng 8:00",
+                        Schedule::Daily {
+                            time: chrono::NaiveTime::from_hms_opt(8, 0, 0).unwrap_or_default(),
+                        },
+                    ),
+                    (
+                        "Tối 20:00",
+                        Schedule::Daily {
+                            time: chrono::NaiveTime::from_hms_opt(20, 0, 0).unwrap_or_default(),
+                        },
+                    ),
+                    (
+                        "T2–T6 9:00",
+                        Schedule::Weekly {
+                            weekdays: vec![0, 1, 2, 3, 4],
+                            time: chrono::NaiveTime::from_hms_opt(9, 0, 0).unwrap_or_default(),
+                        },
+                    ),
+                    (
+                        "Cuối tuần 10:00",
+                        Schedule::Weekly {
+                            weekdays: vec![5, 6],
+                            time: chrono::NaiveTime::from_hms_opt(10, 0, 0).unwrap_or_default(),
+                        },
+                    ),
+                ];
+                for (label, preset) in presets {
+                    if ui.button(label).clicked() {
+                        schedule = Some(preset);
+                        changed = true;
+                    }
+                }
+            });
+            ui.separator();
+            // Type selector.
+            let type_labels = ["Hàng ngày", "Hàng tuần", "Mỗi N phút", "Mỗi N giờ", "Cron"];
+            let current_type = match &schedule {
+                Some(Schedule::Daily { .. }) => 0,
+                Some(Schedule::Weekly { .. }) => 1,
+                Some(Schedule::EveryMinutes { .. }) => 2,
+                Some(Schedule::EveryHours { .. }) => 3,
+                Some(Schedule::Cron { .. }) => 4,
+                Some(Schedule::Once { .. }) | None => 0,
+            };
+            let mut type_idx = current_type;
+            egui::ComboBox::from_id_salt("schedule_type")
+                .selected_text(type_labels[type_idx])
+                .show_ui(ui, |ui| {
+                    for (idx, label) in type_labels.iter().enumerate() {
+                        ui.selectable_value(&mut type_idx, idx, *label);
+                    }
+                });
+            if type_idx != current_type {
+                schedule = Some(match type_idx {
+                    1 => Schedule::Weekly {
+                        weekdays: vec![0],
+                        time: chrono::NaiveTime::from_hms_opt(9, 0, 0).unwrap_or_default(),
+                    },
+                    2 => Schedule::EveryMinutes { minutes: 30 },
+                    3 => Schedule::EveryHours { hours: 1 },
+                    4 => Schedule::Cron {
+                        expr: "0 9 * * *".to_string(),
+                    },
+                    _ => Schedule::Daily {
+                        time: chrono::NaiveTime::from_hms_opt(9, 0, 0).unwrap_or_default(),
+                    },
+                });
+                changed = true;
+            }
+            // Per-type fields.
+            match &mut schedule {
+                Some(Schedule::Daily { time }) => {
+                    let mut text = time.format("%H:%M").to_string();
+                    ui.horizontal(|ui| {
+                        ui.label("Giờ (HH:MM):");
+                        if ui.text_edit_singleline(&mut text).changed() {
+                            match chrono::NaiveTime::parse_from_str(&text, "%H:%M") {
+                                Ok(t) => {
+                                    *time = t;
+                                    changed = true;
+                                }
+                                Err(_) => error = Some("Giờ phải là HH:MM (24h).".to_string()),
+                            }
+                        }
+                    });
+                }
+                Some(Schedule::Weekly { weekdays, time }) => {
+                    let names = ["T2", "T3", "T4", "T5", "T6", "T7", "CN"];
+                    ui.horizontal(|ui| {
+                        for (day, name) in names.iter().enumerate() {
+                            let mut on = weekdays.contains(&(day as u8));
+                            if ui.checkbox(&mut on, *name).changed() {
+                                if on {
+                                    weekdays.push(day as u8);
+                                    weekdays.sort_unstable();
+                                } else {
+                                    weekdays.retain(|d| *d != day as u8);
+                                }
+                                changed = true;
+                            }
+                        }
+                    });
+                    if weekdays.is_empty() {
+                        error = Some("Chọn ít nhất một ngày trong tuần.".to_string());
+                    }
+                    let mut text = time.format("%H:%M").to_string();
+                    ui.horizontal(|ui| {
+                        ui.label("Giờ (HH:MM):");
+                        if ui.text_edit_singleline(&mut text).changed() {
+                            match chrono::NaiveTime::parse_from_str(&text, "%H:%M") {
+                                Ok(t) => {
+                                    *time = t;
+                                    changed = true;
+                                }
+                                Err(_) => error = Some("Giờ phải là HH:MM (24h).".to_string()),
+                            }
+                        }
+                    });
+                }
+                Some(Schedule::EveryMinutes { minutes }) => {
+                    ui.horizontal(|ui| {
+                        ui.label("Mỗi (phút):");
+                        if ui
+                            .add(egui::DragValue::new(minutes).range(1..=1440))
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                    });
+                }
+                Some(Schedule::EveryHours { hours }) => {
+                    ui.horizontal(|ui| {
+                        ui.label("Mỗi (giờ):");
+                        if ui.add(egui::DragValue::new(hours).range(1..=24)).changed() {
+                            changed = true;
+                        }
+                    });
+                }
+                Some(Schedule::Cron { expr }) => {
+                    ui.horizontal(|ui| {
+                        ui.label("Cron (5 trường):");
+                        if ui.text_edit_singleline(expr).changed() {
+                            changed = true;
+                        }
+                    });
+                    theme::muted(ui, "Ví dụ: 0 9 * * * = 9:00 hàng ngày.");
+                }
+                Some(Schedule::Once { at }) => {
+                    theme::muted(
+                        ui,
+                        &format!(
+                            "Chạy một lần: {} (không sửa được ở đây — import JSON để đổi).",
+                            at.format("%Y-%m-%d %H:%M UTC")
+                        ),
+                    );
+                }
+                None => {
+                    theme::muted(ui, "Chưa có lịch — chọn một mẫu nhanh ở trên.");
+                }
+            }
+            // Timezone (Q7: shown with the schedule, fail-closed).
+            ui.horizontal(|ui| {
+                ui.label("Múi giờ:");
+                if ui.text_edit_singleline(&mut timezone).changed() {
+                    changed = true;
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                for tz in [
+                    "Asia/Ho_Chi_Minh",
+                    "Asia/Bangkok",
+                    "UTC",
+                    "Asia/Tokyo",
+                    "Europe/London",
+                    "America/New_York",
+                ] {
+                    if ui.small_button(tz).clicked() {
+                        timezone = tz.to_string();
+                        changed = true;
+                    }
+                }
+            });
+            // Next run with timezone shown.
+            if let Some(sc) = &schedule {
+                let next = sc.next_after(chrono::Local::now());
+                theme::muted(
+                    ui,
+                    &format!("Lịch tới: {} ({})", next.format("%d/%m/%Y %H:%M"), timezone),
+                );
+            }
+            if let Some(e) = &error {
+                ui.label(RichText::new(e).color(theme::DANGER));
+            }
+        });
+        // Write back (only when valid: schedule validates + timezone parses).
+        if changed && error.is_none() {
+            if timezone.parse::<chrono_tz::Tz>().is_err() {
+                self.set_status(&format!("Unknown timezone '{timezone}' — not saved."));
+                return;
+            }
+            if let Some(sc) = &schedule {
+                if let Err(e) = sc.validate() {
+                    self.set_status(&format!("Invalid schedule — not saved: {e}"));
+                    return;
+                }
+            }
+            if let Ok(mut list) = self.scenarios.lock() {
+                if let Some(s) = list.get_mut(i) {
+                    s.schedule = schedule;
+                    s.timezone = timezone;
+                    let _ = self.store.save_scenario(s);
+                }
+            }
+        }
+    }
+
+    /// Template library (Q6): save the composed text as a template,
+    /// insert a template into this scenario's messages, delete one.
+    fn show_template_library(&mut self, ui: &mut egui::Ui, i: usize) {
+        theme::card(ui, |ui| {
+            theme::section_title(ui, t(self.lang(), "builder.templates"));
+            let templates = self.store.load_templates().unwrap_or_default();
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.template_name).hint_text("Tên mẫu..."));
+                let can_save = !self.template_name.trim().is_empty()
+                    && !self.new_message.trim().is_empty()
+                    && !over_limit(self.new_message.trim());
+                if ui
+                    .add_enabled(can_save, egui::Button::new("Lưu tin đang soạn thành mẫu"))
+                    .clicked()
+                {
+                    match self
+                        .store
+                        .save_template(&self.template_name, self.new_message.trim())
+                    {
+                        Ok(_) => {
+                            self.template_name.clear();
+                            self.set_status("Template saved.");
+                        }
+                        Err(e) => self.set_status(&format!("Cannot save template: {e}")),
+                    }
+                }
+            });
+            theme::muted(
+                ui,
+                "Mẫu được lưu chung cho mọi kịch bản, không chứa secret.",
+            );
+            if templates.is_empty() {
+                theme::muted(ui, "Chưa có mẫu nào.");
+            }
+            for (id, name, content) in &templates {
+                ui.horizontal(|ui| {
+                    ui.label(format!("• {name}: {content}"));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Xóa").clicked() {
+                            let _ = self.store.delete_template(id);
+                        }
+                        if ui.button("Chèn vào kịch bản").clicked() {
+                            if let Ok(mut list) = self.scenarios.lock() {
+                                if let Some(s) = list.get_mut(i) {
+                                    s.messages.push(content.clone());
+                                }
+                            }
+                            self.save_scenarios();
+                            self.set_status("Template inserted into this scenario.");
+                        }
+                    });
+                });
+            }
+        });
+    }
+
+    /// Emoji picker (Q10): offline grid from the shortcode table
+    /// (inserts the real Unicode character, so the sent message
+    /// contains the emoji itself) + custom emoji markup paste.
+    fn show_emoji_picker(&mut self, ui: &mut egui::Ui) {
+        if ui
+            .button(if self.show_emoji_picker {
+                "😀 Đóng bảng emoji"
+            } else {
+                "😀 Emoji"
+            })
+            .clicked()
+        {
+            self.show_emoji_picker = !self.show_emoji_picker;
+        }
+        if !self.show_emoji_picker {
+            return;
+        }
+        theme::card(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for (_, emoji) in crate::preview::EMOJI_PICKER_LIST {
+                    if ui.button(*emoji).clicked() {
+                        self.new_message.push_str(emoji);
+                    }
+                }
+            });
+            ui.separator();
+            ui.label("Emoji tùy chỉnh (dán <:tên:id> hoặc URL CDN):");
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.custom_emoji_input)
+                        .hint_text("<:name:123456789>"),
+                );
+                if ui.button("Chèn").clicked() && !self.custom_emoji_input.trim().is_empty() {
+                    self.new_message.push_str(self.custom_emoji_input.trim());
+                    self.custom_emoji_input.clear();
+                }
+            });
+            theme::muted(ui, "Emoji tùy chỉnh chỉ hiện trong Discord nếu server có emoji đó (webhook dùng emoji của server chứa kênh). Xem trước hiện nguyên văn markup.");
+        });
+    }
+
+    /// Embed composer (Q8): one rich embed per scenario, sent with
+    /// every message. Limits are enforced live; an invalid embed
+    /// blocks saving with the reason shown.
+    fn show_embed_composer(&mut self, ui: &mut egui::Ui, i: usize) {
+        let mut embed = self
+            .scenarios
+            .lock()
+            .map(|l| l.get(i).and_then(|s| s.embed.clone()))
+            .unwrap_or(None);
+        let mut changed = false;
+        let mut error: Option<String> = None;
+        theme::card(ui, |ui| {
+            theme::section_title(ui, t(self.lang(), "builder.embed"));
+            let mut enabled = embed.is_some();
+            if ui.checkbox(&mut enabled, "Gửi kèm embed").changed() {
+                embed = if enabled {
+                    Some(crate::embed::Embed::default())
+                } else {
+                    None
+                };
+                changed = true;
+            }
+            if let Some(e) = &mut embed {
+                ui.horizontal(|ui| {
+                    ui.label("Tiêu đề (tối đa 256):");
+                    if ui.text_edit_singleline(&mut e.title).changed() {
+                        changed = true;
+                    }
+                });
+                ui.label("Mô tả (tối đa 4096):");
+                if ui
+                    .add(
+                        egui::TextEdit::multiline(&mut e.description)
+                            .desired_rows(3)
+                            .desired_width(f32::INFINITY),
+                    )
+                    .changed()
+                {
+                    changed = true;
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Tác giả (tối đa 256):");
+                    if ui.text_edit_singleline(&mut e.author_name).changed() {
+                        changed = true;
+                    }
+                });
+                // Color: hex field + presets.
+                let mut hex = e.color.map(|c| format!("{c:06X}")).unwrap_or_default();
+                ui.horizontal(|ui| {
+                    ui.label("Màu (hex RRGGBB, để trống = mặc định):");
+                    if ui.text_edit_singleline(&mut hex).changed() {
+                        let hex_trim = hex.trim().trim_start_matches('#');
+                        if hex_trim.is_empty() {
+                            e.color = None;
+                            changed = true;
+                        } else if hex_trim.len() == 6 && u32::from_str_radix(hex_trim, 16).is_ok() {
+                            e.color = u32::from_str_radix(hex_trim, 16).ok();
+                            changed = true;
+                        } else {
+                            error = Some("Màu phải là 6 ký tự hex (vd: 5865F2).".to_string());
+                        }
+                    }
+                    for (label, value) in [
+                        ("Blurple", 0x5865F2u32),
+                        ("Xanh", 0x57F287),
+                        ("Đỏ", 0xED4245),
+                        ("Vàng", 0xFEE75C),
+                        ("Tím", 0x9B59B6),
+                    ] {
+                        if ui.small_button(label).clicked() {
+                            e.color = Some(value);
+                            changed = true;
+                        }
+                    }
+                });
+                ui.label("Fields (tối đa 25, tên 256 / giá trị 1024):");
+                let mut to_remove: Option<usize> = None;
+                for (idx, field) in e.fields.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::TextEdit::singleline(&mut field.name).hint_text("Tên field"));
+                        ui.add(egui::TextEdit::singleline(&mut field.value).hint_text("Giá trị"));
+                        ui.checkbox(&mut field.inline, "inline");
+                        if ui.button("Xóa").clicked() {
+                            to_remove = Some(idx);
+                        }
+                    });
+                }
+                if let Some(idx) = to_remove {
+                    e.fields.remove(idx);
+                    changed = true;
+                }
+                if e.fields.len() < crate::embed::EMBED_MAX_FIELDS
+                    && ui.button("+ Thêm field").clicked()
+                {
+                    e.fields.push(crate::embed::EmbedField::default());
+                    changed = true;
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Chân trang (tối đa 2048):");
+                    if ui.text_edit_singleline(&mut e.footer_text).changed() {
+                        changed = true;
+                    }
+                });
+                theme::muted(
+                    ui,
+                    &format!(
+                        "Tổng embed: {}/6000 ký tự (giới hạn của Discord).",
+                        e.total_chars()
+                    ),
+                );
+                if let Err(validation) = e.validate() {
+                    ui.label(RichText::new(validation).color(theme::DANGER));
+                }
+                // Preview card.
+                ui.add_space(4.0);
+                theme::card(ui, |ui| {
+                    if let Some(color) = e.color {
+                        ui.label(
+                            RichText::new(format!("■ Màu #{color:06X}"))
+                                .color(theme::TEXT_SECONDARY),
+                        );
+                    }
+                    if !e.author_name.trim().is_empty() {
+                        theme::muted(ui, &e.author_name);
+                    }
+                    if !e.title.trim().is_empty() {
+                        ui.label(theme::semibold(&e.title, 16.0));
+                    }
+                    if !e.description.trim().is_empty() {
+                        ui.label(&e.description);
+                    }
+                    for field in &e.fields {
+                        ui.horizontal(|ui| {
+                            ui.label(theme::semibold(&field.name, 14.0));
+                            ui.label(&field.value);
+                        });
+                    }
+                    if !e.footer_text.trim().is_empty() {
+                        theme::muted(ui, &e.footer_text);
+                    }
+                });
+            }
+            if let Some(e) = &error {
+                ui.label(RichText::new(e).color(theme::DANGER));
+            }
+        });
+        if changed && error.is_none() {
+            // Validate before writing (fail-closed).
+            if let Some(e) = &embed {
+                if let Err(validation) = e.validate() {
+                    self.set_status(&format!("Invalid embed — not saved: {validation}"));
+                    return;
+                }
+            }
+            if let Ok(mut list) = self.scenarios.lock() {
+                if let Some(s) = list.get_mut(i) {
+                    s.embed = embed;
+                    let _ = self.store.save_scenario(s);
+                }
+            }
+        }
+    }
+
+    /// Discord-style preview of the message being composed (QoL Q1):
+    /// markdown segments, emoji shortcodes expanded for display, and
+    /// a live character counter. Empty input shows nothing.
+    fn show_message_preview(&self, ui: &mut egui::Ui) {
+        if self.new_message.trim().is_empty() {
+            return;
+        }
+        let raw = self.new_message.trim();
+        let count = char_count(raw);
+        let too_long = count > crate::preview::DISCORD_CONTENT_LIMIT;
+        ui.horizontal(|ui| {
+            ui.label("Xem trước:");
+            let counter = format!("{count}/2000 ký tự");
+            if too_long {
+                ui.label(RichText::new(counter).color(theme::DANGER));
+            } else {
+                theme::muted(ui, &counter);
+            }
+        });
+        theme::card(ui, |ui| {
+            // Expand shortcodes for display only; the sent text keeps
+            // exactly what the user typed (see preview.rs).
+            let expanded = expand_shortcodes(raw);
+            ui.horizontal_wrapped(|ui| {
+                for seg in parse_markdown(&expanded) {
+                    let mut text = RichText::new(seg.text);
+                    if seg.bold {
+                        text = text.strong();
+                    }
+                    if seg.italic {
+                        text = text.italics();
+                    }
+                    if seg.strike {
+                        text = text.strikethrough();
+                    }
+                    if seg.underline {
+                        text = text.underline();
+                    }
+                    if seg.code {
+                        text = text.monospace();
+                    }
+                    ui.label(text);
+                }
+            });
+        });
+        theme::muted(
+            ui,
+            "Xem trước hiển thị emoji từ :tên:; tin gửi đi giữ nguyên văn bản đã gõ.",
+        );
     }
 
     /// Editor panel for the selected `ActionSendCommand` node: kind,
@@ -1636,8 +3096,18 @@ impl NicordApp {
             }
             ui.label(format!("Xem trước: {}", cfg.compose_prefix()));
         }
+        if self.config.send_mode == SendMode::Webhook {
+            theme::muted(
+                ui,
+                "Chế độ Webhook không gửi được lệnh — chuyển sang chế độ Tài khoản để dùng lệnh.",
+            );
+        }
         ui.horizontal(|ui| {
-            if theme::primary_button(ui, "Test lệnh").clicked() {
+            let enabled = self.config.send_mode != SendMode::Webhook;
+            if ui
+                .add_enabled(enabled, egui::Button::new("Test lệnh"))
+                .clicked()
+            {
                 self.test_command(i, &sel_id);
             }
             theme::muted(ui, "Gửi thử lệnh này một lần ngay bây giờ.");
@@ -1734,21 +3204,32 @@ impl NicordApp {
                 }
                 if ui.button("Import scenario").clicked() {
                     let path = self.import_path.trim().to_string();
-                    match std::fs::read_to_string(&path)
-                        .map_err(|e| e.to_string())
-                        .and_then(|s| {
-                            serde_json::from_str::<Scenario>(&s).map_err(|e| e.to_string())
-                        }) {
-                        Ok(mut imported) => {
+                    match std::fs::read_to_string(&path) {
+                        Ok(text) => {
+                            // QoL Q3: analyse first (warnings + validation),
+                            // import only when the file is usable.
+                            let is_webhook = self.config.send_mode == SendMode::Webhook;
+                            let (scenario, warnings) = analyze_import(&text, is_webhook);
+                            self.import_warnings = warnings;
+                            let Some(mut imported) = scenario else {
+                                self.set_status("Import blocked — see warnings in the editor.");
+                                return;
+                            };
                             imported.id = uuid::Uuid::new_v4().to_string();
                             imported.enabled = false;
                             let mut ok = true;
-                            if let Ok(list) = self.scenarios.lock() {
-                                let mut hypo = list.clone();
-                                hypo.push(imported.clone());
-                                if let Some(v) = channels_violation(&hypo) {
-                                    self.set_status(&format!("Import blocked: {v}"));
-                                    ok = false;
+                            if !is_webhook {
+                                if let Ok(list) = self.scenarios.lock() {
+                                    let mut hypo = list.clone();
+                                    // Check the violation as if enabled: a disabled
+                                    // import never counts, so check the enabled form.
+                                    let mut as_enabled = imported.clone();
+                                    as_enabled.enabled = true;
+                                    hypo.push(as_enabled);
+                                    if let Some(v) = channels_violation(&hypo) {
+                                        self.set_status(&format!("Import blocked: {v}"));
+                                        ok = false;
+                                    }
                                 }
                             }
                             if ok {
@@ -1756,39 +3237,708 @@ impl NicordApp {
                                     list.push(imported);
                                 }
                                 self.save_scenarios();
-                                self.set_status("Scenario imported (disabled — enable it to run).");
+                                let n = self.import_warnings.len();
+                                if n == 0 {
+                                    self.set_status(
+                                        "Scenario imported (disabled — enable it to run).",
+                                    );
+                                } else {
+                                    self.set_status(&format!(
+                                        "Scenario imported with {n} warning(s) — see editor (disabled — enable it to run)."
+                                    ));
+                                }
                             }
                         }
-                        Err(e) => self.set_status(&format!("Import failed: {e}")),
+                        Err(e) => self.set_status(&format!("Cannot read import file: {e}")),
                     }
                 }
             });
         });
     }
+    /// Send one real test message to a destination (Destinations
+    /// "Gửi thử"). Runs through the normal send pipeline, so caps,
+    /// quiet window, and minimum interval all apply — there is no
+    /// bypass. The message is clearly labelled as a test.
+    fn test_destination(&self, dest_id: &str) {
+        let Ok(Some(dest)) = self.store.load_destination(dest_id) else {
+            self.set_status("Destination not found.");
+            return;
+        };
+        let Some(sender) = sender_for_destination(&dest) else {
+            self.set_status("Destination has no usable webhook URL yet.");
+            return;
+        };
+        let mut scenario = Scenario::new("Nicord test");
+        scenario.messages = vec![format!(
+            "Tin thử từ Nicord — đích đến '{}'. Bạn có thể xóa tin này trong Discord.",
+            dest.display_name()
+        )];
+        scenario.destination_id = Some(dest.id.clone());
+        let engine = self.engine.clone();
+        let status = self.status.clone();
+        let username = dest.effective_username();
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    if let Ok(mut s) = status.lock() {
+                        *s = format!("cannot start runtime: {e}");
+                    }
+                    return;
+                }
+            };
+            let result =
+                rt.block_on(engine.send_once(&scenario, &sender, Some(&dest), &username, ""));
+            if let Ok(mut s) = status.lock() {
+                *s = match result {
+                    Ok(id) if id.is_empty() => "Test sent! (webhook, no id returned)".to_string(),
+                    Ok(id) => format!("Test sent! message id {id}"),
+                    Err(e) => format!("Test failed: {e}"),
+                };
+            }
+        });
+    }
+
+    /// Save the destination draft (validates first). A pasted URL in
+    /// `dest_url_input` replaces the stored URL (parsed + encrypted);
+    /// an empty input keeps the existing URL. A destination without a
+    /// URL is saved disabled. Returns true on success.
+    fn save_dest_draft(&mut self) -> bool {
+        let Some(mut draft) = self.dest_draft.clone() else {
+            return false;
+        };
+        let url_input = self.dest_url_input.trim().to_string();
+        if !url_input.is_empty() {
+            match parse_webhook_url(&url_input) {
+                Ok(parsed) => match encrypt_token(&url_input) {
+                    Ok(enc) => {
+                        draft.encrypted_url = enc;
+                        draft.webhook_id = parsed.id.clone();
+                        // Fill display metadata from the last check
+                        // when it matches this webhook.
+                        if let Ok(info) = self.webhook_info.lock() {
+                            if let Some(w) = info.as_ref() {
+                                if w.id == parsed.id {
+                                    draft.webhook_name = w.display_name();
+                                    draft.channel_id = w.channel_id.clone().unwrap_or_default();
+                                    draft.guild_id = w.guild_id.clone().unwrap_or_default();
+                                }
+                            }
+                        }
+                        // A new URL clears any old pause.
+                        draft.failure_state = crate::destination::FailureState::Ok;
+                        draft.last_error.clear();
+                        draft.paused_at = None;
+                    }
+                    Err(e) => {
+                        self.set_status(&format!("Cannot encrypt webhook URL: {e}"));
+                        return false;
+                    }
+                },
+                Err(e) => {
+                    self.set_status(&e);
+                    return false;
+                }
+            }
+        }
+        if draft.encrypted_url.trim().is_empty() {
+            draft.enabled = false;
+        }
+        if let Err(e) = draft.validate() {
+            self.set_status(&format!("Cannot save destination: {e}"));
+            return false;
+        }
+        draft.updated_at = Some(chrono::Utc::now().to_rfc3339());
+        match self.store.save_destination(&draft) {
+            Ok(()) => {
+                self.dest_selected_id = Some(draft.id.clone());
+                self.dest_draft = Some(draft);
+                self.dest_url_input.clear();
+                self.set_status("Destination saved.");
+                true
+            }
+            Err(e) => {
+                self.set_status(&format!("Cannot save destination: {e}"));
+                false
+            }
+        }
+    }
+
+    /// Destinations screen (webhook mode only). Left: list + actions.
+    /// Right: editor for the selected destination (or a new one).
+    /// In user-token mode this screen explains that destinations
+    /// only exist in webhook mode.
+    fn show_destinations(&mut self, ui: &mut egui::Ui) {
+        if self.config.send_mode != SendMode::Webhook {
+            theme::card(ui, |ui| {
+                ui.label(
+                    "Đích đến chỉ tồn tại ở chế độ Webhook. Chế độ Tài khoản giữ nguyên quy tắc 1 kênh.",
+                );
+                theme::muted(
+                    ui,
+                    "Đổi sang chế độ Webhook trong Cài đặt để dùng nhiều kênh.",
+                );
+            });
+            return;
+        }
+        let dests = self.store.load_destinations().unwrap_or_default();
+        let max_allowed = self
+            .config
+            .max_destinations
+            .min(crate::destination::MAX_DESTINATIONS_HARD as u32)
+            .max(1);
+        let at_limit = dests.len() as u32 >= max_allowed;
+        ui.horizontal(|ui| {
+            ui.label(format!("{} / {} đích đến", dests.len(), max_allowed));
+            if at_limit {
+                theme::muted(
+                    ui,
+                    "Đã đạt giới hạn — tăng giới hạn trong Cài đặt (tối đa 20).",
+                );
+            }
+        });
+        ui.add_space(8.0);
+        ui.columns(2, |cols| {
+            // Left: list.
+            cols[0].vertical(|ui| {
+                theme::card(ui, |ui| {
+                    theme::section_title(ui, t(self.lang(), "dest.list"));
+                    if ui
+                        .add_enabled(!at_limit, egui::Button::new("+ Thêm đích đến"))
+                        .clicked()
+                    {
+                        self.dest_selected_id = None;
+                        self.dest_draft = Some(Destination::new("Đích đến mới"));
+                        self.dest_url_input.clear();
+                        self.dest_new_message.clear();
+                    }
+                    ui.add_space(6.0);
+                    if dests.is_empty() {
+                        theme::muted(ui, "Chưa có đích đến nào — thêm webhook đầu tiên của bạn.");
+                    }
+                    for dest in &dests {
+                        let selected = self.dest_selected_id.as_deref() == Some(dest.id.as_str());
+                        let state_text = if dest.encrypted_url.trim().is_empty() {
+                            "chưa có URL"
+                        } else if !dest.enabled {
+                            "đã tắt"
+                        } else {
+                            dest.failure_state.label()
+                        };
+                        ui.horizontal(|ui| {
+                            if ui
+                                .selectable_label(
+                                    selected,
+                                    format!("{} — {state_text}", dest.display_name()),
+                                )
+                                .clicked()
+                            {
+                                self.dest_selected_id = Some(dest.id.clone());
+                                self.dest_draft = Some(dest.clone());
+                                self.dest_url_input.clear();
+                                self.dest_new_message.clear();
+                                self.dest_delete_confirm = None;
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.button("Gửi thử").clicked() {
+                                        self.test_destination(&dest.id);
+                                    }
+                                    let toggle = if dest.enabled { "Tắt" } else { "Bật" };
+                                    if ui.button(toggle).clicked() {
+                                        let mut updated = dest.clone();
+                                        updated.enabled = !dest.enabled;
+                                        if updated.enabled
+                                            && updated.encrypted_url.trim().is_empty()
+                                        {
+                                            self.set_status(
+                                                "Cannot enable: destination has no webhook URL yet.",
+                                            );
+                                        } else if let Err(e) = updated.validate() {
+                                            self.set_status(&format!("Cannot enable: {e}"));
+                                        } else {
+                                            let _ = self.store.save_destination(&updated);
+                                            if self.dest_selected_id.as_deref()
+                                                == Some(dest.id.as_str())
+                                            {
+                                                self.dest_draft = Some(updated);
+                                            }
+                                        }
+                                    }
+                                },
+                            );
+                        });
+                        if !dest.channel_id.is_empty() {
+                            theme::muted(ui, &format!("kênh: {}", dest.channel_id));
+                        }
+                        ui.separator();
+                    }
+                });
+            });
+            // Right: editor.
+            cols[1].vertical(|ui| {
+                self.show_destination_editor(ui, &dests);
+            });
+        });
+    }
+
+    /// Editor panel for the selected destination draft.
+    fn show_destination_editor(&mut self, ui: &mut egui::Ui, dests: &[Destination]) {
+        let Some(mut draft) = self.dest_draft.clone() else {
+            theme::card(ui, |ui| {
+                theme::muted(ui, "Chọn một đích đến để sửa, hoặc thêm mới.");
+            });
+            return;
+        };
+        let is_new = self.dest_selected_id.is_none();
+        theme::card(ui, |ui| {
+            theme::section_title(
+                ui,
+                if is_new {
+                    t(self.lang(), "dest.create")
+                } else {
+                    t(self.lang(), "dest.edit")
+                },
+            );
+            ui.horizontal(|ui| {
+                ui.label("Tên thân thiện:");
+                ui.text_edit_singleline(&mut draft.name);
+            });
+            // URL: never prefilled, never shown in full.
+            ui.horizontal(|ui| {
+                ui.label("Webhook URL:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.dest_url_input)
+                        .password(true)
+                        .hint_text(if draft.encrypted_url.is_empty() {
+                            "paste webhook URL here"
+                        } else {
+                            "để trống để giữ URL đã lưu, dán URL mới để đổi"
+                        }),
+                );
+            });
+            if !draft.encrypted_url.is_empty() {
+                theme::muted(ui, "URL đã lưu: có (không hiển thị).");
+            }
+            if !draft.webhook_id.is_empty() {
+                theme::muted(
+                    ui,
+                    &format!(
+                        "Webhook: {} (ID {}), kênh {}",
+                        if draft.webhook_name.is_empty() {
+                            "?"
+                        } else {
+                            &draft.webhook_name
+                        },
+                        draft.webhook_id,
+                        if draft.channel_id.is_empty() {
+                            "?"
+                        } else {
+                            &draft.channel_id
+                        }
+                    ),
+                );
+            }
+            ui.horizontal(|ui| {
+                if theme::ghost_button(ui, "Kiểm tra URL").clicked() {
+                    let url = self.dest_url_input.clone();
+                    if url.trim().is_empty() {
+                        self.set_status("Paste a webhook URL first.");
+                    } else {
+                        self.check_webhook(url);
+                    }
+                }
+                let check_msg = self
+                    .webhook_check_status
+                    .lock()
+                    .map(|s| s.clone())
+                    .unwrap_or_default();
+                if !check_msg.is_empty() {
+                    ui.label(check_msg);
+                }
+            });
+            theme::muted(ui, "Tạo webhook trong Discord: Cài đặt kênh → Tích hợp → Webhook. URL là mật khẩu — đừng chia sẻ.");
+            ui.separator();
+            ui.checkbox(&mut draft.enabled, "Bật đích đến này");
+            ui.horizontal(|ui| {
+                ui.label("Tên hiển thị khi gửi (để trống = tên webhook):");
+                ui.text_edit_singleline(&mut draft.username_override);
+                crate::destination::truncate_username_override(&mut draft.username_override);
+            });
+            ui.horizontal(|ui| {
+                ui.label("Avatar URL (https, để trống = avatar webhook):");
+                ui.text_edit_singleline(&mut draft.avatar_url_override);
+            });
+            ui.horizontal(|ui| {
+                ui.label("Thread ID (chỉ số, để trống = gửi vào kênh):");
+                ui.text_edit_singleline(&mut draft.thread_id);
+            });
+            theme::muted(ui, "Thread phải thuộc kênh của webhook (Discord sẽ tự mở lại thread đã lưu trữ). Hành vi với thread bị khóa chưa được kiểm chứng — hãy thử trên thread thật trước khi dựa vào nó.");
+            ui.horizontal(|ui| {
+                ui.label("Giới hạn tin/ngày (0 = dùng giới hạn toàn cục, tối đa 300):");
+                ui.add(egui::DragValue::new(&mut draft.daily_cap).range(0..=300));
+            });
+            ui.horizontal(|ui| {
+                ui.label("Khoảng cách tối thiểu giữa 2 lần gửi (giây, tối thiểu 5):");
+                ui.add(egui::DragValue::new(&mut draft.min_interval_secs).range(5..=3600));
+            });
+            // Quiet window.
+            let mut quiet_enabled = draft.quiet_start.is_some();
+            ui.checkbox(
+                &mut quiet_enabled,
+                "Cửa sổ im lặng (không gửi trong khoảng này)",
+            );
+            if quiet_enabled {
+                let mut start = draft
+                    .quiet_start
+                    .clone()
+                    .unwrap_or_else(|| "22:00".to_string());
+                let mut end = draft
+                    .quiet_end
+                    .clone()
+                    .unwrap_or_else(|| "06:00".to_string());
+                ui.horizontal(|ui| {
+                    ui.label("Từ (HH:MM):");
+                    ui.text_edit_singleline(&mut start);
+                    ui.label("đến (HH:MM):");
+                    ui.text_edit_singleline(&mut end);
+                });
+                theme::muted(ui, "Hỗ trợ qua đêm (vd: 22:00 → 06:00). Giờ địa phương.");
+                draft.quiet_start = Some(start);
+                draft.quiet_end = Some(end);
+            } else {
+                draft.quiet_start = None;
+                draft.quiet_end = None;
+            }
+            ui.separator();
+            ui.label("Bộ tin mặc định (dùng khi kịch bản không có tin riêng):");
+            let mut to_remove: Option<usize> = None;
+            for (idx, msg) in draft.default_messages.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(format!("• {msg}"));
+                    if ui.button("Xóa").clicked() {
+                        to_remove = Some(idx);
+                    }
+                });
+            }
+            if let Some(idx) = to_remove {
+                draft.default_messages.remove(idx);
+            }
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.dest_new_message)
+                        .hint_text("Add a default message..."),
+                );
+                let too_long = over_limit(self.dest_new_message.trim());
+                if ui
+                    .add_enabled(
+                        !self.dest_new_message.trim().is_empty() && !too_long,
+                        egui::Button::new("+ Thêm"),
+                    )
+                    .clicked()
+                {
+                    draft
+                        .default_messages
+                        .push(self.dest_new_message.trim().to_string());
+                    self.dest_new_message.clear();
+                }
+            });
+            // Failure state + resume.
+            if draft.failure_state.is_paused() {
+                ui.separator();
+                ui.label(
+                    RichText::new(format!("Đang tạm dừng: {}", draft.failure_state.label()))
+                        .color(theme::DANGER),
+                );
+                if !draft.last_error.is_empty() {
+                    theme::muted(ui, &format!("Lỗi: {}", draft.last_error));
+                }
+                if ui.button("Tiếp tục (thử lại)").clicked() {
+                    let _ = self.store.set_destination_failure(
+                        &draft.id,
+                        crate::destination::FailureState::Ok,
+                        "",
+                    );
+                    draft.failure_state = crate::destination::FailureState::Ok;
+                    draft.last_error.clear();
+                    draft.paused_at = None;
+                    self.set_status("Destination resumed.");
+                }
+                theme::muted(ui, "Nếu webhook đã bị xóa trong Discord, hãy dán URL mới và kiểm tra lại thay vì chỉ tiếp tục.");
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                if theme::primary_button(ui, "Lưu đích đến").clicked() {
+                    self.dest_draft = Some(draft.clone());
+                    self.save_dest_draft();
+                    // Reload the draft from the saved state.
+                    if let Some(id) = &self.dest_selected_id {
+                        if let Ok(Some(saved)) = self.store.load_destination(id) {
+                            self.dest_draft = Some(saved);
+                        }
+                    }
+                }
+                if !is_new {
+                    if ui.button("Nhân bản").clicked() {
+                        // Clone (Q5): settings copied, URL starts empty,
+                        // disabled until a URL is pasted + checked.
+                        let mut copy = draft.clone();
+                        copy.id = uuid::Uuid::new_v4().to_string();
+                        copy.name = format!("{} (bản sao)", copy.name);
+                        copy.encrypted_url.clear();
+                        copy.webhook_id.clear();
+                        copy.webhook_name.clear();
+                        copy.channel_id.clear();
+                        copy.guild_id.clear();
+                        copy.enabled = false;
+                        copy.failure_state = crate::destination::FailureState::Ok;
+                        copy.last_error.clear();
+                        copy.paused_at = None;
+                        let now = chrono::Utc::now().to_rfc3339();
+                        copy.created_at = Some(now.clone());
+                        copy.updated_at = Some(now);
+                        if self.store.save_destination(&copy).is_ok() {
+                            self.dest_selected_id = Some(copy.id.clone());
+                            self.dest_draft = Some(copy);
+                            self.dest_url_input.clear();
+                            self.set_status(
+                                "Destination cloned (no URL — paste one and check it).",
+                            );
+                        }
+                    }
+                    if theme::danger_button(ui, "Xóa").clicked() {
+                        self.dest_delete_confirm = Some(draft.id.clone());
+                        self.dest_delete_target = String::new();
+                    }
+                }
+            });
+            // Write the draft back (editor edits are local until Save).
+            self.dest_draft = Some(draft);
+        });
+        // Delete confirmation + scenario reassignment.
+        if let Some(confirm_id) = self.dest_delete_confirm.clone() {
+            if let Ok(Some(target)) = self.store.load_destination(&confirm_id) {
+                let users: Vec<String> = self
+                    .scenarios
+                    .lock()
+                    .map(|list| {
+                        list.iter()
+                            .filter(|s| s.destination_id.as_deref() == Some(confirm_id.as_str()))
+                            .map(|s| s.name.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                ui.add_space(8.0);
+                theme::card(ui, |ui| {
+                    theme::section_title(ui, "Xóa đích đến?");
+                    ui.label(format!(
+                        "Đích đến '{}' đang được {} kịch bản dùng.",
+                        target.display_name(),
+                        users.len()
+                    ));
+                    for name in &users {
+                        theme::muted(ui, &format!("• {name}"));
+                    }
+                    if users.is_empty() {
+                        theme::muted(ui, "Không có kịch bản nào dùng đích đến này.");
+                    } else {
+                        ui.label("Chuyển các kịch bản này sang:");
+                        let others: Vec<Destination> = dests
+                            .iter()
+                            .filter(|d| d.id != confirm_id)
+                            .cloned()
+                            .collect();
+                        let target_label = others
+                            .iter()
+                            .find(|d| d.id == self.dest_delete_target)
+                            .map(|d| d.display_name())
+                            .unwrap_or_else(|| "Tắt các kịch bản này".to_string());
+                        egui::ComboBox::from_id_salt("dest_delete_target")
+                            .selected_text(target_label)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.dest_delete_target,
+                                    String::new(),
+                                    "Tắt các kịch bản này",
+                                );
+                                for d in &others {
+                                    ui.selectable_value(
+                                        &mut self.dest_delete_target,
+                                        d.id.clone(),
+                                        d.display_name(),
+                                    );
+                                }
+                            });
+                    }
+                    ui.horizontal(|ui| {
+                        if theme::danger_button(ui, "Xóa thật").clicked() {
+                            // Reassign or disable the scenarios first.
+                            if let Ok(mut list) = self.scenarios.lock() {
+                                for s in list.iter_mut() {
+                                    if s.destination_id.as_deref() == Some(confirm_id.as_str()) {
+                                        if self.dest_delete_target.is_empty() {
+                                            s.enabled = false;
+                                            s.destination_id = None;
+                                        } else {
+                                            s.destination_id =
+                                                Some(self.dest_delete_target.clone());
+                                        }
+                                    }
+                                }
+                            }
+                            self.save_scenarios();
+                            let _ = self.store.delete_destination(&confirm_id);
+                            self.dest_delete_confirm = None;
+                            self.dest_selected_id = None;
+                            self.dest_draft = None;
+                            self.set_status("Destination deleted.");
+                        }
+                        if ui.button("Hủy").clicked() {
+                            self.dest_delete_confirm = None;
+                        }
+                    });
+                });
+            }
+        }
+    }
+
     fn show_logs(&mut self, ui: &mut egui::Ui) {
         ui.label("Send history (token is never logged).");
         ui.add_space(4.0);
+        // Scenario names for the filter dropdown (read once per frame).
+        let scenario_options: Vec<(String, String)> = self
+            .scenarios
+            .lock()
+            .map(|list| {
+                list.iter()
+                    .map(|s| (s.id.clone(), s.name.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
         theme::card(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label("Filter:");
                 ui.add(
                     egui::TextEdit::singleline(&mut self.log_filter)
-                        .hint_text("scenario name or status, e.g. sent"),
+                        .hint_text("keyword (name, status, detail)"),
                 );
+                // Status filter (QoL Q4).
+                let status_label = if self.log_status_filter.is_empty() {
+                    "All statuses"
+                } else {
+                    self.log_status_filter.as_str()
+                };
+                egui::ComboBox::from_id_salt("log_status_filter")
+                    .selected_text(status_label)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.log_status_filter,
+                            String::new(),
+                            "All statuses",
+                        );
+                        ui.selectable_value(
+                            &mut self.log_status_filter,
+                            "sent".to_string(),
+                            "sent",
+                        );
+                        ui.selectable_value(
+                            &mut self.log_status_filter,
+                            "failed".to_string(),
+                            "failed",
+                        );
+                        ui.selectable_value(
+                            &mut self.log_status_filter,
+                            "deleted".to_string(),
+                            "deleted",
+                        );
+                    });
+                // Scenario filter (QoL Q4).
+                let scenario_label = scenario_options
+                    .iter()
+                    .find(|(id, _)| *id == self.log_scenario_filter)
+                    .map(|(_, name)| name.clone())
+                    .unwrap_or_else(|| "All scenarios".to_string());
+                egui::ComboBox::from_id_salt("log_scenario_filter")
+                    .selected_text(scenario_label)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.log_scenario_filter,
+                            String::new(),
+                            "All scenarios",
+                        );
+                        for (id, name) in &scenario_options {
+                            ui.selectable_value(&mut self.log_scenario_filter, id.clone(), name);
+                        }
+                    });
+                // Destination filter (webhook mode: by channel id).
+                // Two webhooks in one channel share a filter entry;
+                // the scenario filter narrows further when needed.
+                if self.config.send_mode == SendMode::Webhook {
+                    let dests = self.store.load_destinations().unwrap_or_default();
+                    let dest_label = dests
+                        .iter()
+                        .find(|d| d.channel_id == self.log_channel_filter)
+                        .map(|d| d.display_name())
+                        .unwrap_or_else(|| "All destinations".to_string());
+                    egui::ComboBox::from_id_salt("log_channel_filter")
+                        .selected_text(dest_label)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.log_channel_filter,
+                                String::new(),
+                                "All destinations",
+                            );
+                            for d in &dests {
+                                if !d.channel_id.is_empty() {
+                                    ui.selectable_value(
+                                        &mut self.log_channel_filter,
+                                        d.channel_id.clone(),
+                                        d.display_name(),
+                                    );
+                                }
+                            }
+                        });
+                }
                 if ui.button("Export logs (CSV)").clicked() {
                     let path = config_dir().join("nicord-logs.csv");
+                    let status = if self.log_status_filter.is_empty() {
+                        None
+                    } else {
+                        Some(self.log_status_filter.clone())
+                    };
+                    let scenario = if self.log_scenario_filter.is_empty() {
+                        None
+                    } else {
+                        Some(self.log_scenario_filter.clone())
+                    };
+                    let channel = if self.log_channel_filter.is_empty() {
+                        None
+                    } else {
+                        Some(self.log_channel_filter.clone())
+                    };
                     let result = self
                         .store
-                        .recent_logs_filtered(1000, &self.log_filter.clone())
+                        .query_logs(
+                            1000,
+                            &self.log_filter.clone(),
+                            status.as_deref(),
+                            scenario.as_deref(),
+                            channel.as_deref(),
+                        )
                         .map(|rows| {
                             let mut csv = String::from("time,scenario,status,detail\n");
                             for (ts, name, status, detail) in rows {
+                                // Proper CSV quoting + secret scrubbing
+                                // (QoL Q4): an export can never leak a
+                                // webhook URL, even if one ever reached
+                                // a log detail.
                                 csv.push_str(&format!(
                                     "{},{},{},{}\n",
-                                    ts,
-                                    name.replace(',', ";"),
-                                    status,
-                                    detail.replace(',', ";")
+                                    csv_escape(&ts),
+                                    csv_escape(&scrub_secrets(&name)),
+                                    csv_escape(&status),
+                                    csv_escape(&scrub_secrets(&detail))
                                 ));
                             }
                             std::fs::write(&path, csv)
@@ -1807,10 +3957,28 @@ impl NicordApp {
             });
         });
         ui.add_space(12.0);
-        match self
-            .store
-            .recent_logs_filtered(100, &self.log_filter.clone())
-        {
+        let log_status = if self.log_status_filter.is_empty() {
+            None
+        } else {
+            Some(self.log_status_filter.clone())
+        };
+        let log_scenario = if self.log_scenario_filter.is_empty() {
+            None
+        } else {
+            Some(self.log_scenario_filter.clone())
+        };
+        let log_channel = if self.log_channel_filter.is_empty() {
+            None
+        } else {
+            Some(self.log_channel_filter.clone())
+        };
+        match self.store.query_logs(
+            100,
+            &self.log_filter.clone(),
+            log_status.as_deref(),
+            log_scenario.as_deref(),
+            log_channel.as_deref(),
+        ) {
             Ok(rows) => {
                 if rows.is_empty() {
                     theme::card(ui, |ui| {
@@ -1847,11 +4015,420 @@ impl NicordApp {
         }
     }
 
+    /// Backup card (Settings): export/import the whole config for
+    /// another machine. Export writes a versioned JSON file; import
+    /// REPLACES the current config (after an automatic local backup)
+    /// and requires the engine to be stopped + explicit confirmation.
+    fn show_backup_card(&mut self, ui: &mut egui::Ui) {
+        theme::card(ui, |ui| {
+            theme::section_title(ui, "Sao lưu & khôi phục cấu hình");
+            theme::muted(ui, "Xuất toàn bộ cấu hình (cài đặt, đích đến, kịch bản, mẫu) để dùng trên máy khác. Lịch sử gửi không được xuất. Copy trực tiếp file cấu hình sang máy khác sẽ KHÔNG dùng được secret, vì secret mã hóa theo máy — hãy dùng xuất portable dưới đây.");
+            ui.separator();
+            // ---- Export ----
+            ui.label("Xuất cấu hình:");
+            ui.horizontal(|ui| {
+                ui.radio_value(
+                    &mut self.backup_export_mode_portable,
+                    true,
+                    "Portable (có secret, bảo vệ bằng mật khẩu)",
+                );
+                ui.radio_value(
+                    &mut self.backup_export_mode_portable,
+                    false,
+                    "An toàn (không secret, nhập lại trên máy mới)",
+                );
+            });
+            if self.backup_export_mode_portable {
+                ui.horizontal(|ui| {
+                    ui.label("Mật khẩu bảo vệ file xuất:");
+                    ui.add(egui::TextEdit::singleline(&mut self.backup_passphrase).password(true));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Nhập lại mật khẩu:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.backup_passphrase_confirm)
+                            .password(true),
+                    );
+                });
+                theme::muted(ui, "Mật khẩu càng mạnh càng tốt — file xuất là một két chứa secret. Quên mật khẩu = không mở được file.");
+            }
+            ui.horizontal(|ui| {
+                ui.label("Đường dẫn file xuất:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.backup_export_path)
+                        .hint_text("để trống = thư mục cấu hình, tên tự động"),
+                );
+            });
+            if theme::primary_button(ui, "Xuất cấu hình").clicked() {
+                let mode = if self.backup_export_mode_portable {
+                    crate::backup::ExportMode::Portable
+                } else {
+                    crate::backup::ExportMode::Safe
+                };
+                if mode == crate::backup::ExportMode::Portable
+                    && self.backup_passphrase != self.backup_passphrase_confirm
+                {
+                    self.set_status("Passphrases do not match.");
+                } else if mode == crate::backup::ExportMode::Portable
+                    && self.backup_passphrase.len() < 8
+                {
+                    self.set_status("Passphrase must be at least 8 characters.");
+                } else {
+                    match crate::backup::build_export(
+                        &self.store,
+                        &self.config,
+                        mode,
+                        &self.backup_passphrase,
+                    )
+                    .and_then(|f| crate::backup::export_to_json(&f))
+                    {
+                        Ok(json) => {
+                            let path = if self.backup_export_path.trim().is_empty() {
+                                let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+                                config_dir().join(format!("nicord-config-{ts}.json"))
+                            } else {
+                                std::path::PathBuf::from(self.backup_export_path.trim())
+                            };
+                            match std::fs::write(&path, json) {
+                                Ok(()) => {
+                                    self.set_status(&format!(
+                                        "Config exported to {}",
+                                        path.display()
+                                    ));
+                                    self.backup_passphrase.clear();
+                                    self.backup_passphrase_confirm.clear();
+                                }
+                                Err(e) => self.set_status(&format!("Export failed: {e}")),
+                            }
+                        }
+                        Err(e) => self.set_status(&format!("Export failed: {e}")),
+                    }
+                }
+            }
+            ui.separator();
+            // ---- Import ----
+            ui.label("Nhập cấu hình:");
+            let engine_active = self.engine.is_loop_active();
+            if engine_active {
+                ui.label(
+                    RichText::new(
+                        "Dừng engine trước khi nhập (import thay thế cấu hình engine đang dùng).",
+                    )
+                    .color(theme::DANGER),
+                );
+            }
+            ui.horizontal(|ui| {
+                ui.label("Đường dẫn file nhập:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.backup_import_path)
+                        .hint_text("đường dẫn tới file nicord-config-*.json"),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("Mật khẩu (chỉ file portable):");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.backup_import_passphrase).password(true),
+                );
+            });
+            ui.checkbox(
+                &mut self.backup_import_confirm,
+                "Tôi hiểu: nhập sẽ THAY THẾ toàn bộ cấu hình, đích đến, kịch bản và mẫu hiện tại (một bản sao lưu tự động sẽ được tạo trước).",
+            );
+            theme::muted(
+                ui,
+                "Bản sao lưu tự động chỉ khôi phục được trên máy này (secret mã hóa theo máy).",
+            );
+            if ui
+                .add_enabled(
+                    !engine_active && self.backup_import_confirm,
+                    egui::Button::new("Nhập & thay thế cấu hình"),
+                )
+                .clicked()
+            {
+                self.do_import();
+            }
+            if !self.backup_warnings.is_empty() {
+                ui.add_space(6.0);
+                theme::section_title(ui, "Cảnh báo nhập");
+                for w in &self.backup_warnings {
+                    theme::muted(ui, &format!("• {w}"));
+                }
+            }
+        });
+    }
+
+    /// Run an import: read + parse the file, take an automatic local
+    /// backup, apply the replacement, reload UI state. Errors leave
+    /// the current config untouched (the backup is written first,
+    /// and `apply_import` validates before deleting anything it
+    /// cannot replace — a failure after deletion is reported with
+    /// the backup path so the user can restore manually).
+    fn do_import(&mut self) {
+        let path = self.backup_import_path.trim().to_string();
+        if path.is_empty() {
+            self.set_status("Enter the import file path first.");
+            return;
+        }
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => {
+                self.set_status(&format!("Cannot read import file: {e}"));
+                return;
+            }
+        };
+        let file = match crate::backup::parse_export(&text) {
+            Ok(f) => f,
+            Err(e) => {
+                self.set_status(&format!("Import rejected: {e}"));
+                return;
+            }
+        };
+        // Automatic local backup of the CURRENT state first.
+        let backup_path = {
+            let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+            config_dir().join(format!("nicord-backup-{ts}.json"))
+        };
+        let backup_note = match crate::backup::build_export(
+            &self.store,
+            &self.config,
+            crate::backup::ExportMode::Local,
+            "",
+        )
+        .and_then(|f| crate::backup::export_to_json(&f))
+        .and_then(|json| std::fs::write(&backup_path, json).map_err(|e| e.to_string()))
+        {
+            Ok(()) => format!("Backup saved to {}.", backup_path.display()),
+            Err(e) => {
+                self.set_status(&format!(
+                    "Import aborted: cannot write automatic backup ({e}). Nothing was changed."
+                ));
+                return;
+            }
+        };
+        let passphrase = self.backup_import_passphrase.clone();
+        match crate::backup::apply_import(&self.store, &file, &passphrase) {
+            Ok((new_config, report)) => {
+                self.config = new_config;
+                let _ = save_config(&self.config);
+                // Reload scenarios + live-apply caps to the engine.
+                if let Ok(list) = self.store.load_scenarios() {
+                    if let Ok(mut mine) = self.scenarios.lock() {
+                        *mine = list;
+                    }
+                }
+                self.engine
+                    .set_global_daily_cap(self.config.global_daily_cap);
+                self.engine
+                    .set_dest_error_limit(self.config.consecutive_error_limit);
+                self.engine.set_antiban(self.config.antiban.clone());
+                self.backup_warnings = report.warnings;
+                self.backup_import_confirm = false;
+                self.backup_import_passphrase.clear();
+                self.selected = None;
+                self.dest_selected_id = None;
+                self.dest_draft = None;
+                self.set_status(&format!(
+                    "Import done: {} scenarios, {} destinations, {} templates. {backup_note}",
+                    report.scenarios_imported,
+                    report.destinations_imported,
+                    report.templates_imported
+                ));
+            }
+            Err(e) => {
+                self.set_status(&format!(
+                    "Import failed: {e} Nothing was changed. {backup_note}"
+                ));
+            }
+        }
+    }
+
     fn show_settings(&mut self, ui: &mut egui::Ui) {
+        // Send mode: Webhook (official, recommended) or user-token
+        // account mode. Switching never deletes the other credential.
+        theme::card(ui, |ui| {
+            theme::section_title(ui, t(self.lang(), "settings.send_mode"));
+            ui.horizontal(|ui| {
+                ui.radio_value(
+                    &mut self.config.send_mode,
+                    SendMode::Webhook,
+                    "Webhook (khuyến nghị)",
+                );
+                ui.radio_value(
+                    &mut self.config.send_mode,
+                    SendMode::UserToken,
+                    "Tài khoản Discord",
+                );
+            });
+            theme::muted(
+                ui,
+                "Webhook là cách chính thức của Discord: chỉ gửi tin nhắn tới 1 kênh, \
+                 không gửi được lệnh, không có typing. Tài khoản (self-bot) có nguy cơ bị khóa. \
+                 Đổi chế độ không xóa thông tin đã lưu của chế độ kia. Bấm Save settings ở dưới để lưu.",
+            );
+            if self.config.send_mode == SendMode::Webhook
+                && self.config.encrypted_webhook_url.is_empty()
+            {
+                ui.label("Chưa có webhook URL — dán URL ở dưới và lưu lại.");
+            }
+            if self.config.send_mode == SendMode::UserToken
+                && self.config.encrypted_token.is_empty()
+            {
+                ui.label("Chưa có token — quay lại Onboarding để lưu token, hoặc chọn Webhook.");
+            }
+        });
+        ui.add_space(12.0);
+        if self.config.send_mode == SendMode::Webhook {
+            theme::card(ui, |ui| {
+                theme::section_title(ui, t(self.lang(), "settings.webhook"));
+                if !self.config.webhook_id.is_empty() {
+                    ui.label(format!(
+                        "Webhook đã lưu: {} (ID {})",
+                        self.config.webhook_display_name(),
+                        self.config.webhook_id
+                    ));
+                    // Health + last check (QoL Q2).
+                    let health = self
+                        .webhook_health_shared
+                        .lock()
+                        .map(|h| *h)
+                        .unwrap_or(WebhookHealth::Unknown);
+                    let checked = self
+                        .webhook_last_checked_shared
+                        .lock()
+                        .map(|s| s.clone())
+                        .unwrap_or_default();
+                    let health_color = match health {
+                        WebhookHealth::Ok => theme::SUCCESS,
+                        WebhookHealth::Unknown => theme::TEXT_SECONDARY,
+                        _ => theme::DANGER,
+                    };
+                    ui.label(
+                        RichText::new(format!("Trạng thái: {}", health.label()))
+                            .color(health_color),
+                    );
+                    if !checked.is_empty() {
+                        theme::muted(ui, &format!("Kiểm tra gần nhất: {checked}"));
+                    }
+                    if health == WebhookHealth::NotFound {
+                        ui.label(
+                            RichText::new(
+                                "Webhook đã bị xóa hoặc URL đã đổi. Tạo webhook mới trong Discord (Cài đặt kênh → Tích hợp → Webhook), dán URL mới bên dưới và lưu lại.",
+                            )
+                            .color(theme::DANGER),
+                        );
+                    }
+                    // Paused destinations (if any) are listed in the
+                    // Destinations screen; a successful re-check here
+                    // also clears their pause.
+                    if ui.button("Kiểm tra lại webhook đã lưu").clicked() {
+                        self.recheck_stored_webhook();
+                    }
+                }
+                ui.label("Đổi webhook URL (URL mới sẽ được mã hóa khi lưu):");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.webhook_url_input)
+                        .password(true)
+                        .hint_text("paste a new webhook URL here"),
+                );
+                ui.horizontal(|ui| {
+                    if theme::ghost_button(ui, "Kiểm tra webhook").clicked() {
+                        let url = self.webhook_url_input.clone();
+                        self.check_webhook(url);
+                    }
+                    if theme::primary_button(ui, "Lưu webhook").clicked() {
+                        let input = self.webhook_url_input.trim().to_string();
+                        if input.is_empty() {
+                            self.set_status("Webhook URL is empty.");
+                        } else {
+                            match parse_webhook_url(&input) {
+                                Ok(parsed) => match encrypt_token(&input) {
+                                    Ok(enc) => {
+                                        self.config.encrypted_webhook_url = enc;
+                                        self.config.webhook_id = parsed.id.clone();
+                                        if let Ok(info) = self.webhook_info.lock() {
+                                            if let Some(w) = info.as_ref() {
+                                                if w.id == parsed.id {
+                                                    self.config.webhook_name = w.display_name();
+                                                }
+                                            }
+                                        }
+                                        if save_config(&self.config).is_ok() {
+                                            self.upsert_destination_from_legacy();
+                                            self.webhook_url_input.clear();
+                                            self.set_status(
+                                                "Webhook saved (encrypted, local only).",
+                                            );
+                                        } else {
+                                            self.set_status("Failed to save config.");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        self.set_status(&format!("Cannot encrypt webhook URL: {e}"))
+                                    }
+                                },
+                                Err(e) => self.set_status(&e),
+                            }
+                        }
+                    }
+                });
+                let check_msg = self
+                    .webhook_check_status
+                    .lock()
+                    .map(|s| s.clone())
+                    .unwrap_or_default();
+                if !check_msg.is_empty() {
+                    ui.label(check_msg);
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label("Tên hiển thị khi gửi (để trống = tên webhook):");
+                    ui.text_edit_singleline(&mut self.config.webhook_username);
+                    crate::destination::truncate_username_override(
+                        &mut self.config.webhook_username,
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Tên thân thiện cho đích đến (để trống = tên webhook):");
+                    ui.text_edit_singleline(&mut self.config.webhook_friendly_name);
+                });
+                theme::muted(
+                    ui,
+                    "Tên hiển thị và tên thân thiện được lưu cùng Save settings ở dưới.",
+                );
+            });
+            ui.add_space(12.0);
+        }
+        // Destination limits (webhook mode). Saved via Save settings.
+        if self.config.send_mode == SendMode::Webhook {
+            theme::card(ui, |ui| {
+                theme::section_title(ui, t(self.lang(), "settings.limits"));
+                ui.horizontal(|ui| {
+                    ui.label("Giới hạn tin/ngày toàn cục (mọi đích đến cộng lại):");
+                    ui.add(egui::DragValue::new(&mut self.config.global_daily_cap).range(1..=1000));
+                });
+                theme::muted(ui, "Lưới an toàn chống chạy nhầm/chạy lặp. Đặt cao sẽ hiện cảnh báo khi vượt quá 300 — giới hạn thật của Discord (429) luôn được tôn trọng khi chặt hơn.");
+                ui.horizontal(|ui| {
+                    ui.label("Số đích đến tối đa (1–20):");
+                    ui.add(egui::DragValue::new(&mut self.config.max_destinations).range(1..=20));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Lỗi liên tiếp thì tạm dừng đích đến (3–10):");
+                    ui.add(
+                        egui::DragValue::new(&mut self.config.consecutive_error_limit)
+                            .range(3..=10),
+                    );
+                });
+                theme::muted(
+                    ui,
+                    "Lưu cùng Save settings ở dưới; áp dụng ngay cho engine đang chạy.",
+                );
+            });
+            ui.add_space(12.0);
+        }
         // Token Validator (Discord-BLUE): check the stored token and
         // show the account behind it. The token itself is never shown.
         theme::card(ui, |ui| {
-            theme::section_title(ui, "Tài khoản");
+            theme::section_title(ui, t(self.lang(), "settings.account"));
             ui.horizontal(|ui| {
                 if theme::primary_button(ui, "Kiểm tra token").clicked() {
                     self.check_token();
@@ -1889,6 +4466,14 @@ impl NicordApp {
         // the running engine on Save.
         theme::card(ui, |ui| {
             theme::section_title(ui, "Chống ban");
+            if self.config.send_mode == SendMode::Webhook {
+                theme::muted(
+                    ui,
+                    "Chế độ Webhook: các tùy chọn dưới đây KHÔNG áp dụng — Webhook chỉ gửi \
+                     tin nhắn đơn giản, không biến thể, không typing, không tự xóa. \
+                     Giá trị vẫn được giữ nguyên nếu bạn quay lại chế độ Tài khoản.",
+                );
+            }
             ui.checkbox(
                 &mut self.config.antiban.smart_templates,
                 "Smart Templates: Spintax {a|b} + biến thể tin nhắn ngẫu nhiên",
@@ -1977,11 +4562,42 @@ impl NicordApp {
             #[cfg(not(target_os = "windows"))]
             theme::muted(ui, "System tray: chỉ có trên Windows.");
             theme::muted(ui, "Khởi động cùng máy được ghi thật vào hệ thống (Windows Run / Linux autostart). Khi bật khay hệ thống, đóng cửa sổ sẽ ẩn Nicord xuống khay thay vì thoát — bấm chuột phải vào icon khay để thoát hẳn.");
+            // Language (Q9): instant switch, saved immediately.
+            ui.horizontal(|ui| {
+                ui.label(t(self.lang(), "settings.language"));
+                let mut lang = self.lang();
+                egui::ComboBox::from_id_salt("ui_language")
+                    .selected_text(match lang {
+                        Lang::Vi => "Tiếng Việt",
+                        Lang::En => "English",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut lang, Lang::Vi, "Tiếng Việt");
+                        ui.selectable_value(&mut lang, Lang::En, "English");
+                    });
+                if lang != self.lang() {
+                    self.config.language = lang.code().to_string();
+                    let _ = save_config(&self.config);
+                    self.set_status("Language switched.");
+                }
+            });
             ui.add_space(8.0);
-            if theme::primary_button(ui, "Save settings").clicked() {
+            if theme::primary_button(ui, t(self.lang(), "btn.save_settings")).clicked() {
+                // Clamp destination limits to their documented bounds.
+                self.config.max_destinations = self
+                    .config
+                    .max_destinations
+                    .clamp(1, crate::destination::MAX_DESTINATIONS_HARD as u32);
+                self.config.consecutive_error_limit =
+                    self.config.consecutive_error_limit.clamp(3, 10);
                 let _ = save_config(&self.config);
                 // Live-apply the anti-ban settings to the running engine.
                 self.engine.set_antiban(self.config.antiban.clone());
+                // Live-apply the destination caps (no restart needed).
+                self.engine
+                    .set_global_daily_cap(self.config.global_daily_cap);
+                self.engine
+                    .set_dest_error_limit(self.config.consecutive_error_limit);
                 // Apply the real OS autostart hook.
                 match crate::autostart::set_enabled(self.config.autostart) {
                     Ok(()) => self.set_status("Settings saved."),
@@ -1995,7 +4611,7 @@ impl NicordApp {
         });
         ui.add_space(12.0);
         theme::card(ui, |ui| {
-            theme::section_title(ui, "Cập nhật");
+            theme::section_title(ui, t(self.lang(), "settings.updates"));
             ui.checkbox(
                 &mut self.config.auto_check_updates,
                 "Tự động kiểm tra cập nhật khi mở app",
@@ -2011,6 +4627,8 @@ impl NicordApp {
                 "Nicord chỉ hỏi bản phát hành công khai trên GitHub, không gửi dữ liệu cá nhân. Cập nhật chỉ diễn ra khi bạn đồng ý — file cài đặt được thay, còn token, kịch bản và lịch sử gửi vẫn nguyên.",
             );
         });
+        ui.add_space(12.0);
+        self.show_backup_card(ui);
         ui.add_space(12.0);
         theme::danger_frame().show(ui, |ui| {
             ui.set_width(ui.available_width());

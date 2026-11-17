@@ -11,18 +11,20 @@
 
 use crate::{
     antiban::{sanitize_content, AntiBanConfig},
+    destination::{Destination, FailureState},
     discord::{build_interaction_payload, make_nonce, DiscordClient, DiscordError},
     gateway::{Gateway, SESSION_WAIT_SECS},
     scenario::{due_time, render_template_with_vars, CommandConfig, Scenario, Schedule},
     spintax::{apply_spintax, vary_message},
     store::Store,
+    webhook::MessageSender,
 };
-use chrono::{DateTime, Local, NaiveDate, Utc};
-use rand::{rngs::StdRng, SeedableRng};
+use chrono::{DateTime, Local, NaiveDate, Timelike, Utc};
+use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -93,6 +95,24 @@ pub struct Engine {
     last_day: Mutex<chrono::NaiveDate>,
     pub emergency_stop: Arc<AtomicBool>,
     pub running: Arc<AtomicBool>,
+    /// True while a `run_loop` task holds the single-loop claim,
+    /// including wind-down after Emergency Stop. Distinct from
+    /// `running`: `stop_all()` clears `running` immediately, but the
+    /// old loop may still be finishing a send, so a new loop must not
+    /// start until this claim is released.
+    loop_active: Arc<AtomicBool>,
+    /// Per-destination 429 cooldowns (destination id -> resume time).
+    /// std Mutex: short critical sections, no await while held, and
+    /// the UI never needs to read them.
+    cooldowns: std::sync::Mutex<HashMap<String, Instant>>,
+    /// Global 429 pause (all destinations) until this instant.
+    global_pause_until: std::sync::Mutex<Option<Instant>>,
+    /// Consecutive errors per destination id (auto-pause tracking).
+    dest_errors: std::sync::Mutex<HashMap<String, u32>>,
+    /// Global daily cap (webhook mode, live-editable from Settings).
+    global_daily_cap: AtomicU32,
+    /// Consecutive-error limit before auto-pause (live-editable).
+    dest_error_limit: AtomicU32,
     /// Real identity for template vars, fetched once at engine start
     /// (`get_me` + first guild). Falls back to ("you", "server") only
     /// when that call fails, and the failure is logged.
@@ -113,7 +133,12 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new(store: Arc<Store>, antiban: AntiBanConfig) -> Self {
+    pub fn new(
+        store: Arc<Store>,
+        antiban: AntiBanConfig,
+        global_daily_cap: u32,
+        dest_error_limit: u32,
+    ) -> Self {
         let sent = store.count_sends_today();
         Self {
             store,
@@ -124,6 +149,12 @@ impl Engine {
             last_day: Mutex::new(Utc::now().date_naive()),
             emergency_stop: Arc::new(AtomicBool::new(false)),
             running: Arc::new(AtomicBool::new(false)),
+            loop_active: Arc::new(AtomicBool::new(false)),
+            cooldowns: std::sync::Mutex::new(HashMap::new()),
+            global_pause_until: std::sync::Mutex::new(None),
+            dest_errors: std::sync::Mutex::new(HashMap::new()),
+            global_daily_cap: AtomicU32::new(global_daily_cap),
+            dest_error_limit: AtomicU32::new(dest_error_limit),
             identity: Mutex::new(("you".to_string(), "server".to_string())),
             identity_last_try: Mutex::new(None),
             break_state: Mutex::new(BreakState {
@@ -148,6 +179,87 @@ impl Engine {
     pub fn set_antiban(&self, cfg: AntiBanConfig) {
         if let Ok(mut c) = self.antiban.write() {
             *c = cfg;
+        }
+    }
+
+    /// Atomically claim the single engine loop. False means a loop is
+    /// already active (including wind-down) and the caller must not
+    /// start a second one: two loops hold separate last-run state and
+    /// can fire the same scheduled time twice.
+    pub fn try_claim_loop(&self) -> bool {
+        self.loop_active
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    fn release_loop(&self) {
+        self.loop_active.store(false, Ordering::SeqCst);
+    }
+
+    /// True while a `run_loop` task holds the claim (including
+    /// wind-down). The UI checks this before spawning a new loop; the
+    /// atomic claim in `run_loop` is the correctness guard.
+    pub fn is_loop_active(&self) -> bool {
+        self.loop_active.load(Ordering::SeqCst)
+    }
+
+    /// Live-update the global daily cap (Settings save).
+    pub fn set_global_daily_cap(&self, cap: u32) {
+        self.global_daily_cap.store(cap, Ordering::SeqCst);
+    }
+
+    /// Live-update the consecutive-error limit (Settings save).
+    pub fn set_dest_error_limit(&self, limit: u32) {
+        self.dest_error_limit.store(limit, Ordering::SeqCst);
+    }
+
+    /// True while a global 429 pause is in effect.
+    pub fn is_globally_paused(&self) -> bool {
+        self.global_pause_until
+            .lock()
+            .map(|g| g.map(|t| t > Instant::now()).unwrap_or(false))
+            .unwrap_or(false)
+    }
+
+    fn set_global_pause(&self, secs: u64) {
+        if let Ok(mut g) = self.global_pause_until.lock() {
+            *g = Some(Instant::now() + Duration::from_secs(secs.max(1)));
+        }
+    }
+
+    fn set_cooldown(&self, dest_id: &str, secs: u64) {
+        if let Ok(mut map) = self.cooldowns.lock() {
+            map.insert(
+                dest_id.to_string(),
+                Instant::now() + Duration::from_secs(secs.max(1)),
+            );
+        }
+    }
+
+    fn cooldown_remaining(&self, dest_id: &str) -> Option<Duration> {
+        self.cooldowns.lock().ok().and_then(|map| {
+            map.get(dest_id)
+                .and_then(|t| t.checked_duration_since(Instant::now()))
+        })
+    }
+
+    /// Record a destination error. Returns true when the destination
+    /// just crossed the auto-pause limit (caller persists the pause).
+    fn record_dest_error(&self, dest_id: &str) -> bool {
+        let limit = self.dest_error_limit.load(Ordering::SeqCst).max(1);
+        self.dest_errors
+            .lock()
+            .map(|mut map| {
+                let count = map.entry(dest_id.to_string()).or_insert(0);
+                *count += 1;
+                *count >= limit
+            })
+            .unwrap_or(false)
+    }
+
+    fn reset_dest_errors(&self, dest_id: &str) {
+        if let Ok(mut map) = self.dest_errors.lock() {
+            map.remove(dest_id);
         }
     }
 
@@ -249,24 +361,90 @@ impl Engine {
             need
         };
         if !wait.is_zero() {
-            tokio::time::sleep(wait).await;
+            // Abort early on Emergency Stop; callers re-check the flag
+            // right after this returns.
+            let _ = self.sleep_interruptible(wait).await;
         }
     }
 
     /// Send one scenario's next message, applying all anti-ban layers.
     /// Returns Ok(message_id) or Err(reason). Errors starting with
     /// `skip: ` are intentional skips (sleep window, daily cap, time
-    /// window) — the caller must not count them as failures.
-    /// Never panics on Discord errors.
+    /// window, paused destination) — the caller consumes the run but
+    /// must not count them as failures. Errors starting with `defer: `
+    /// are short waits (minimum interval, 429 cooldown, global pause)
+    /// — the caller must NOT consume the run, count an error, or log
+    /// a failure; the run retries on a later tick, slightly late.
+    /// `destination` is Some in webhook mode (per-destination checks),
+    /// None in user-token mode. Never panics on Discord errors.
     pub async fn send_once(
         &self,
         scenario: &Scenario,
-        client: &DiscordClient,
+        sender: &MessageSender,
+        destination: Option<&Destination>,
         username: &str,
         server_name: &str,
     ) -> Result<String, String> {
         if self.emergency_stop.load(Ordering::SeqCst) {
             return Err("emergency stop is active".into());
+        }
+        // Global 429 pause blocks every send until it expires.
+        if self.is_globally_paused() {
+            return Err("defer: Discord global rate-limit pause in effect".into());
+        }
+        // Destination pre-checks (webhook mode only).
+        if let Some(dest) = destination {
+            if !dest.enabled {
+                return Err(format!(
+                    "skip: destination '{}' is disabled",
+                    dest.display_name()
+                ));
+            }
+            if dest.failure_state.is_paused() {
+                return Err(format!(
+                    "skip: destination '{}' is paused ({}) — resume it in Destinations",
+                    dest.display_name(),
+                    dest.failure_state.label()
+                ));
+            }
+            if dest.encrypted_url.trim().is_empty() {
+                return Err(format!(
+                    "skip: destination '{}' has no webhook URL yet",
+                    dest.display_name()
+                ));
+            }
+            // Quiet window (fail-closed on a broken window).
+            let now_local = Local::now();
+            let minutes = now_local.hour() * 60 + now_local.minute();
+            if dest.is_quiet_at(minutes) {
+                return Err(format!(
+                    "skip: destination '{}' is inside its quiet window",
+                    dest.display_name()
+                ));
+            }
+            // Per-destination 429 cooldown: defer, do not consume.
+            if let Some(remaining) = self.cooldown_remaining(&dest.id) {
+                return Err(format!(
+                    "defer: destination '{}' cooling down for {}s (429)",
+                    dest.display_name(),
+                    remaining.as_secs()
+                ));
+            }
+            // Per-destination daily cap (DB count, UTC date).
+            let effective_cap = if dest.daily_cap == 0 {
+                self.global_daily_cap.load(Ordering::SeqCst)
+            } else {
+                dest.daily_cap
+            };
+            if !dest.channel_id.is_empty() {
+                let sent = self.store.count_sends_today_for_channel(&dest.channel_id);
+                if sent >= effective_cap {
+                    return Err(format!(
+                        "skip: destination '{}' daily cap reached ({sent}/{effective_cap})",
+                        dest.display_name()
+                    ));
+                }
+            }
         }
         // Live anti-ban config for this send (Settings edits apply
         // without restarting the engine).
@@ -275,16 +453,26 @@ impl Engine {
         if antiban.in_sleep_window(Local::now()) {
             return Err("skip: inside night sleep window".into());
         }
-        scenario
-            .validate()
-            .map_err(|e| format!("invalid scenario: {e}"))?;
+        // Mode-aware validation: webhook scenarios need no channel,
+        // but command nodes are rejected (webhooks cannot send them).
+        if sender.is_webhook() {
+            scenario
+                .validate_for_webhook()
+                .map_err(|e| format!("invalid scenario: {e}"))?;
+        } else {
+            scenario
+                .validate()
+                .map_err(|e| format!("invalid scenario: {e}"))?;
+        }
         // ConditionTimeWindow nodes: outside the window = skip, not error.
         if let Err(e) = scenario.check_time_windows(Local::now()) {
             return Err(format!("skip: {e}"));
         }
-        // Daily cap: 300/day with warm-up, additionally capped by the
-        // per-scenario limit when one is set (0 = no per-scenario limit).
-        // The persisted send count is the source of truth for "sent today".
+        // Daily cap. User mode: 300/day with warm-up, additionally
+        // capped by the per-scenario limit. Webhook mode: the global
+        // daily cap from Settings (no warm-up — webhooks are official
+        // API usage, not an account warming up), plus the per-scenario
+        // limit. The persisted send count is the source of truth.
         {
             // The bucket is the UTC date: the cap resets at 00:00 UTC,
             // never at local midnight, so changing the machine timezone
@@ -296,29 +484,47 @@ impl Engine {
                 *self.sent_today.lock().await = self.store.count_sends_today();
             }
             let sent = *self.sent_today.lock().await;
-            let base_cap = antiban.daily_cap;
-            let age = self.store.account_age_days();
-            let account_eff = antiban.effective_daily_cap(base_cap, age);
             let scenario_cap = if scenario.limits.daily_cap == 0 {
                 u32::MAX
             } else {
                 scenario.limits.daily_cap
             };
-            let eff = account_eff.min(scenario_cap);
-            if sent >= eff {
-                return Err(format!(
-                    "skip: daily cap reached ({sent}/{eff}, warm-up age {age}d)"
-                ));
+            if destination.is_some() {
+                let eff = self
+                    .global_daily_cap
+                    .load(Ordering::SeqCst)
+                    .min(scenario_cap);
+                if sent >= eff {
+                    return Err(format!("skip: global daily cap reached ({sent}/{eff})"));
+                }
+            } else {
+                let base_cap = antiban.daily_cap;
+                let age = self.store.account_age_days();
+                let account_eff = antiban.effective_daily_cap(base_cap, age);
+                let eff = account_eff.min(scenario_cap);
+                if sent >= eff {
+                    return Err(format!(
+                        "skip: daily cap reached ({sent}/{eff}, warm-up age {age}d)"
+                    ));
+                }
             }
         }
 
         // A Send Command node takes precedence over message nodes: one
         // scheduled firing runs exactly the first command node (see
         // `Scenario::command_node` for why only the first one runs).
+        // Webhook mode rejects commands defensively here too, even
+        // though validation above already rejects them.
         if let Some(cmd_node) = scenario.command_node() {
+            if sender.is_webhook() {
+                return Err(
+                    "webhook mode cannot send commands — use a message scenario or switch back to account mode"
+                        .into(),
+                );
+            }
             let cfg = CommandConfig::from_node(cmd_node);
             return self
-                .send_command(scenario, &cfg, client, username, server_name, &antiban)
+                .send_command(scenario, &cfg, sender, username, server_name, &antiban)
                 .await;
         }
         // Node execution (in node order): a Send Message / Send Embed node
@@ -326,9 +532,15 @@ impl Engine {
         // UtilityWait nodes add an explicit delay before sending.
         let wait_secs = scenario.wait_seconds();
         let mut rng = StdRng::from_os_rng();
+        // Content fallback chain (Q6): node message → scenario
+        // messages → destination default messages → error. When
+        // `use_destination_messages` is set, the destination
+        // defaults replace the scenario list outright. Never an
+        // empty send, never invented content.
+        let use_dest_first = scenario.use_destination_messages && destination.is_some();
         let raw = if let Some(node_msg) = scenario.node_message() {
             node_msg
-        } else {
+        } else if !use_dest_first && !scenario.messages.is_empty() {
             let last_idx = self.last_msg_index.lock().await.get(&scenario.id).copied();
             let (idx, msg) = scenario
                 .pick_message_with_index(last_idx, &mut rng)
@@ -338,6 +550,33 @@ impl Engine {
                 .await
                 .insert(scenario.id.clone(), idx);
             msg
+        } else if let Some(dest) = destination {
+            if dest.default_messages.is_empty() {
+                return Err(
+                    "scenario has no messages and the destination has no default messages".into(),
+                );
+            }
+            // Rotate through the destination defaults without
+            // repeating the last pick (same rule as scenarios).
+            let last_idx = self.last_msg_index.lock().await.get(&scenario.id).copied();
+            let n = dest.default_messages.len();
+            let idx = if n == 1 {
+                0
+            } else {
+                loop {
+                    let candidate = rng.random_range(0..n);
+                    if Some(candidate) != last_idx {
+                        break candidate;
+                    }
+                }
+            };
+            self.last_msg_index
+                .lock()
+                .await
+                .insert(scenario.id.clone(), idx);
+            dest.default_messages[idx].clone()
+        } else {
+            return Err("scenario has no messages".to_string());
         };
         let mut vars: HashMap<String, String> = scenario
             .variables
@@ -349,36 +588,68 @@ impl Engine {
             render_template_with_vars(&raw, username, server_name, &scenario.channel_id, &vars);
         // Smart Templates (Discord-BLUE): Spintax + variation are applied
         // AFTER template vars are resolved — so `{{username}}` is never
-        // mangled — and only when the toggle is on.
-        let final_text = if antiban.smart_templates {
+        // mangled — and only when the toggle is on. Webhook mode never
+        // varies content: webhook sends are plain scheduled messages.
+        let final_text = if antiban.smart_templates && !sender.is_webhook() {
             vary_message(&apply_spintax(&rendered, &mut rng), &mut rng)
         } else {
             rendered
         };
-        // Layer 4: content checks.
+        // Layer 4: content checks. Empty content is allowed when an
+        // embed is attached (Discord requires content OR embeds).
         let (clean, warnings) = sanitize_content(&final_text, &antiban);
         for w in &warnings {
             tracing::warn!("anti-ban: {w}");
         }
-        if clean.trim().is_empty() {
+        let has_embed = scenario
+            .embed
+            .as_ref()
+            .map(|e| !e.is_empty())
+            .unwrap_or(false);
+        if clean.trim().is_empty() && !has_embed {
             return Err("message is empty after sanitising".into());
         }
 
         if wait_secs > 0 {
-            tokio::time::sleep(Duration::from_secs(wait_secs)).await;
+            let _ = self
+                .sleep_interruptible(Duration::from_secs(wait_secs))
+                .await;
             if self.emergency_stop.load(Ordering::SeqCst) {
                 return Err("emergency stop pressed while waiting".into());
             }
         }
-        self.wait_for_slot(&scenario.channel_id).await;
+        // Minimum interval. User mode: sleep until the slot opens
+        // (existing behaviour). Webhook mode: defer without consuming
+        // the run, so other destinations keep running on this tick.
+        if let Some(dest) = destination {
+            let interval = Duration::from_secs(u64::from(dest.min_interval_secs));
+            let too_soon = {
+                let last = self.last_sent.lock().await;
+                last.get(&dest.id)
+                    .map(|t| t.elapsed() < interval)
+                    .unwrap_or(false)
+            };
+            if too_soon {
+                return Err(format!(
+                    "defer: destination '{}' minimum interval not reached yet",
+                    dest.display_name()
+                ));
+            }
+        } else {
+            self.wait_for_slot(&scenario.channel_id).await;
+        }
         if self.emergency_stop.load(Ordering::SeqCst) {
             return Err("emergency stop pressed while waiting".into());
         }
 
         // Auto Typing (Discord-BLUE): show "typing..." for a random
         // 2–5s before sending. A typing failure never blocks the send.
-        if antiban.auto_typing {
-            let _ = client.send_typing(&scenario.channel_id).await;
+        // Webhooks have no typing endpoint, so this is skipped entirely
+        // in webhook mode.
+        if antiban.auto_typing && !sender.is_webhook() {
+            if let MessageSender::User(client) = sender {
+                let _ = client.send_typing(&scenario.channel_id).await;
+            }
             let typing = Duration::from_secs(antiban.typing_secs(&mut rng));
             if self.sleep_interruptible(typing).await {
                 return Err("emergency stop pressed while typing".into());
@@ -386,36 +657,81 @@ impl Engine {
         }
 
         // Retry: network errors up to 3x with backoff; 429 waits retry_after;
-        // 401/403 stop immediately (Spec §6).
-        self.send_message_with_retry(scenario, client, &clean, &antiban, &mut rng)
-            .await
+        // 401/403/404 stop immediately (Spec §6).
+        let embeds: Vec<crate::embed::Embed> = scenario
+            .embed
+            .clone()
+            .filter(|e| !e.is_empty())
+            .into_iter()
+            .collect();
+        self.send_message_with_retry(
+            scenario,
+            sender,
+            destination,
+            &clean,
+            &embeds,
+            &antiban,
+            &mut rng,
+        )
+        .await
     }
 
     /// Send one message with the retry policy, then run the post-send
     /// layers (Auto Delete, Auto Break). Returns the message id.
+    // The retry path genuinely needs all seven inputs (scenario,
+    // sender, destination, content, embeds, anti-ban, rng); grouping
+    // them into a struct would churn every call site for no gain.
+    #[allow(clippy::too_many_arguments)]
     async fn send_message_with_retry(
         &self,
         scenario: &Scenario,
-        client: &DiscordClient,
+        sender: &MessageSender,
+        destination: Option<&Destination>,
         clean: &str,
+        embeds: &[crate::embed::Embed],
         antiban: &AntiBanConfig,
         rng: &mut StdRng,
     ) -> Result<String, String> {
+        // Log channel: the destination's channel in webhook mode (so
+        // per-destination stats and filters work), the scenario's
+        // channel in user mode.
+        let log_channel = destination
+            .map(|d| d.channel_id.clone())
+            .filter(|c| !c.is_empty())
+            .unwrap_or_else(|| scenario.channel_id.clone());
         let mut attempt = 0;
         loop {
             attempt += 1;
-            match client.send_message(&scenario.channel_id, clean).await {
+            match sender
+                .send_with_embeds(&scenario.channel_id, clean, embeds)
+                .await
+            {
                 Ok(sent) => {
                     *self.sent_today.lock().await += 1;
+                    // Record the actual send time for the destination's
+                    // minimum-interval check.
+                    if let Some(dest) = destination {
+                        self.last_sent
+                            .lock()
+                            .await
+                            .insert(dest.id.clone(), Instant::now());
+                        self.reset_dest_errors(&dest.id);
+                    }
+                    // A webhook 204 has no message id: do not claim one.
+                    let detail = if sent.id.is_empty() {
+                        "message sent (webhook, no id returned)".to_string()
+                    } else {
+                        format!("message {}", sent.id)
+                    };
                     let entry = SendLogEntry {
                         scenario_id: scenario.id.clone(),
                         scenario_name: scenario.name.clone(),
-                        channel_id: scenario.channel_id.clone(),
+                        channel_id: log_channel.clone(),
                         status: "sent".into(),
-                        detail: format!("message {}", sent.id),
+                        detail,
                     };
                     let _ = self.store.log_send(&entry);
-                    self.maybe_auto_delete(scenario, client, &sent.id, antiban)
+                    self.maybe_auto_delete(scenario, sender, &sent.id, antiban)
                         .await?;
                     self.maybe_auto_break(antiban, rng).await?;
                     return Ok(sent.id);
@@ -425,11 +741,32 @@ impl Engine {
                     global,
                 }) => {
                     tracing::warn!("Discord 429, waiting {retry_after_secs}s (global={global})");
-                    if global {
+                    // Webhook mode: record the cooldown and defer —
+                    // other destinations keep running, and this run
+                    // retries after `retry_after` without consuming.
+                    // Never shorten `retry_after`.
+                    if let Some(dest) = destination {
+                        if global {
+                            self.set_global_pause(retry_after_secs);
+                        } else {
+                            self.set_cooldown(&dest.id, retry_after_secs);
+                        }
+                        return Err(format!(
+                            "defer: Discord rate limit, retry after {retry_after_secs}s (global={global})"
+                        ));
+                    }
+                    // User mode: same waits as before, but abort early
+                    // on Emergency Stop instead of sleeping up to 1h
+                    // uninterruptibly.
+                    let paused = if global {
                         // Spec §6: a global limit warning pauses everything 1h.
-                        tokio::time::sleep(Duration::from_secs(3600)).await;
+                        self.sleep_interruptible(Duration::from_secs(3600)).await
                     } else {
-                        tokio::time::sleep(Duration::from_secs(retry_after_secs.max(1))).await;
+                        self.sleep_interruptible(Duration::from_secs(retry_after_secs.max(1)))
+                            .await
+                    };
+                    if paused {
+                        return Err("emergency stop pressed during rate-limit pause".into());
                     }
                     if attempt >= 3 {
                         if let Ok(mut f) = self.failed_today.lock() {
@@ -444,6 +781,29 @@ impl Engine {
                     if let Ok(mut f) = self.failed_today.lock() {
                         *f += 1;
                     }
+                    if let Some(dest) = destination {
+                        let _ = self.store.set_destination_failure(
+                            &dest.id,
+                            FailureState::Paused401,
+                            &format!("stopped immediately: {m}"),
+                        );
+                    }
+                    return Err(format!("stopped immediately: {m}"));
+                }
+                Err(DiscordError::NotFound(m)) => {
+                    if let Ok(mut f) = self.failed_today.lock() {
+                        *f += 1;
+                    }
+                    // A gone webhook pauses the destination (persisted):
+                    // further sends would only 404 again. The user
+                    // resumes it from Destinations after fixing it.
+                    if let Some(dest) = destination {
+                        let _ = self.store.set_destination_failure(
+                            &dest.id,
+                            FailureState::Paused404,
+                            &format!("stopped immediately: {m}"),
+                        );
+                    }
                     return Err(format!("stopped immediately: {m}"));
                 }
                 Err(DiscordError::Other(m)) => {
@@ -454,7 +814,9 @@ impl Engine {
                         return Err(format!("failed after 3 attempts: {m}"));
                     }
                     let backoff = 2u64.pow(attempt) * 2;
-                    tokio::time::sleep(Duration::from_secs(backoff)).await;
+                    if self.sleep_interruptible(Duration::from_secs(backoff)).await {
+                        return Err("emergency stop pressed during retry backoff".into());
+                    }
                 }
             }
         }
@@ -467,10 +829,17 @@ impl Engine {
     async fn maybe_auto_delete(
         &self,
         scenario: &Scenario,
-        client: &DiscordClient,
+        sender: &MessageSender,
         message_id: &str,
         antiban: &AntiBanConfig,
     ) -> Result<(), String> {
+        // Webhook mode has no auto-delete in v1: sent messages stay up.
+        if sender.is_webhook() {
+            return Ok(());
+        }
+        let MessageSender::User(client) = sender else {
+            return Ok(());
+        };
         if !antiban.auto_delete {
             return Ok(());
         }
@@ -553,14 +922,18 @@ impl Engine {
         &self,
         scenario: &Scenario,
         cfg: &CommandConfig,
-        client: &DiscordClient,
+        sender: &MessageSender,
         username: &str,
         server_name: &str,
         antiban: &AntiBanConfig,
     ) -> Result<String, String> {
+        // Defensive: send_once already rejects commands in webhook mode.
+        let MessageSender::User(client) = sender else {
+            return Err("webhook mode cannot send commands".into());
+        };
         let mut rng = StdRng::from_os_rng();
         if cfg.is_slash() {
-            return self.send_slash(scenario, cfg, client, antiban).await;
+            return self.send_slash(scenario, cfg, sender, antiban).await;
         }
         let mut vars: HashMap<String, String> = scenario
             .variables
@@ -585,7 +958,9 @@ impl Engine {
         }
         let wait_secs = scenario.wait_seconds();
         if wait_secs > 0 {
-            tokio::time::sleep(Duration::from_secs(wait_secs)).await;
+            let _ = self
+                .sleep_interruptible(Duration::from_secs(wait_secs))
+                .await;
             if self.emergency_stop.load(Ordering::SeqCst) {
                 return Err("emergency stop pressed while waiting".into());
             }
@@ -601,7 +976,8 @@ impl Engine {
                 return Err("emergency stop pressed while typing".into());
             }
         }
-        self.send_message_with_retry(scenario, client, &clean, antiban, &mut rng)
+        // Prefix commands are user-mode only: no destination, no embed.
+        self.send_message_with_retry(scenario, sender, None, &clean, &[], antiban, &mut rng)
             .await
     }
 
@@ -614,13 +990,19 @@ impl Engine {
         &self,
         scenario: &Scenario,
         cfg: &CommandConfig,
-        client: &DiscordClient,
+        sender: &MessageSender,
         antiban: &AntiBanConfig,
     ) -> Result<String, String> {
+        // Defensive: send_once already rejects commands in webhook mode.
+        let MessageSender::User(client) = sender else {
+            return Err("webhook mode cannot send commands".into());
+        };
         let mut rng = StdRng::from_os_rng();
         let wait_secs = scenario.wait_seconds();
         if wait_secs > 0 {
-            tokio::time::sleep(Duration::from_secs(wait_secs)).await;
+            let _ = self
+                .sleep_interruptible(Duration::from_secs(wait_secs))
+                .await;
             if self.emergency_stop.load(Ordering::SeqCst) {
                 return Err("emergency stop pressed while waiting".into());
             }
@@ -725,10 +1107,14 @@ impl Engine {
                     tracing::warn!(
                         "Discord 429 on slash, waiting {retry_after_secs}s (global={global})"
                     );
-                    if global {
-                        tokio::time::sleep(Duration::from_secs(3600)).await;
+                    let paused = if global {
+                        self.sleep_interruptible(Duration::from_secs(3600)).await
                     } else {
-                        tokio::time::sleep(Duration::from_secs(retry_after_secs.max(1))).await;
+                        self.sleep_interruptible(Duration::from_secs(retry_after_secs.max(1)))
+                            .await
+                    };
+                    if paused {
+                        return Err("emergency stop pressed during rate-limit pause".into());
                     }
                     if attempt >= 3 {
                         if let Ok(mut f) = self.failed_today.lock() {
@@ -739,7 +1125,9 @@ impl Engine {
                         ));
                     }
                 }
-                Err(DiscordError::Unauthorized(m)) | Err(DiscordError::Forbidden(m)) => {
+                Err(DiscordError::Unauthorized(m))
+                | Err(DiscordError::Forbidden(m))
+                | Err(DiscordError::NotFound(m)) => {
                     if let Ok(mut f) = self.failed_today.lock() {
                         *f += 1;
                     }
@@ -753,7 +1141,9 @@ impl Engine {
                         return Err(format!("failed after 3 attempts: {m}"));
                     }
                     let backoff = 2u64.pow(attempt) * 2;
-                    tokio::time::sleep(Duration::from_secs(backoff)).await;
+                    if self.sleep_interruptible(Duration::from_secs(backoff)).await {
+                        return Err("emergency stop pressed during retry backoff".into());
+                    }
                 }
             }
         }
@@ -778,23 +1168,36 @@ impl Engine {
     }
 
     /// Main loop: every second, fire scenarios whose schedule is due.
-    /// `get_token` supplies a fresh client; `scenarios` is re-read each tick
+    /// `get_sender` supplies a fresh sender; `scenarios` is re-read each tick
     /// so edits in the UI take effect without restarting the engine.
+    /// Main engine loop. `resolve_sender` maps each scenario to its
+    /// sender plus its destination (Some in webhook mode, None in
+    /// user-token mode). One loop only (atomic guard); destinations
+    /// are processed sequentially in a stable order, with a fixed
+    /// 1-second stagger between webhook sends in one tick.
     pub async fn run_loop(
         self: Arc<Self>,
-        get_client: impl Fn() -> Option<DiscordClient> + Send + Sync + 'static,
+        resolve_sender: impl Fn(&Scenario) -> Option<(MessageSender, Option<Destination>)>
+            + Send
+            + Sync
+            + 'static,
         scenarios_fn: impl Fn() -> Vec<Scenario> + Send + Sync + 'static,
     ) {
+        // Single-loop guard: refuse a second concurrent loop (e.g. a
+        // double Start click, or a Start during wind-down after Stop).
+        if !self.try_claim_loop() {
+            tracing::warn!("engine loop already active; refusing a second loop");
+            return;
+        }
         self.running.store(true, Ordering::SeqCst);
         // Authoritative last-run state: scenario id -> (schedule label,
         // last scheduled time that fired). Persisted to SQLite on every
         // fire, so a restart resumes exactly where it left off.
         let mut last_runs: HashMap<String, (String, Option<DateTime<Utc>>)> = HashMap::new();
         let mut consecutive_errors: u32 = 0;
-        // Fetch the real identity once at startup (retried ≤1/min on failure).
-        if let Some(client) = get_client() {
-            self.refresh_identity(&client).await;
-        }
+        // No startup identity fetch: user-mode identity is refreshed
+        // per scenario below (throttled), and webhook-mode identity
+        // comes from the stored destination (no network needed).
         while self.running.load(Ordering::SeqCst) && !self.emergency_stop.load(Ordering::SeqCst) {
             let now = Local::now();
             let scenarios = scenarios_fn();
@@ -829,17 +1232,6 @@ impl Engine {
                 let Some(schedule) = scenario.schedule.clone() else {
                     continue;
                 };
-                if let Some(allowed) = &allowed_channel {
-                    if &scenario.channel_id != allowed {
-                        tracing::warn!(
-                            "scenario {} uses channel {} but only {} may send — skipped",
-                            scenario.name,
-                            scenario.channel_id,
-                            allowed
-                        );
-                        continue;
-                    }
-                }
                 let Some(due) = due_time(
                     &schedule,
                     last_run,
@@ -849,16 +1241,45 @@ impl Engine {
                 ) else {
                     continue;
                 };
-                let Some(client) = get_client() else {
+                let Some((sender, destination)) = resolve_sender(&scenario) else {
                     continue;
                 };
-                // Refresh identity if it is still the fallback.
-                if self.identity().await.0 == "you" {
-                    self.refresh_identity(&client).await;
+                // Only the first distinct channel may send (user mode).
+                // Webhook mode ignores channel_id: the URL is channel-bound.
+                if destination.is_none() && !sender.is_webhook() {
+                    if let Some(allowed) = &allowed_channel {
+                        if &scenario.channel_id != allowed {
+                            tracing::warn!(
+                                "scenario {} uses channel {} but only {} may send — skipped",
+                                scenario.name,
+                                scenario.channel_id,
+                                allowed
+                            );
+                            continue;
+                        }
+                    }
                 }
-                let (username, server_name) = self.identity().await;
+                // Template identity: per-destination in webhook mode
+                // (stored name, no network), global account identity
+                // in user mode (refreshed when still the fallback).
+                let (username, server_name) = if let Some(dest) = &destination {
+                    (dest.effective_username(), String::new())
+                } else {
+                    if self.identity().await.0 == "you" {
+                        if let MessageSender::User(client) = &sender {
+                            self.refresh_identity(client).await;
+                        }
+                    }
+                    self.identity().await
+                };
                 match self
-                    .send_once(&scenario, &client, &username, &server_name)
+                    .send_once(
+                        &scenario,
+                        &sender,
+                        destination.as_ref(),
+                        &username,
+                        &server_name,
+                    )
                     .await
                 {
                     Ok(_) => {
@@ -875,6 +1296,20 @@ impl Engine {
                             );
                         }
                         let _ = self.store.save_scenario(&scenario);
+                        // Fixed 1-second stagger between webhook sends
+                        // in one tick (transparent, never random).
+                        if destination.is_some()
+                            && self.sleep_interruptible(Duration::from_secs(1)).await
+                        {
+                            break;
+                        }
+                    }
+                    Err(e) if e.starts_with("defer:") => {
+                        // Short wait (interval / 429 cooldown / global
+                        // pause): do NOT consume the run, count an
+                        // error, or log a failure. The run retries on
+                        // a later tick, slightly late.
+                        tracing::info!("scenario {} deferred: {e}", scenario.name);
                     }
                     Err(e) if e.starts_with("skip:") => {
                         // Intentional skip (sleep window / cap / time
@@ -891,11 +1326,45 @@ impl Engine {
                     }
                     Err(e) => {
                         tracing::warn!("scenario {} failed: {e}", scenario.name);
+                        // Persist failures so Logs can filter by status
+                        // and the Dashboard can count them (QoL). The
+                        // detail is truncated: Discord error bodies can
+                        // be long, and the log is for diagnosis, not a
+                        // transcript. Errors never contain credentials.
+                        let detail: String = e.chars().take(1000).collect();
+                        let _ = self.store.log_send(&SendLogEntry {
+                            scenario_id: scenario.id.clone(),
+                            scenario_name: scenario.name.clone(),
+                            channel_id: scenario.channel_id.clone(),
+                            status: "failed".into(),
+                            detail,
+                        });
                         consecutive_errors += 1;
+                        // Per-destination consecutive errors: pause only
+                        // that destination when it crosses the limit.
+                        // Never overwrite a 404/401 pause set by the
+                        // send path itself.
+                        if let Some(dest) = &destination {
+                            if self.record_dest_error(&dest.id) {
+                                if let Ok(Some(current)) = self.store.load_destination(&dest.id) {
+                                    if current.failure_state == FailureState::Ok {
+                                        let _ = self.store.set_destination_failure(
+                                            &dest.id,
+                                            FailureState::PausedErrors,
+                                            &e,
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         // Spec §6: 3 consecutive errors pauses the engine.
+                        // Interruptible: Emergency Stop must not wait
+                        // out the full 10 minutes.
                         if consecutive_errors >= 3 {
                             tracing::error!("3 consecutive errors — pausing engine for 10 min");
-                            tokio::time::sleep(Duration::from_secs(600)).await;
+                            if self.sleep_interruptible(Duration::from_secs(600)).await {
+                                break;
+                            }
                             consecutive_errors = 0;
                         }
                     }
@@ -904,6 +1373,7 @@ impl Engine {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
         self.running.store(false, Ordering::SeqCst);
+        self.release_loop();
     }
 }
 
@@ -955,5 +1425,36 @@ mod tests {
         // Empty channel ids don't count.
         let c = Scenario::new("c");
         assert!(channels_violation(&[a, c]).is_none());
+    }
+
+    #[test]
+    fn loop_claim_is_exclusive_until_released() {
+        let store = Arc::new(Store::open_memory().unwrap());
+        let engine = Engine::new(store, AntiBanConfig::default(), 300, 5);
+        assert!(engine.try_claim_loop());
+        assert!(!engine.try_claim_loop());
+        assert!(engine.is_loop_active());
+        engine.release_loop();
+        assert!(!engine.is_loop_active());
+        assert!(engine.try_claim_loop());
+        engine.release_loop();
+    }
+
+    #[test]
+    fn cooldown_and_error_tracking() {
+        let store = Arc::new(Store::open_memory().unwrap());
+        let engine = Engine::new(store, AntiBanConfig::default(), 300, 3);
+        assert!(!engine.is_globally_paused());
+        engine.set_global_pause(60);
+        assert!(engine.is_globally_paused());
+        assert!(engine.cooldown_remaining("d1").is_none());
+        engine.set_cooldown("d1", 30);
+        assert!(engine.cooldown_remaining("d1").is_some());
+        assert!(engine.cooldown_remaining("d2").is_none());
+        assert!(!engine.record_dest_error("d1"));
+        assert!(!engine.record_dest_error("d1"));
+        assert!(engine.record_dest_error("d1"));
+        engine.reset_dest_errors("d1");
+        assert!(!engine.record_dest_error("d1"));
     }
 }

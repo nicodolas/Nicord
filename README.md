@@ -26,7 +26,7 @@ Ví dụ bạn có thể dùng Nicord để:
 - Gửi thông báo, tin khuyến mãi, tin cập nhật theo giờ cố định.
 - Xoay vòng nhiều mẫu tin khác nhau, để tin nhắn không bị lặp đi lặp lại giống hệt nhau.
 
-Bạn chỉ cần mở app, soạn nội dung, đặt lịch, rồi để app chạy. **Tin nhắn gửi đi hiện như chính bạn gửi** — không cần mời bot vào server, không cần lập trình.
+Bạn chỉ cần mở app, soạn nội dung, đặt lịch, rồi để app chạy. Ở chế độ Tài khoản, tin nhắn gửi đi hiện như chính bạn gửi — không cần mời bot vào server, không cần lập trình. Ở chế độ Webhook (khuyến nghị, cách chính thức của Discord), tin nhắn hiện dưới tên webhook của kênh.
 
 > ⚠️ **ĐỌC TRƯỚC KHI DÙNG — RẤT QUAN TRỌNG**
 >
@@ -36,10 +36,39 @@ Bạn chỉ cần mở app, soạn nội dung, đặt lịch, rồi để app ch
 >
 > 👉 **Hãy dùng một tài khoản phụ để thử. Đừng dùng tài khoản chính** có server, bạn bè hay Nitro quan trọng.
 > Bạn tự chịu trách nhiệm với tài khoản của mình khi dùng Nicord.
+>
+> Muốn an toàn hơn? Dùng **chế độ Webhook** bên dưới — đó là cách chính thức của Discord, không dùng tài khoản của bạn để gửi.
 
 ---
 
-## Bắt đầu trong 5 phút
+## Chế độ Webhook (khuyến nghị)
+
+Webhook là cách chính thức của Discord để gửi tin nhắn tự động tới 1 kênh. Bạn không cần token tài khoản, không cần mời bot, và không có nguy cơ bị khóa tài khoản vì gửi tin.
+
+**Cách tạo webhook:**
+
+1. Trong Discord, bấm chuột phải vào kênh bạn muốn gửi → **Edit Channel** → **Integrations** → **Webhooks** → **New Webhook**.
+2. Đặt tên cho webhook (tên này sẽ hiện khi tin nhắn được gửi), rồi bấm **Copy Webhook URL**.
+3. Mở Nicord, chọn **Webhook** ở màn hình đầu tiên, dán URL vào, bấm **Kiểm tra webhook** để xem đúng kênh chưa, rồi **Lưu webhook**.
+
+**Lưu ý:**
+
+- URL webhook **là mật khẩu** — ai có URL đều gửi được tin vào kênh đó. Nicord mã hóa URL và chỉ lưu trên máy bạn, không bao giờ hiện đủ URL hay ghi vào log. Nếu URL bị lộ, hãy xóa webhook cũ và tạo webhook mới trong Discord.
+- Webhook **chỉ gửi tin nhắn**. Webhook không gửi được lệnh (prefix/slash), không hiện "đang gõ...", không tự xóa tin. Các kịch bản có lệnh sẽ bị từ chối ở chế độ Webhook.
+- Mỗi webhook gắn với đúng 1 kênh. Muốn đổi kênh, tạo webhook mới ở kênh đó rồi đổi URL trong Cài đặt.
+- Bạn có thể đổi qua lại giữa Webhook và Tài khoản trong Cài đặt — thông tin đã lưu của chế độ kia không bị xóa.
+
+**Tiện ích khi soạn và theo dõi:**
+
+- Xem trước tin nhắn kiểu Discord ngay khi gõ, kèm đếm ký tự 2000; tin quá dài sẽ bị chặn khi thêm/bật.
+- Trạng thái webhook (tốt / không tìm thấy / lỗi mạng) và thời điểm kiểm tra gần nhất hiện ở Dashboard và Cài đặt; webhook bị xóa sẽ tự tạm dừng gửi cho tới khi kiểm tra lại.
+- Import kịch bản có cảnh báo rõ ràng (thiếu trường, file lỗi, file chứa URL webhook).
+- Logs lọc theo từ khóa, trạng thái và kịch bản; xuất CSV không bao giờ chứa URL/token.
+- Nhân bản kịch bản và đặt tên thân thiện cho webhook.
+
+---
+
+## Bắt đầu trong 5 phút (chế độ Tài khoản)
 
 ### Bước 1 — Nhập token Discord của bạn
 
@@ -93,7 +122,7 @@ Không. Tin nhắn được gửi bằng chính tài khoản của bạn, nên k
 Không. Những lần hẹn trong lúc máy tắt sẽ bị bỏ qua, app chỉ gửi lần hẹn tiếp theo. App không gửi dồn dập để bù.
 
 **App có chạy ẩn dưới khay hệ thống (tray) không?**
-Chưa. Hiện tại bạn cần giữ cửa sổ app mở (có thể thu nhỏ). Tính năng chạy ẩn sẽ có trong bản sau.
+Trên Windows thì có: bật "Thu nhỏ xuống khay hệ thống" trong Cài đặt, đóng cửa sổ sẽ ẩn app xuống tray thay vì thoát. Trên Linux hiện chưa có tray, bạn cần giữ cửa sổ app mở (có thể thu nhỏ). Tự chạy cùng máy tính đã có trên cả Windows và Linux.
 
 **App chạy trên máy nào?**
 App viết để chạy trên Windows, macOS và Linux, nhưng hiện mới chỉ chạy thử trên Linux. App rất nhẹ, mở lên gần như ngay lập tức.
@@ -110,7 +139,7 @@ Hiện tại chưa có file cài đặt sẵn. Để chạy Nicord, bạn cần 
 
 Nói thẳng để bạn không bất ngờ:
 
-- **Chưa có icon khay hệ thống / tự chạy cùng máy tính.** Bạn cần mở app và giữ cửa sổ mở để app chạy.
+- **Icon khay hệ thống chỉ có trên Windows.** Trên Linux, bạn cần mở app và giữ cửa sổ mở để app chạy. Tự chạy cùng máy tính đã có trên cả Windows và Linux.
 - **Chưa thử nghiệm gửi ổn định 7 ngày liên tục.** Trước khi dùng lâu dài, bạn nên tự chạy thử trên tài khoản phụ vài ngày.
 - App chỉ gửi tin theo lịch, không đọc tin nhắn trong server.
 

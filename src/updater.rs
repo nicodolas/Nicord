@@ -29,7 +29,7 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::{
     fmt,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
@@ -251,15 +251,53 @@ pub async fn download_asset(
     Ok(())
 }
 
+/// Zip-bomb guards for release extraction. A real Nicord release is a
+/// few MB with a handful of files; these caps are far above that.
+pub const MAX_ZIP_FILES: usize = 1_000;
+pub const MAX_ZIP_FILE_BYTES: u64 = 100 * 1024 * 1024;
+pub const MAX_ZIP_TOTAL_BYTES: u64 = 200 * 1024 * 1024;
+
+/// Extraction limits (see the `MAX_ZIP_*` constants for production
+/// values). Tests pass small limits to exercise the guards without
+/// building huge zips.
+#[derive(Debug, Clone, Copy)]
+pub struct ZipLimits {
+    pub max_files: usize,
+    pub max_file_bytes: u64,
+    pub max_total_bytes: u64,
+}
+
+impl Default for ZipLimits {
+    fn default() -> Self {
+        Self {
+            max_files: MAX_ZIP_FILES,
+            max_file_bytes: MAX_ZIP_FILE_BYTES,
+            max_total_bytes: MAX_ZIP_TOTAL_BYTES,
+        }
+    }
+}
+
 /// Extract a zip into `dest`, returning the extracted file paths.
 /// `ZipFile::enclosed_name` rejects absolute paths and `..` entries
 /// (Zip Slip), so a hostile zip cannot write outside `dest`.
 pub fn extract_zip(zip_path: &Path, dest: &Path) -> Result<Vec<PathBuf>, String> {
+    extract_zip_with_limits(zip_path, dest, ZipLimits::default())
+}
+
+pub fn extract_zip_with_limits(
+    zip_path: &Path,
+    dest: &Path,
+    limits: ZipLimits,
+) -> Result<Vec<PathBuf>, String> {
     let file = std::fs::File::open(zip_path).map_err(|e| format!("không mở được file zip: {e}"))?;
     let mut archive =
         zip::ZipArchive::new(file).map_err(|e| format!("file zip không hợp lệ: {e}"))?;
+    if archive.len() > limits.max_files {
+        return Err("file zip chứa quá nhiều file".into());
+    }
     std::fs::create_dir_all(dest).map_err(|e| format!("không tạo được thư mục tạm: {e}"))?;
     let mut out = Vec::new();
+    let mut total: u64 = 0;
     for i in 0..archive.len() {
         let mut entry = archive
             .by_index(i)
@@ -276,13 +314,27 @@ pub fn extract_zip(zip_path: &Path, dest: &Path) -> Result<Vec<PathBuf>, String>
                 .map_err(|e| format!("không tạo được thư mục tạm: {e}"))?;
             continue;
         }
+        // Reject an oversized declared size early; the `take` below is
+        // the enforced check (a declared size could lie).
+        if entry.size() > limits.max_file_bytes {
+            return Err("file zip chứa file quá lớn".into());
+        }
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("không tạo được thư mục tạm: {e}"))?;
         }
         let mut f =
             std::fs::File::create(&target).map_err(|e| format!("không giải nén được: {e}"))?;
-        std::io::copy(&mut entry, &mut f).map_err(|e| format!("không giải nén được: {e}"))?;
+        let mut limited = (&mut entry).take(limits.max_file_bytes + 1);
+        let copied =
+            std::io::copy(&mut limited, &mut f).map_err(|e| format!("không giải nén được: {e}"))?;
+        if copied > limits.max_file_bytes {
+            return Err("file zip chứa file quá lớn".into());
+        }
+        total += copied;
+        if total > limits.max_total_bytes {
+            return Err("file zip giải nén vượt quá giới hạn cho phép".into());
+        }
         out.push(target);
     }
     Ok(out)
@@ -755,6 +807,39 @@ mod tests {
         let err = extract_zip(&zip_path, &dest).unwrap_err();
         assert!(err.contains("không an toàn"), "unexpected error: {err}");
         assert!(!dir.join("evil.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_zip_with_limits_rejects_too_many_files() {
+        let dir = std::env::temp_dir().join(format!("nicord-test-{}", uuid::Uuid::new_v4()));
+        let zip_path = dir.join("many.zip");
+        let dest = dir.join("out");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&zip_path, sample_zip_bytes()).unwrap();
+        // Sample zip has 4 entries (3 files + 1 directory).
+        let limits = ZipLimits {
+            max_files: 2,
+            ..ZipLimits::default()
+        };
+        let err = extract_zip_with_limits(&zip_path, &dest, limits).unwrap_err();
+        assert!(err.contains("quá nhiều file"), "unexpected error: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_zip_with_limits_rejects_oversize_total() {
+        let dir = std::env::temp_dir().join(format!("nicord-test-{}", uuid::Uuid::new_v4()));
+        let zip_path = dir.join("big.zip");
+        let dest = dir.join("out");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&zip_path, sample_zip_bytes()).unwrap();
+        let limits = ZipLimits {
+            max_total_bytes: 5,
+            ..ZipLimits::default()
+        };
+        let err = extract_zip_with_limits(&zip_path, &dest, limits).unwrap_err();
+        assert!(err.contains("vượt quá giới hạn"), "unexpected error: {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

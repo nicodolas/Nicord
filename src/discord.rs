@@ -120,6 +120,9 @@ pub enum DiscordError {
     /// 401 / 403 — bad token or no permission. Stop immediately.
     Unauthorized(String),
     Forbidden(String),
+    /// 404 — the channel or webhook is gone. Never retry: retrying a
+    /// deleted destination cannot succeed and only hammers Discord.
+    NotFound(String),
     Other(String),
 }
 
@@ -136,6 +139,7 @@ impl std::fmt::Display for DiscordError {
             ),
             DiscordError::Unauthorized(m) => write!(f, "unauthorized (401): {m}"),
             DiscordError::Forbidden(m) => write!(f, "forbidden (403): {m}"),
+            DiscordError::NotFound(m) => write!(f, "not found (404): {m}"),
             DiscordError::Other(m) => write!(f, "{m}"),
         }
     }
@@ -242,15 +246,22 @@ impl DiscordClient {
         }
     }
 
-    pub async fn send_message(
+    /// Send with optional embeds (Q8). Embeds serialize via
+    /// `Embed::to_json` into the existing `embeds` body field.
+    pub async fn send_message_with_embeds(
         &self,
         channel_id: &str,
         content: &str,
+        embeds: &[crate::embed::Embed],
     ) -> Result<SentMessage, DiscordError> {
         let url = format!("{DISCORD_API}/channels/{channel_id}/messages");
         let body = SendMessageBody {
             content: content.to_string(),
-            embeds: None,
+            embeds: if embeds.is_empty() {
+                None
+            } else {
+                Some(embeds.iter().map(|e| e.to_json()).collect())
+            },
         };
         let resp = self
             .http
@@ -373,29 +384,34 @@ impl DiscordClient {
 
     async fn status_error(&self, status: StatusCode, resp: reqwest::Response) -> DiscordError {
         let body = resp.text().await.unwrap_or_default();
-        match status {
-            StatusCode::TOO_MANY_REQUESTS => {
-                let retry_after: f64 = serde_json::from_str::<serde_json::Value>(&body)
-                    .ok()
-                    .and_then(|v| v.get("retry_after")?.as_f64())
-                    .unwrap_or(5.0);
-                let global = serde_json::from_str::<serde_json::Value>(&body)
-                    .ok()
-                    .and_then(|v| v.get("global")?.as_bool())
-                    .unwrap_or(false);
-                DiscordError::RateLimited {
-                    retry_after_secs: retry_after.ceil() as u64,
-                    global,
-                }
+        discord_error_from_status(status, &body)
+    }
+}
+
+/// Map an HTTP status + body to a DiscordError. Pure: unit-testable
+/// without a network call. Both `DiscordClient` and `WebhookClient`
+/// use it, so 429 / 401 / 403 / 404 mean the same thing in both modes.
+pub fn discord_error_from_status(status: StatusCode, body: &str) -> DiscordError {
+    match status {
+        StatusCode::TOO_MANY_REQUESTS => {
+            let v: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+            let retry_after = v.get("retry_after").and_then(|x| x.as_f64()).unwrap_or(5.0);
+            let global = v.get("global").and_then(|x| x.as_bool()).unwrap_or(false);
+            DiscordError::RateLimited {
+                retry_after_secs: retry_after.ceil() as u64,
+                global,
             }
-            StatusCode::UNAUTHORIZED => {
-                DiscordError::Unauthorized("token is invalid or expired".into())
-            }
-            StatusCode::FORBIDDEN => DiscordError::Forbidden(
-                "no permission to send in this channel (or token is restricted)".into(),
-            ),
-            _ => DiscordError::Other(format!("Discord HTTP {}: {}", status.as_u16(), body)),
         }
+        StatusCode::UNAUTHORIZED => {
+            DiscordError::Unauthorized("token is invalid or expired".into())
+        }
+        StatusCode::FORBIDDEN => DiscordError::Forbidden(
+            "no permission to send in this channel (or token is restricted)".into(),
+        ),
+        StatusCode::NOT_FOUND => DiscordError::NotFound(
+            "the channel or webhook no longer exists (deleted or regenerated)".into(),
+        ),
+        _ => DiscordError::Other(format!("Discord HTTP {}: {}", status.as_u16(), body)),
     }
 }
 
@@ -587,6 +603,29 @@ mod tests {
             3
         );
         assert_eq!(parse_retry_after("not json"), 5);
+    }
+
+    #[test]
+    fn error_mapping_covers_404_and_429() {
+        let e =
+            discord_error_from_status(StatusCode::NOT_FOUND, r#"{"message":"Unknown Webhook"}"#);
+        assert!(matches!(e, DiscordError::NotFound(_)));
+        let e = discord_error_from_status(
+            StatusCode::TOO_MANY_REQUESTS,
+            r#"{"retry_after":1.5,"global":true}"#,
+        );
+        match e {
+            DiscordError::RateLimited {
+                retry_after_secs,
+                global,
+            } => {
+                assert_eq!(retry_after_secs, 2);
+                assert!(global);
+            }
+            _ => panic!("wrong variant for 429"),
+        }
+        let e = discord_error_from_status(StatusCode::UNAUTHORIZED, "");
+        assert!(matches!(e, DiscordError::Unauthorized(_)));
     }
 
     #[test]

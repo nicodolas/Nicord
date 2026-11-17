@@ -14,7 +14,7 @@ tens of MB of RAM. The interface is simple on purpose — speed over beauty.
 | Language | Rust 2021 | Single binary, no runtime, low RAM |
 | UI | eframe 0.31 + egui 0.31 (`glow`) | Native immediate-mode |
 | Async | tokio (multi-thread) | Send engine runs in background threads |
-| HTTP | reqwest 0.12 (`rustls-tls`) | Discord REST only; no gateway needed for scheduled sends |
+| HTTP | reqwest 0.12 (`rustls-tls`) | Discord REST for scheduled sends; a gateway connection (`src/gateway.rs`) is used only to obtain a session ID for slash commands |
 | Storage | rusqlite (bundled) + JSON config | Scenarios + logs in SQLite; config as versioned JSON |
 | Token crypto | AES-256-GCM, machine-tied key | Token never in plaintext, never logged, never uploaded |
 | Time | chrono + chrono-tz | Scheduling, sleep window, per-scenario timezones |
@@ -54,8 +54,17 @@ src/
   app.rs        # egui UI: Onboarding, Dashboard, Builder, Logs, Settings
   scenario.rs   # scenario model, schedule + cron parser, spin-text, validation
   scheduler.rs  # send engine, per-channel queue, retry, 429 handling
-  discord.rs    # Discord REST client (user token)
-  crypto.rs     # AES-256-GCM token encryption, machine-tied key
+  discord.rs    # Discord REST client (user token) + shared error mapping
+  webhook.rs    # Webhook mode: URL parsing, WebhookClient, MessageSender
+  preview.rs    # message preview: markdown parsing, shortcodes, 2000-char limit
+  destination.rs # Destination model (1 webhook = 1 channel, own settings)
+  gateway.rs    # gateway client (slash session id, user-token mode only)
+  spintax.rs    # spin-text + variation (user-token mode only)
+  theme.rs      # dark theme, embedded fonts
+  tray.rs       # Windows-only system tray
+  autostart.rs  # OS autostart (Windows Run / Linux XDG)
+  updater.rs    # in-app auto-update from GitHub Releases
+  crypto.rs     # AES-256-GCM token/webhook encryption, machine-tied key
   store.rs      # SQLite (scenarios/logs/meta) + JSON config
 docs/ARCHITECTURE.md
 examples/scenario-example.json
@@ -296,14 +305,237 @@ treated as "no update" and logged quietly — no error dialog.
   auto-check toggle (default ON, persisted in `config.json` as
   `auto_check_updates`).
 
+## Webhook mode (official, recommended)
+
+- Execute: `POST https://discord.com/api/webhooks/{id}/{token}?wait=true`
+  with `{content, username?}`. `?wait=true` returns the created message
+  (200 + JSON); without it Discord answers 204. No Authorization header:
+  the URL token IS the credential.
+- Inspect: `GET https://discord.com/api/webhooks/{id}/{token}` returns
+  the webhook object (name, channel_id, guild_id). Used by "Kiểm tra
+  webhook" and by the engine to seed `{{username}}` (`{{server}}` is
+  empty in webhook mode).
+- Limits: content ≤ 2000 chars (checked client-side). 429: respect
+  `retry_after` (incl. `global`), same policy as user-token mode.
+  404: the webhook is gone — stop at once, never retry
+  (`DiscordError::NotFound`, shared error mapping in `discord.rs`).
+- Parsing (`src/webhook.rs`, no `url` dependency): HTTPS only, host
+  exactly `discord.com` / `discordapp.com`, path exactly
+  `/api/webhooks/{numeric id}/{token}`. Errors never echo the input.
+  `WebhookUrl` has a manual Debug impl and `masked_url()`; the full
+  URL is never logged or displayed.
+- Storage: `AppConfig.send_mode` (default `UserToken` for old configs),
+  `encrypted_webhook_url` (same AES-GCM as the token),
+  `webhook_id` / `webhook_name` (display only), `webhook_username`
+  (optional override). Both credentials coexist; switching modes never
+  deletes the other one.
+- Engine: `MessageSender` (User / Webhook) in `webhook.rs`. Webhook
+  mode skips spin-text/variation, typing, and auto-delete; command
+  nodes are rejected by `Scenario::validate_for_webhook` and
+  defensively in `send_once`. Channel rules are skipped (the URL is
+  channel-bound). Daily cap, sleep window, and retry policy are shared.
+- Validation: `Scenario::validate()` (user mode) vs
+  `validate_for_webhook()` (no channel required, no commands). Enable
+  and Import use the mode-aware check.
+
+Manual webhook checklist (run on your own test server/webhook, not in CI):
+
+1. Create a webhook in a test channel, paste the URL, "Kiểm tra
+   webhook" shows the right name + channel.
+2. Enable a message scenario, Start engine, verify the message arrives
+   via the webhook with the webhook's name.
+3. Delete/regenerate the webhook, verify the next send fails with a
+   clear "webhook không tồn tại" error and does not loop.
+4. Verify a command scenario is rejected on Enable in webhook mode,
+   and that switching back to account mode restores command behavior.
+
+## Quality of life (P0)
+
+Implemented in single-destination form (the current app has one
+webhook / one channel). Per-destination variants arrive with the
+multi-destination design; destination clone/enable is deliberately
+deferred to that work.
+
+- **Preview + counter (Builder).** `src/preview.rs` renders
+  Discord markdown (`**`, `*`, `_`, `~~`, `__`, `` ` ``) and expands
+  `:shortcode:` emoji for display only — the sent text keeps exactly
+  what was typed. Live `N/2000` counter; Add is disabled and Enable
+  is blocked when any message exceeds 2000 characters
+  (`Scenario::validate` checks raw length, both modes).
+- **Destination health.** `AppConfig.webhook_health` +
+  `webhook_last_checked_at` persist the last check result (Ok /
+  NotFound / Forbidden / NetworkError / Unknown). A 404 during a
+  send pauses the webhook in the engine (`Engine::webhook_paused`);
+  a successful re-check from Settings clears the pause. Rate limits
+  never overwrite health. Dashboard shows a destination card with
+  health, last check, last send, and persisted failures today.
+- **Validated import.** `analyze_import` (scenario.rs) scans for
+  secret-looking content, reports JSON errors with line/column,
+  warns about missing fields (filled with defaults), and rejects
+  invalid scenarios with the reason. Warnings are shown in the
+  Builder editor. Missing `schemaVersion`/`id` now default instead
+  of failing deserialization (importer assigns a fresh UUID).
+- **Logs.** Failures are now persisted (`status = 'failed'`,
+  detail truncated to 1000 chars) so Logs can filter by status.
+  `Store::query_logs` combines keyword (LIKE-escaped) + status +
+  scenario filters. CSV export uses RFC 4180 quoting and scrubs
+  webhook URLs (`scrub_secrets`).
+- **Clone + friendly names.** Builder "Clone" duplicates a scenario
+  (fresh id, disabled, no run history). `webhook_friendly_name`
+  (Settings) overrides the webhook's own name everywhere a
+  destination is displayed (`AppConfig::webhook_display_name`).
+
+## Destinations (multi-channel, Webhook mode only)
+
+One destination = one official webhook = one channel. Each
+destination owns its settings: friendly name, encrypted URL, display
+metadata from Discord, enable flag, username/avatar overrides,
+optional thread id (stored, not yet used for sending), daily cap,
+minimum interval, quiet window, and default messages. Failure state
+is persisted (`Ok` / `Paused404` / `Paused401` / `PausedErrors`), so
+a paused destination stays paused across restarts until resumed.
+
+- **Storage:** `destinations` table in SQLite (JSON per row, URL
+  encrypted before writing). `AppConfig` adds `global_daily_cap`
+  (default 300), `max_destinations` (default 10, hard ceiling 20),
+  `consecutive_error_limit` (default 5), and the
+  `destinations_migrated` flag. Legacy single-webhook fields are
+  kept (not deleted) and dual-written into the destinations table
+  when a URL is saved from onboarding/Settings.
+- **Migration:** on startup, `ensure_destinations_migrated` creates
+  one destination from the legacy URL (encrypted bytes copied
+  as-is, never decrypted) and assigns every scenario's
+  `destination_id` to it when the mode is Webhook. Idempotent and
+  lossless; existing destinations are never duplicated.
+- **Engine:** one loop (guard kept). Per scenario, the sender is
+  resolved from the scenario's destination. Pre-send checks:
+  enabled, not paused, has a URL, quiet window (fail-closed),
+  per-destination 429 cooldown, per-destination daily cap (DB
+  count by channel id), global daily cap. Short waits return
+  `defer:` errors (run NOT consumed, no failure logged); caps,
+  quiet windows, and pauses return `skip:` errors (run consumed,
+  no failure). A 429 records a per-destination cooldown (or a
+  global pause when `global`), never shortened. 404/401 persist
+  a pause for that destination only. 5 consecutive errors
+  (configurable) pause only that destination. A fixed 1-second
+  stagger separates webhook sends in one tick. Content fallback:
+  node message → scenario messages → destination default messages.
+- **UI:** Destinations screen (list + editor + delete with scenario
+  reassignment + clone starting without a URL). Builder picks one
+  destination per scenario (enabled destinations only). Dashboard
+  shows a card per destination plus a global-pause banner. Logs
+  filter by destination (channel id). `thread_id` is validated
+  (digits only) but not used for sending until verified.
+- **User-token mode is unchanged:** single-channel rule, no
+  destinations, no shared multi-channel send path.
+
+## Quality of life (P1)
+
+- **Templates + fallback (Q6).** Shared template library
+  (`templates` table: name + content, no secrets). Content
+  fallback chain in the engine: node message → scenario
+  messages → destination default messages. A scenario can
+  explicitly use the destination's messages instead of its own
+  (`use_destination_messages`). The Builder shows the content
+  source and, when unambiguous, the exact next message; rotation
+  is random (never repeats the last pick), so with several
+  candidates the UI says so instead of predicting.
+- **Schedules (Q7).** The Builder now edits schedules directly:
+  Daily/Weekly/Every N minutes/Every N hours/Cron, plus presets
+  (30 min, hourly, 8:00, 20:00, weekdays 9:00, weekend 10:00)
+  and a timezone field with common IANA names. Time Window
+  nodes support overnight windows and fail closed: a present
+  but unparsable window is a validation error, never a silent
+  whole-day default. Unknown timezones are rejected (the
+  previous silent UTC fallback is gone). Dashboard destination
+  cards show each destination's next run with its timezone.
+- **Embeds (Q8).** One rich embed per scenario, edited in the
+  Builder (title, description, author, color, up to 25 fields,
+  footer) with live limit checks and a preview. Limits follow
+  Discord's official docs (verified 2026-11-17): title 256,
+  description 4096, field name 256 / value 1024, footer 2048,
+  author 256, total ≤ 6000. The color range 0..=0xFFFFFF is an
+  app decision (docs say only "integer"). Embeds send via both
+  transports; empty content is allowed with an embed.
+- **Language (Q9).** Vietnamese (default) + English, switched
+  instantly from Settings. Coverage is the core UI (navigation,
+  titles, section titles, common buttons); body copy and status
+  messages stay Vietnamese until their keys are added
+  (incremental — see `src/i18n.rs`).
+- **Emoji picker (Q10).** Offline grid (same characters as the
+  preview shortcode table) inserts the real Unicode character,
+  plus custom emoji markup paste (`<:name:id>`). Custom emoji
+  only render in Discord when the guild has them.
+- **Thread sending.** `thread_id` is now sent as a query param
+  on webhook execute (verified: the thread must belong to the
+  webhook's channel; Discord auto-unarchives it). Locked-thread
+  behaviour is unverified — test on a real thread first.
+- **Verified Discord facts (2026-11-17, official docs).** Max
+  15 webhooks/channel, 1000/guild. Rate limits are per-webhook
+  buckets ("may calculate limits independently"); `retry_after`
+  is float seconds (Nicord ceils it, never shortens it). A 404
+  means "do not attempt to use it again" — hence the persisted
+  destination pause. Username override length is undocumented;
+  Nicord limits it to 80 chars as a precaution (app decision).
+
+## Config export / import (cross-machine moves)
+
+Settings → "Sao lưu & khôi phục cấu hình" exports the whole
+setup — config, destinations, scenarios, templates — as one
+versioned JSON file (`format: "nicord-export"`, `version: 1`).
+Send logs are history, not config, and are never exported.
+
+- **Portable** (default): secrets included, encrypted under a
+  passphrase — PBKDF2-HMAC-SHA256, 600,000 iterations, AES-256-GCM
+  (`src/crypto.rs`, hand-written HMAC/PBKDF2, verified against RFC
+  4231 / RFC 6070 vectors). Use this to move to another machine.
+  The file is a password vault: a weak passphrase means weak
+  protection, and a forgotten passphrase means the file cannot
+  be opened.
+- **Safe**: secrets omitted. Destinations arrive without URLs and
+  disabled; the user re-enters credentials on the new machine.
+  Safe for sharing a setup.
+- **Local**: secrets copied machine-encrypted as-is. Restorable
+  only on the same machine. Used for the automatic backup taken
+  before every import.
+
+Why this exists: secrets are encrypted with a machine-tied key,
+so copying `config.json` / the database to another machine leaves
+them undecryptable. Portable export re-encrypts them under the
+passphrase instead. Exporting a secret that cannot be decrypted
+locally aborts the export rather than writing a broken file.
+
+Import **replaces** the current setup (never merges). It requires
+the engine to be stopped + an explicit confirmation, writes a
+local backup first (aborting if the backup cannot be written),
+validates every entry, and skips invalid ones with warnings —
+never silently. A wrong passphrase fails before anything changes.
+More than 20 destinations in a file is rejected (hard ceiling).
+
+Persistence rule for future features: if a feature's state has
+over a 20% chance of needing to survive a restart or a move,
+persist it — and include it in export/import. Full rules:
+`docs/CONFIG-RULES.md`.
+
 ## Known limitations
 
 - **System tray is Windows-only.** On Linux the tray checkbox is
   hidden and closing the window still quits. Autostart works on both
   Windows (Run key) and Linux (XDG desktop entry).
+- **Locked-thread behaviour is unverified.** `thread_id` sends are
+  enabled (same-channel threads auto-unarchive per Discord's
+  docs), but sending into a locked thread has not been tested.
 - **Spike not run yet:** 7 days of stable sending on a spare account has
   not been proven — run it before releasing.
-- Sending is REST-only (no gateway). The channel picker is wired (Load
-  servers/channels), with a hand-typed channel ID as fallback.
+- Sending is REST-based; a gateway connection is used only to obtain
+  a session ID for slash commands (`src/gateway.rs`). The channel
+  picker is wired (Load servers/channels), with a hand-typed channel
+  ID as fallback.
+- The machine-tied token key is obfuscation against casual config
+  copying, not protection against local malware or other local users
+  (the machine ID is world-readable on Linux; on Windows a constant
+  fallback is used). An OS-keyring migration is future work; do not
+  change the key derivation without a migration plan, or existing
+  stored tokens will stop decrypting.
 - Cron schedules use the scenario timezone; double-check schedules that
   cross midnight.

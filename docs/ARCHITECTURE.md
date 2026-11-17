@@ -20,20 +20,34 @@
 | Language | Rust 2021, edition 2021 | Single binary, no runtime, low RAM |
 | UI | eframe 0.31 + egui 0.31 (`glow`) | Native immediate-mode, tens of MB RAM, instant startup |
 | Async | tokio (multi-thread) | Send engine runs in background threads |
-| HTTP | reqwest 0.12 (`rustls-tls`) | Discord REST only; no gateway needed for scheduled sends |
+| HTTP | reqwest 0.12 (`rustls-tls`) | Discord REST for scheduled sends; a gateway connection (`src/gateway.rs`) is used only to obtain a session ID for slash commands |
 | Storage | rusqlite (bundled) + JSON config | Scenarios + logs in SQLite; config as versioned JSON |
 | Token crypto | AES-256-GCM, machine-tied key | Token never in plaintext, never logged, never uploaded |
 | Time | chrono | Scheduling, sleep window, next-run display |
 
 ## Data flow (one send)
 
+User-token mode:
+
 1. Scheduler tick (1s) finds a due scenario.
 2. Job enters the per-channel queue; waits for the minimum interval + jitter.
 3. Engine renders the template (`{{username}}`, `{{date}}`, …), picks a
    spin-text variant, sanitises content (blocks `@everyone` by default).
 4. `POST /channels/{id}/messages` with the user token.
-5. On 429: wait exactly `retry_after`, back off; on 401/403: stop at once.
+5. On 429: wait exactly `retry_after`, back off; on 401/403/404: stop at once.
 6. Log: time, channel, scenario, status, error code — **never the token**.
+
+Webhook mode (same tick, queue, cap, and retry policy; simpler send):
+
+1. Steps 1–2 as above. Template vars use the webhook name;
+   `{{server}}` renders empty.
+2. No spin-text/variation, no typing, no auto-delete: the rendered
+   template is sent verbatim after sanitising.
+3. `POST /api/webhooks/{id}/{token}?wait=true` with no Authorization
+   header. The URL token IS the credential.
+4. On 429: wait `retry_after` as above. On 404 (webhook deleted):
+   stop at once with a clear error — never retry a gone webhook.
+5. Log as above — **never the webhook URL**.
 
 ## Modules
 
@@ -47,9 +61,42 @@
   3-consecutive-errors pause (10 min), emergency stop.
 - `discord.rs` — REST client: `send_message`, `get_me`, `list_guilds`,
   `list_channels`. `parse_retry_after` for 429 bodies.
+  `discord_error_from_status` maps HTTP statuses (incl. 404) for both
+  clients. `DiscordError::NotFound` stops retries immediately.
+- `webhook.rs` — Webhook mode: strict `parse_webhook_url` (HTTPS +
+  Discord hosts only, errors never echo the token), secret-safe
+  `WebhookUrl` (manual Debug, `masked_url`), `WebhookClient`
+  (`send_message` with `?wait=true`, `get_webhook`), and the
+  `MessageSender` enum the engine sends through in both modes.
+- `preview.rs` — pure message-preview helpers: Discord markdown
+  parsing (`**`/`*`/`_`/`~~`/`__`/`` ` ``), emoji shortcode expansion
+  for display only, and the 2000-character limit check used by both
+  the Builder UI and `Scenario` validation.
+- `destination.rs` — the Destination model (one webhook = one
+  channel): settings, failure state, validation, quiet-window
+  logic. Storage and migration live in `store.rs`; per-destination
+  engine behaviour lives in `scheduler.rs`.
+- `embed.rs` — Discord rich embed model, limit validation, and
+  the Discord payload shape (`to_json`). One embed per scenario.
+- `i18n.rs` — Vietnamese/English strings for the core UI
+  (`Lang`, `t`). Coverage is incremental; see the module doc.
+- `gateway.rs` — Gateway client, used only to obtain a session ID
+  for slash commands (user-token mode only).
+- `spintax.rs` — spin-text + message variation (user-token mode only;
+  skipped in webhook mode).
+- `theme.rs` — Discord-like dark theme, embedded fonts.
+- `tray.rs` — Windows-only system tray (see below).
+- `autostart.rs` — real OS autostart (Windows Run key / Linux XDG).
+- `updater.rs` — in-app auto-update from GitHub Releases.
 - `crypto.rs` — `machine_key()` = SHA-256(`nicord-machine-key-v1` +
-  `/etc/machine-id` + OS user); AES-256-GCM encrypt/decrypt; `mask_token`.
-- `store.rs` — SQLite tables `scenarios` / `send_logs`; JSON `AppConfig`.
+  `/etc/machine-id` + OS user); AES-256-GCM encrypt/decrypt; `mask_token`;
+  explicit-key encrypt/decrypt for exports; hand-written HMAC-SHA256
+  + PBKDF2-HMAC-SHA256 (RFC 4231 / RFC 6070 vectors in tests).
+- `backup.rs` — config export/import: versioned JSON format,
+  Portable/Safe/Local modes, passphrase KDF, replacement import
+  with validation + warnings. See `docs/CONFIG-RULES.md`.
+- `store.rs` — SQLite tables `scenarios` / `send_logs`; JSON `AppConfig`
+  (incl. `SendMode`, encrypted webhook URL, webhook display metadata).
 
 ## License keys — removed in v0.1.0
 
@@ -106,10 +153,17 @@ These reduce risk only. They do not make self-botting compliant.
   hand-typed channel ID as a fallback.
 - Cron is a real 5-field parser now (see above); the timezone of a cron
   schedule is the scenario timezone.
-- **Tray / autostart: NOT implemented.** There is no system-tray icon;
-  the app runs while its window is open (minimise keeps the engine
-  running). The Settings autostart toggle is saved but the OS hook is
-  not wired. The README says this plainly instead of claiming tray support.
+- **Tray / autostart: implemented.** Tray is Windows-only
+  (`src/tray.rs`): closing the window hides Nicord to the tray when
+  enabled in Settings. Autostart is real on both Windows (Run key)
+  and Linux (XDG desktop entry) — see `src/autostart.rs`. On Linux
+  there is no tray icon, so the window must stay open.
+- **Release workflow conflict:** `.github/workflows/release.yml`
+  releases only from pushes to a `product` branch; pushing to `main`
+  never releases. This conflicts with a main-only workflow and must
+  be resolved (e.g. tag-based or main-based releases) before cutting
+  a release without a `product` branch. Do not create a `product`
+  branch as a workaround without an explicit decision.
 - Release packaging: Windows installer (MSI via `cargo-packager` or WiX)
   is not yet set up.
 - Export/import of scenarios (JSON file) and log filter/export (CSV)

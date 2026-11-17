@@ -10,6 +10,7 @@
 //! - `Once` fires exactly once, then the scenario is disabled.
 //! - Cron is a real 5-field parser (minute hour dom month dow), not hourly.
 
+use crate::preview::{char_count, DISCORD_CONTENT_LIMIT};
 use chrono::{DateTime, Datelike, Local, NaiveTime, Timelike, Utc};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -113,8 +114,14 @@ impl Schedule {
             Schedule::EveryHours { hours } if *hours == 0 => {
                 Err("interval must be >= 1 hour".into())
             }
-            Schedule::Weekly { weekdays, .. } if weekdays.is_empty() => {
-                Err("weekly schedule needs at least one weekday".into())
+            Schedule::Weekly { weekdays, .. } => {
+                if weekdays.is_empty() {
+                    Err("weekly schedule needs at least one weekday".into())
+                } else if weekdays.iter().any(|w| *w > 6) {
+                    Err("weekly weekdays must be 0 (Mon) .. 6 (Sun)".into())
+                } else {
+                    Ok(())
+                }
             }
             Schedule::Cron { expr } => parse_cron(expr).map(|_| ()),
             _ => Ok(()),
@@ -749,16 +756,40 @@ impl Default for ScenarioLimits {
 /// A full scenario (Spec §10). Stored as JSON, schemaVersion 1.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Scenario {
-    #[serde(rename = "schemaVersion")]
+    /// Missing in older exports → 1 (current schema), so imports
+    /// warn instead of failing on a missing version field.
+    #[serde(rename = "schemaVersion", default = "default_schema_version")]
     pub schema_version: u32,
+    /// Missing in hand-written files → "" (the importer always assigns
+    /// a fresh UUID, so a missing id warns instead of failing).
+    #[serde(default)]
     pub id: String,
     pub name: String,
     #[serde(default)]
     pub enabled: bool,
     #[serde(default = "default_timezone")]
     pub timezone: String,
-    #[serde(default)]
+    /// Serializes as `channel_id`; also accepts the legacy camelCase
+    /// `channelId` on read, so older exported JSON keeps its channel.
+    #[serde(default, alias = "channelId")]
     pub channel_id: String,
+    /// Destination id in Webhook mode (required when enabling).
+    /// Ignored in user-token mode (which uses `channel_id`).
+    /// Kept alongside `channel_id` so switching modes loses nothing.
+    #[serde(default)]
+    pub destination_id: Option<String>,
+    /// When true (webhook mode), send from the destination's
+    /// default messages instead of this scenario's own messages,
+    /// even when the scenario has messages. When false, the
+    /// destination defaults are only a fallback for an empty
+    /// scenario message list (see the engine's fallback chain).
+    #[serde(default)]
+    pub use_destination_messages: bool,
+    /// Optional rich embed attached to every message this scenario
+    /// sends (Q8). None = plain text only. An embed may accompany
+    /// empty content (Discord requires content OR embeds).
+    #[serde(default)]
+    pub embed: Option<crate::embed::Embed>,
     #[serde(default)]
     pub schedule: Option<Schedule>,
     #[serde(default)]
@@ -787,6 +818,10 @@ fn default_timezone() -> String {
     "Asia/Ho_Chi_Minh".to_string()
 }
 
+fn default_schema_version() -> u32 {
+    1
+}
+
 impl Scenario {
     pub fn new(name: &str) -> Self {
         Self {
@@ -796,6 +831,9 @@ impl Scenario {
             enabled: false,
             timezone: default_timezone(),
             channel_id: String::new(),
+            destination_id: None,
+            use_destination_messages: false,
+            embed: None,
             schedule: Some(Schedule::Daily {
                 time: NaiveTime::from_hms_opt(9, 0, 0).unwrap_or_default(),
             }),
@@ -815,12 +853,49 @@ impl Scenario {
     /// Validate before running (Spec §5): exactly one trigger, no empty
     /// content, no infinite loop, valid schedule — and every node kind
     /// must be one the scheduler actually executes.
+    /// User-token mode: a destination channel is required and command
+    /// nodes are allowed.
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_inner(true, true, false)
+    }
+
+    /// Webhook-mode validation: no channel is required (the webhook
+    /// URL is channel-bound), but command nodes are rejected —
+    /// webhooks cannot send commands. All other checks are identical
+    /// to `validate()`.
+    pub fn validate_for_webhook(&self) -> Result<(), String> {
+        self.validate_inner(false, false, true)
+    }
+
+    fn validate_inner(
+        &self,
+        require_channel: bool,
+        allow_commands: bool,
+        require_destination: bool,
+    ) -> Result<(), String> {
         if self.name.trim().is_empty() {
             return Err("scenario name is empty".into());
         }
-        if self.channel_id.trim().is_empty() {
+        // Fail-closed: an unknown timezone must not silently run in
+        // UTC (tz_from_name falls back). Reject it at validation.
+        if self.timezone.parse::<chrono_tz::Tz>().is_err() {
+            return Err(format!(
+                "unknown timezone '{}' — use an IANA name like Asia/Ho_Chi_Minh",
+                self.timezone
+            ));
+        }
+        if require_channel && self.channel_id.trim().is_empty() {
             return Err("no destination channel selected".into());
+        }
+        if require_destination
+            && self
+                .destination_id
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+        {
+            return Err("no destination selected — pick a destination in the Builder".into());
         }
         let triggers = self
             .nodes
@@ -843,9 +918,22 @@ impl Scenario {
                 ));
             }
             if node.kind == NodeKind::ActionSendCommand {
+                if !allow_commands {
+                    return Err(
+                        "webhook mode does not support Send Command nodes — use Send Message, or switch back to account mode"
+                            .into(),
+                    );
+                }
                 CommandConfig::from_node(node)
                     .validate()
                     .map_err(|e| format!("Send Command node {}: {e}", node.id))?;
+            }
+            // Time Window nodes fail CLOSED: a present-but-unparsable
+            // start/end is a validation error, never a silent
+            // whole-day default (which would send at any hour).
+            if node.kind == NodeKind::ConditionTimeWindow {
+                validate_time_window(node)
+                    .map_err(|e| format!("Time Window node {}: {e}", node.id))?;
             }
         }
         if let Some(s) = &self.schedule {
@@ -862,6 +950,36 @@ impl Scenario {
                     return Err(format!(
                         "Send Message node {} has empty content and no message list",
                         node.id
+                    ));
+                }
+            }
+        }
+        // Embed limits (Q8): validated in both modes, since both
+        // transports send the same embed payload.
+        if let Some(embed) = &self.embed {
+            embed.validate()?;
+        }
+        // Discord rejects any message over 2000 characters, so fail fast
+        // here with a clear error instead of failing on every send.
+        // This checks the raw text (before template vars / spin-text):
+        // conservative for templates that expand, exact for plain text.
+        for (idx, msg) in self.messages.iter().enumerate() {
+            if char_count(msg) > DISCORD_CONTENT_LIMIT {
+                return Err(format!(
+                    "message {} is {} characters, over Discord's 2000-character limit",
+                    idx + 1,
+                    char_count(msg)
+                ));
+            }
+        }
+        for node in &self.nodes {
+            if node.kind == NodeKind::ActionSendMessage || node.kind == NodeKind::ActionSendEmbed {
+                let content = node_content(node);
+                if char_count(&content) > DISCORD_CONTENT_LIMIT {
+                    return Err(format!(
+                        "Send Message node {} content is {} characters, over Discord's 2000-character limit",
+                        node.id,
+                        char_count(&content)
                     ));
                 }
             }
@@ -996,9 +1114,39 @@ fn parse_hhmm(s: &str) -> Option<u32> {
     }
 }
 
+/// Validate a Time Window node's config (fail-closed). Absent
+/// start/end means "whole day" and is valid; a present value that
+/// does not parse (bad "HH:MM", hour > 23) is an error.
+fn validate_time_window(node: &Node) -> Result<(), String> {
+    for key in ["start", "end"] {
+        if let Some(v) = node.config.get(key) {
+            let s = v
+                .as_str()
+                .ok_or_else(|| format!("'{key}' must be an \"HH:MM\" string"))?;
+            if parse_hhmm(s).is_none() {
+                return Err(format!("'{key}' must be HH:MM (24h), got '{s}'"));
+            }
+        }
+    }
+    for key in ["start_hour", "end_hour"] {
+        if let Some(v) = node.config.get(key) {
+            let h = v
+                .as_u64()
+                .ok_or_else(|| format!("'{key}' must be a whole hour 0..=23"))?;
+            if h > 23 {
+                return Err(format!("'{key}' must be 0..=23, got {h}"));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// (start_minutes, end_minutes) for a Time Window node. Accepts
 /// start_hour/end_hour numbers or start/end "HH:MM" strings. Defaults
-/// to the whole day (00:00–24:00) when unconfigured.
+/// to the whole day (00:00–24:00) when unconfigured. Validation
+/// (see `validate_time_window`) rejects malformed values before a
+/// scenario can be enabled, so this never silently widens a window
+/// the user mistyped.
 fn time_window_range(node: &Node) -> (u32, u32) {
     let start = node
         .config
@@ -1060,6 +1208,98 @@ pub fn render_template_with_vars(
         out = out.replace(&format!("{{{{{}}}}}", k), v);
     }
     out
+}
+
+/// Analyse a scenario JSON file before importing it (QoL import checks).
+///
+/// Returns `(scenario, warnings)`. `scenario` is `Some` only when the
+/// file parses AND passes mode-aware validation. `warnings` is never
+/// silent: missing fields (filled with defaults), secret-looking
+/// content, and parse/validation failures are all reported with
+/// enough detail to fix the file. Nothing is written here — the
+/// caller decides whether to import.
+///
+/// Notes on rules that do NOT apply to scenario JSON: there are no
+/// min/max field pairs in the Scenario schema (time windows with
+/// start > end are valid overnight windows, not swapped), and the
+/// importer always assigns a fresh UUID, so duplicate IDs cannot occur.
+pub fn analyze_import(text: &str, is_webhook: bool) -> (Option<Scenario>, Vec<String>) {
+    let mut warnings: Vec<String> = Vec::new();
+
+    // Secret scan (values are never included in warnings).
+    if text.contains("api/webhooks/") {
+        warnings.push(
+            "File chứa URL webhook — hãy coi file này như file chứa mật khẩu, đừng chia sẻ."
+                .to_string(),
+        );
+    }
+    if text.contains("\"token\"") || text.contains("\"encrypted_token\"") {
+        warnings.push(
+            "File chứa trường token — kiểm tra kỹ nguồn gốc file trước khi import.".to_string(),
+        );
+    }
+
+    let value: serde_json::Value = match serde_json::from_str(text) {
+        Ok(v) => v,
+        Err(e) => {
+            warnings.push(format!(
+                "JSON lỗi tại dòng {}, cột {}: {}",
+                e.line(),
+                e.column(),
+                e
+            ));
+            return (None, warnings);
+        }
+    };
+    let Some(obj) = value.as_object() else {
+        warnings.push("File phải là một đối tượng JSON của scenario.".to_string());
+        return (None, warnings);
+    };
+    // Missing-field warnings (serde fills defaults; the user should know).
+    // `channelId` counts as `channel_id` (legacy alias).
+    for key in [
+        "schemaVersion",
+        "id",
+        "name",
+        "enabled",
+        "timezone",
+        "destination_id",
+        "schedule",
+        "nodes",
+        "edges",
+        "variables",
+        "limits",
+        "messages",
+    ] {
+        if !obj.contains_key(key) {
+            warnings.push(format!("Thiếu trường '{key}' — dùng giá trị mặc định."));
+        }
+    }
+    if !obj.contains_key("channel_id") && !obj.contains_key("channelId") {
+        warnings.push("Thiếu trường 'channel_id' — dùng giá trị mặc định.".to_string());
+    }
+
+    let scenario: Scenario = match serde_json::from_value(value) {
+        Ok(s) => s,
+        Err(e) => {
+            warnings.push(format!("Không đọc được scenario: {e}"));
+            return (None, warnings);
+        }
+    };
+    // Import validation is relaxed for the destination: an imported
+    // scenario arrives disabled, and the user picks its destination
+    // in the Builder (a destination id from another machine is
+    // meaningless here). Enable still requires a destination.
+    let valid = if is_webhook {
+        scenario.validate_inner(false, false, false)
+    } else {
+        scenario.validate()
+    };
+    if let Err(e) = valid {
+        warnings.push(format!("Không hợp lệ: {e}"));
+        return (None, warnings);
+    }
+    (Some(scenario), warnings)
 }
 
 #[cfg(test)]
@@ -1300,6 +1540,26 @@ mod tests {
     }
 
     #[test]
+    fn weekly_rejects_out_of_range_weekdays() {
+        let time = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
+        let bad = Schedule::Weekly {
+            weekdays: vec![7],
+            time,
+        };
+        assert!(bad.validate().is_err());
+        let bad2 = Schedule::Weekly {
+            weekdays: vec![0, 255],
+            time,
+        };
+        assert!(bad2.validate().is_err());
+        let good = Schedule::Weekly {
+            weekdays: vec![0, 6],
+            time,
+        };
+        assert!(good.validate().is_ok());
+    }
+
+    #[test]
     fn cron_is_real_not_hourly() {
         let sched = Schedule::Cron {
             expr: "0 9 * * *".to_string(),
@@ -1481,6 +1741,91 @@ mod tests {
     }
 
     #[test]
+    fn validation_rejects_overlong_messages() {
+        let mut s = Scenario::new("long");
+        s.channel_id = "123".to_string();
+        s.messages = vec!["a".repeat(2001)];
+        let err = s.validate().unwrap_err();
+        assert!(err.contains("2000"), "unexpected error: {err}");
+        s.messages = vec!["a".repeat(2000)];
+        assert!(s.validate().is_ok());
+    }
+
+    #[test]
+    fn analyze_import_warns_and_rejects_bad_files() {
+        // Valid minimal file: warns about missing fields, still imports.
+        let (sc, warns) = analyze_import(
+            r#"{"name":"t","channel_id":"1","nodes":[{"id":"n1","type":"trigger_schedule","config":{}}],"messages":["hi"]}"#,
+            false,
+        );
+        assert!(sc.is_some(), "warnings: {warns:?}");
+        assert!(warns.iter().any(|w| w.contains("schemaVersion")));
+        // Secret scan warns without including the URL.
+        let (_, warns) = analyze_import(
+            r#"{"name":"t","channel_id":"1","nodes":[],"messages":["see https://discord.com/api/webhooks/1/SECRET"]}"#,
+            false,
+        );
+        assert!(warns.iter().any(|w| w.contains("mật khẩu")));
+        assert!(!warns.join(" ").contains("SECRET"));
+        // Bad JSON reports line/column and imports nothing.
+        let (sc, warns) = analyze_import("{\n  bad", false);
+        assert!(sc.is_none());
+        assert!(warns.iter().any(|w| w.contains("dòng")));
+        // Invalid scenario (empty name) is rejected with the reason.
+        let (sc, warns) = analyze_import(
+            r#"{"name":"","channel_id":"1","nodes":[],"messages":["hi"]}"#,
+            false,
+        );
+        assert!(sc.is_none());
+        assert!(warns.iter().any(|w| w.contains("Không hợp lệ")));
+    }
+
+    #[test]
+    fn webhook_validation_allows_empty_channel_but_rejects_commands() {
+        // Message scenario with no channel: user-mode validation fails,
+        // webhook validation passes (the URL is channel-bound) once a
+        // destination is selected; without one it fails.
+        let mut s = Scenario::new("webhook");
+        assert!(s.validate().is_err());
+        assert!(s.validate_for_webhook().is_err());
+        s.destination_id = Some("dest-1".to_string());
+        assert!(s.validate_for_webhook().is_ok());
+        // Adding a command node flips webhook validation to an error,
+        // while user-mode validation (with a channel) still passes.
+        let mut s2 = Scenario::new("webhook-cmd");
+        s2.channel_id = "123".to_string();
+        s2.destination_id = Some("dest-1".to_string());
+        let mut node = Node::new(NodeKind::ActionSendCommand);
+        node.config = serde_json::json!({"kind": "prefix", "name": "rank"});
+        s2.nodes.push(node);
+        assert!(s2.validate().is_ok());
+        let err = s2.validate_for_webhook().unwrap_err();
+        assert!(err.contains("webhook mode"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn time_window_validation_fails_closed() {
+        let mut s = Scenario::new("tw");
+        s.channel_id = "1".to_string();
+        // No Time Window node: fine.
+        assert!(s.validate().is_ok());
+        // Unconfigured window: whole day, fine.
+        let mut node = Node::new(NodeKind::ConditionTimeWindow);
+        node.config = serde_json::json!({});
+        s.nodes.push(node);
+        assert!(s.validate().is_ok());
+        // Malformed start: rejected.
+        s.nodes.last_mut().unwrap().config = serde_json::json!({"start": "25:00", "end": "06:00"});
+        assert!(s.validate().is_err());
+        // Overnight window: fine.
+        s.nodes.last_mut().unwrap().config = serde_json::json!({"start": "22:00", "end": "06:00"});
+        assert!(s.validate().is_ok());
+        // Bad hour number: rejected.
+        s.nodes.last_mut().unwrap().config = serde_json::json!({"start_hour": 24});
+        assert!(s.validate().is_err());
+    }
+
+    #[test]
     fn slash_option_kind_labels() {
         assert_eq!(slash_option_kind_label(3), "Chuỗi");
         assert_eq!(slash_option_kind_label(4), "Số nguyên");
@@ -1499,9 +1844,17 @@ mod tests {
         let s: Scenario =
             serde_json::from_str(&json).expect("example scenario must parse as a Scenario");
         assert_eq!(s.limits.daily_cap, 300);
-        assert!(
-            s.validate().is_err(),
-            "example has a placeholder channel id"
-        );
+        // The example keeps its channel field (a placeholder the user must
+        // replace with a real channel ID) and is structurally valid.
+        assert_eq!(s.channel_id, "REPLACE_WITH_YOUR_CHANNEL_ID");
+        assert!(s.validate().is_ok());
+    }
+
+    #[test]
+    fn scenario_accepts_camelcase_channel_id_alias() {
+        let json = r#"{"schemaVersion":1,"id":"x","name":"t","channelId":"123","schedule":{"kind":"daily","time":"09:00:00"},"nodes":[{"id":"n1","type":"trigger_schedule"},{"id":"n2","type":"action_send_message","config":{"content":"hi"}}],"messages":["hi"]}"#;
+        let s: Scenario = serde_json::from_str(json).unwrap();
+        assert_eq!(s.channel_id, "123");
+        assert!(s.validate().is_ok());
     }
 }

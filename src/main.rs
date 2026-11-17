@@ -1,16 +1,22 @@
-//! Nicord — desktop Discord auto-sender (your own account).
+//! Nicord — desktop Discord scheduled sender (webhook or your own account).
 //! Entry point: native eframe/egui window, no React / Electron / WebView.
 //!
-//! ⚠️  Self-bots are forbidden by Discord's Terms of Service and can result
-//! in permanent account termination. Use a spare account. Nicord makes no
-//! guarantee you will never be banned.
+//! ⚠️  The account (self-bot) mode is forbidden by Discord's Terms of
+//! Service and can result in permanent account termination. Use a spare
+//! account. Nicord makes no guarantee you will never be banned. Webhook
+//! mode is the official, recommended alternative.
 
 mod antiban;
 mod app;
 mod autostart;
+mod backup;
 mod crypto;
+mod destination;
 mod discord;
+mod embed;
 mod gateway;
+mod i18n;
+mod preview;
 mod scenario;
 mod scheduler;
 mod spintax;
@@ -19,6 +25,7 @@ mod theme;
 #[cfg(target_os = "windows")]
 mod tray;
 mod updater;
+mod webhook;
 
 use app::NicordApp;
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
