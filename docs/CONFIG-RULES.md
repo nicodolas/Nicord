@@ -43,7 +43,7 @@ docs so the next reader knows it was considered.
 | Scenarios | SQLite `scenarios` table (JSON per row) | Schema versioned (`schemaVersion`). Unknown fields must not break loading. |
 | Templates | SQLite `templates` table | Name + content, no secrets. |
 | Send logs | SQLite `send_logs` table | History, NOT config. Never exported. |
-| Secrets | Encrypted, never plaintext | Machine key for local storage (`crypto.rs`); passphrase key for portable export (`backup.rs`). Never logged, never shown in full, never in exports except encrypted. |
+| Secrets | Encrypted, never plaintext | OS keyring first, machine-key blob fallback (`secret_store.rs`); passphrase key for portable export (`backup.rs`). Never logged, never shown in full, never in exports except encrypted. |
 
 Rules for adding a persisted field:
 
@@ -73,9 +73,9 @@ Modes:
   to another machine. The file is a password vault: treat it like one.
 - **Safe** — secrets omitted (destinations arrive without URLs,
   disabled). For sharing a setup. The user re-enters credentials.
-- **Local** — secrets kept machine-encrypted (copied as-is). Only
-  restorable on the same machine. Used for the automatic backup
-  taken before an import.
+- **Local** — stored secret values copied as-is (keyring
+  references or machine blobs). Only restorable on the same
+  machine. Used for the automatic backup taken before an import.
 
 Explicitly NOT exported (and why):
 
@@ -95,9 +95,15 @@ backup is written first. See `backup.rs` for the exact rules.
 
 - A secret is never stored in plaintext, never logged, never shown
   in full, never sent anywhere except its own Discord endpoint.
-- Local storage uses the machine-tied key (`crypto::machine_key`).
-  That key is obfuscation against casual copying, not a keyring —
-  see `TECHNICAL.md` for the honest wording. Do not claim otherwise.
+- Local storage goes through `secret_store`: the OS keyring first
+  (Windows Credential Manager, macOS Keychain, Linux Secret
+  Service), falling back to the machine-tied key
+  (`crypto::machine_key`) when the keyring is unavailable. The
+  machine key is obfuscation against casual copying, not a
+  keyring — see `TECHNICAL.md` for the honest wording. Do not
+  claim otherwise. A new secret MUST be stored via
+  `secret_store::store_secret` with its own keyring entry name,
+  never via `crypto::encrypt_token` directly.
 - Portable storage uses a passphrase-derived key. A weak passphrase
   means weak protection; the UI requires at least 8 characters and
   says so plainly.
