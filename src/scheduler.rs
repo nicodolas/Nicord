@@ -38,6 +38,11 @@ pub struct SendLogEntry {
     pub channel_id: String,
     pub status: String,
     pub detail: String,
+    /// Discord message id of the sent message ("" when unknown, e.g.
+    /// a webhook 204 or a failure). Used by manual delete (Q13).
+    pub message_id: String,
+    /// Destination the send went through ("" in user-token mode).
+    pub destination_id: String,
 }
 
 /// Single-product rule: at most 1 distinct channel across all *enabled*
@@ -729,8 +734,11 @@ impl Engine {
                         channel_id: log_channel.clone(),
                         status: "sent".into(),
                         detail,
+                        message_id: sent.id.clone(),
+                        destination_id: destination.map(|d| d.id.clone()).unwrap_or_default(),
                     };
                     let _ = self.store.log_send(&entry);
+                    crate::notify::play(crate::notify::SoundEvent::SendSuccess);
                     self.maybe_auto_delete(scenario, sender, &sent.id, antiban)
                         .await?;
                     self.maybe_auto_break(antiban, rng).await?;
@@ -787,6 +795,7 @@ impl Engine {
                             FailureState::Paused401,
                             &format!("stopped immediately: {m}"),
                         );
+                        crate::notify::play(crate::notify::SoundEvent::DestinationPaused);
                     }
                     return Err(format!("stopped immediately: {m}"));
                 }
@@ -803,6 +812,7 @@ impl Engine {
                             FailureState::Paused404,
                             &format!("stopped immediately: {m}"),
                         );
+                        crate::notify::play(crate::notify::SoundEvent::DestinationPaused);
                     }
                     return Err(format!("stopped immediately: {m}"));
                 }
@@ -863,6 +873,8 @@ impl Engine {
                     channel_id: scenario.channel_id.clone(),
                     status: "deleted".into(),
                     detail: format!("deleted message {message_id}"),
+                    message_id: message_id.to_string(),
+                    destination_id: String::new(),
                 });
             }
             Err(e) => {
@@ -1096,6 +1108,8 @@ impl Engine {
                         channel_id: scenario.channel_id.clone(),
                         status: "sent".into(),
                         detail: format!("slash /{}", cfg.name.trim()),
+                        message_id: String::new(),
+                        destination_id: String::new(),
                     });
                     self.maybe_auto_break(antiban, &mut rng).await?;
                     return Ok(format!("slash /{}", cfg.name.trim()));
@@ -1338,7 +1352,13 @@ impl Engine {
                             channel_id: scenario.channel_id.clone(),
                             status: "failed".into(),
                             detail,
+                            message_id: String::new(),
+                            destination_id: destination
+                                .as_ref()
+                                .map(|d| d.id.clone())
+                                .unwrap_or_default(),
                         });
+                        crate::notify::play(crate::notify::SoundEvent::SendFailure);
                         consecutive_errors += 1;
                         // Per-destination consecutive errors: pause only
                         // that destination when it crosses the limit.
@@ -1352,6 +1372,9 @@ impl Engine {
                                             &dest.id,
                                             FailureState::PausedErrors,
                                             &e,
+                                        );
+                                        crate::notify::play(
+                                            crate::notify::SoundEvent::DestinationPaused,
                                         );
                                     }
                                 }

@@ -51,7 +51,7 @@ impl WebhookHealth {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     /// AES-256-GCM encrypted Discord token (base64), or empty.
     #[serde(default)]
@@ -103,6 +103,22 @@ pub struct AppConfig {
     /// unknown codes fall back to Vietnamese (see `i18n::Lang`).
     #[serde(default = "default_language")]
     pub language: String,
+    /// UI theme code ("dark" default, "light"). Applied instantly;
+    /// unknown codes fall back to Dark (see `theme::ThemeChoice`).
+    #[serde(default = "default_theme")]
+    pub theme: String,
+    /// Notification sounds on send failures / destination pauses.
+    /// Missing in old configs → true: failures deserve attention.
+    #[serde(default = "default_true")]
+    pub sound_enabled: bool,
+    /// Also play a sound on successful sends. Default false: with
+    /// frequent schedules, a sound per send would be noise.
+    #[serde(default)]
+    pub sound_on_success: bool,
+    /// RFC 3339 UTC timestamp of the last config export (empty =
+    /// never). Used by the startup health report to suggest a backup.
+    #[serde(default)]
+    pub last_export_at: String,
     #[serde(default = "default_true")]
     pub autostart: bool,
     #[serde(default)]
@@ -119,6 +135,44 @@ pub struct AppConfig {
     /// Missing in old config.json files → true.
     #[serde(default = "default_true")]
     pub auto_check_updates: bool,
+}
+
+impl Default for AppConfig {
+    /// The same defaults serde uses for missing fields. This must
+    /// stay in sync with the `#[serde(default = ...)]` attributes
+    /// above: a derived Default gave 0/"" everywhere, so a fresh or
+    /// corrupt config silently disabled the global cap, the
+    /// destination limit, and update checks. The test
+    /// `default_matches_serde_defaults` guards the sync.
+    fn default() -> Self {
+        Self {
+            encrypted_token: String::new(),
+            token_last4: String::new(),
+            tos_accepted: false,
+            send_mode: SendMode::default(),
+            encrypted_webhook_url: String::new(),
+            webhook_id: String::new(),
+            webhook_name: String::new(),
+            webhook_username: String::new(),
+            webhook_friendly_name: String::new(),
+            webhook_health: WebhookHealth::default(),
+            webhook_last_checked_at: String::new(),
+            global_daily_cap: default_global_daily_cap(),
+            max_destinations: default_max_destinations(),
+            destinations_migrated: false,
+            consecutive_error_limit: default_consecutive_error_limit(),
+            language: default_language(),
+            theme: default_theme(),
+            autostart: true,
+            active_scenario_id: None,
+            antiban: AntiBanConfig::default(),
+            tray_enabled: false,
+            auto_check_updates: true,
+            sound_enabled: true,
+            sound_on_success: false,
+            last_export_at: String::new(),
+        }
+    }
 }
 
 impl AppConfig {
@@ -156,6 +210,10 @@ fn default_language() -> String {
     "vi".to_string()
 }
 
+fn default_theme() -> String {
+    "dark".to_string()
+}
+
 pub fn config_dir() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -168,6 +226,22 @@ pub fn config_path() -> PathBuf {
 
 pub fn db_path() -> PathBuf {
     config_dir().join("nicord.db")
+}
+
+/// One row of the send history, as returned by `query_logs`.
+/// `message_id` / `destination_id` are "" for rows written before
+/// Q13 (or for sends that returned no id, e.g. a webhook 204).
+#[derive(Debug, Clone)]
+pub struct LogRow {
+    pub id: i64,
+    pub created_at: String,
+    pub scenario_id: String,
+    pub scenario_name: String,
+    pub channel_id: String,
+    pub status: String,
+    pub detail: String,
+    pub message_id: String,
+    pub destination_id: String,
 }
 
 pub struct Store {
@@ -192,6 +266,8 @@ impl Store {
                 channel_id TEXT,
                 status TEXT,
                 detail TEXT,
+                message_id TEXT,
+                destination_id TEXT,
                 created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS meta (
@@ -211,9 +287,44 @@ impl Store {
             );",
         )
         .map_err(|e| format!("cannot create tables: {e}"))?;
+        // Migration: databases created before Q13 lack the
+        // message_id/destination_id columns (CREATE TABLE IF NOT
+        // EXISTS never adds them). Guarded by a PRAGMA check, so
+        // running it on every open is safe.
+        Self::ensure_send_log_columns(&conn)?;
         Ok(Self {
             db: Mutex::new(conn),
         })
+    }
+
+    /// Add `message_id` / `destination_id` to `send_logs` when an
+    /// older database lacks them. Old rows keep NULL, which reads
+    /// back as "" via COALESCE in `query_logs`.
+    fn ensure_send_log_columns(conn: &Connection) -> Result<(), String> {
+        let cols: Vec<String> = {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(send_logs)")
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<_, _>>().map_err(|e| e.to_string())?
+        };
+        for (col, ddl) in [
+            (
+                "message_id",
+                "ALTER TABLE send_logs ADD COLUMN message_id TEXT",
+            ),
+            (
+                "destination_id",
+                "ALTER TABLE send_logs ADD COLUMN destination_id TEXT",
+            ),
+        ] {
+            if !cols.iter().any(|c| c == col) {
+                conn.execute(ddl, []).map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
     }
 
     /// Open a throwaway in-memory store (used by tests).
@@ -222,7 +333,7 @@ impl Store {
         let conn = Connection::open_in_memory().map_err(|e| e.to_string())?;
         conn.execute_batch(
             "CREATE TABLE scenarios (id TEXT PRIMARY KEY, json TEXT NOT NULL, updated_at TEXT NOT NULL);
-             CREATE TABLE send_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, scenario_id TEXT, scenario_name TEXT, channel_id TEXT, status TEXT, detail TEXT, created_at TEXT NOT NULL);
+             CREATE TABLE send_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, scenario_id TEXT, scenario_name TEXT, channel_id TEXT, status TEXT, detail TEXT, message_id TEXT, destination_id TEXT, created_at TEXT NOT NULL);
              CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
              CREATE TABLE destinations (id TEXT PRIMARY KEY, json TEXT NOT NULL, updated_at TEXT NOT NULL);
              CREATE TABLE templates (id TEXT PRIMARY KEY, name TEXT NOT NULL, content TEXT NOT NULL, updated_at TEXT NOT NULL);",
@@ -540,14 +651,16 @@ impl Store {
             .lock()
             .map_err(|e| e.to_string())?
             .execute(
-                "INSERT INTO send_logs (scenario_id, scenario_name, channel_id, status, detail, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO send_logs (scenario_id, scenario_name, channel_id, status, detail, message_id, destination_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     entry.scenario_id,
                     entry.scenario_name,
                     entry.channel_id,
                     entry.status,
                     entry.detail,
+                    entry.message_id,
+                    entry.destination_id,
                     now
                 ],
             )
@@ -568,12 +681,13 @@ impl Store {
         status: Option<&str>,
         scenario_id: Option<&str>,
         channel_id: Option<&str>,
-    ) -> Result<Vec<(String, String, String, String)>, String> {
+    ) -> Result<Vec<LogRow>, String> {
         let conn = self.db.lock().map_err(|e| e.to_string())?;
         let like = format!("%{}%", escape_like(keyword));
         let mut stmt = conn
             .prepare(
-                "SELECT created_at, scenario_name, status, detail FROM send_logs
+                "SELECT id, created_at, scenario_id, scenario_name, channel_id, status, detail,
+                        COALESCE(message_id, ''), COALESCE(destination_id, '') FROM send_logs
                  WHERE (?1 = '%%' OR scenario_name LIKE ?1 ESCAPE '\\' COLLATE NOCASE
                         OR status LIKE ?1 ESCAPE '\\' COLLATE NOCASE
                         OR detail LIKE ?1 ESCAPE '\\' COLLATE NOCASE)
@@ -587,12 +701,17 @@ impl Store {
             .query_map(
                 params![like, status, scenario_id, channel_id, limit as i64],
                 |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                    ))
+                    Ok(LogRow {
+                        id: row.get(0)?,
+                        created_at: row.get(1)?,
+                        scenario_id: row.get(2)?,
+                        scenario_name: row.get(3)?,
+                        channel_id: row.get(4)?,
+                        status: row.get(5)?,
+                        detail: row.get(6)?,
+                        message_id: row.get(7)?,
+                        destination_id: row.get(8)?,
+                    })
                 },
             )
             .map_err(|e| e.to_string())?;
@@ -785,6 +904,8 @@ mod tests {
                     channel_id: "c".to_string(),
                     status: status.to_string(),
                     detail: format!("detail {name}"),
+                    message_id: String::new(),
+                    destination_id: String::new(),
                 })
                 .unwrap();
         };
@@ -794,19 +915,63 @@ mod tests {
         // Literal % and _ match only the literal name, not everything.
         let rows = store.query_logs(10, "100%_done", None, None, None).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].1, "100%_done");
+        assert_eq!(rows[0].scenario_name, "100%_done");
+        assert_eq!(rows[0].message_id, "");
         // Status + scenario filters combine.
         let rows = store
             .query_logs(10, "", Some("sent"), Some("s2"), None)
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].1, "other");
+        assert_eq!(rows[0].scenario_name, "other");
         let rows = store
             .query_logs(10, "", Some("failed"), None, None)
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(store.count_status_today("failed"), 1);
         assert!(store.last_send_time().is_some());
+    }
+
+    #[test]
+    fn log_send_roundtrips_message_and_destination_ids() {
+        let store = Store::open_memory().unwrap();
+        store
+            .log_send(&SendLogEntry {
+                scenario_id: "s1".to_string(),
+                scenario_name: "n".to_string(),
+                channel_id: "c".to_string(),
+                status: "sent".to_string(),
+                detail: "message 123".to_string(),
+                message_id: "123".to_string(),
+                destination_id: "d1".to_string(),
+            })
+            .unwrap();
+        let rows = store.query_logs(10, "", None, None, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].message_id, "123");
+        assert_eq!(rows[0].destination_id, "d1");
+        assert!(rows[0].id > 0);
+    }
+
+    #[test]
+    fn send_log_migration_adds_columns_to_legacy_schema() {
+        // A database from before Q13: no message_id/destination_id.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE send_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, scenario_id TEXT, scenario_name TEXT, channel_id TEXT, status TEXT, detail TEXT, created_at TEXT NOT NULL);
+             INSERT INTO send_logs (scenario_id, scenario_name, channel_id, status, detail, created_at) VALUES ('s','n','c','sent','old','2026-01-01T00:00:00Z');",
+        )
+        .unwrap();
+        Store::ensure_send_log_columns(&conn).unwrap();
+        // Idempotent: a second run must not error.
+        Store::ensure_send_log_columns(&conn).unwrap();
+        let (mid, did): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT message_id, destination_id FROM send_logs LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((mid, did), (None, None));
     }
 
     #[test]
@@ -887,6 +1052,28 @@ mod tests {
     }
 
     #[test]
+    fn default_matches_serde_defaults() {
+        // A fresh install (no config.json) gets Default; an old
+        // config.json missing new fields gets the serde defaults.
+        // Both must agree, or fresh and upgraded installs behave
+        // differently. Compare via JSON: no PartialEq needed.
+        let from_empty: AppConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            serde_json::to_string(&AppConfig::default()).unwrap(),
+            serde_json::to_string(&from_empty).unwrap()
+        );
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.global_daily_cap, 300);
+        assert_eq!(cfg.max_destinations, 10);
+        assert_eq!(cfg.consecutive_error_limit, 5);
+        assert_eq!(cfg.language, "vi");
+        assert_eq!(cfg.theme, "dark");
+        assert!(cfg.autostart);
+        assert!(cfg.auto_check_updates);
+        assert!(cfg.sound_enabled);
+    }
+
+    #[test]
     fn webhook_display_name_prefers_friendly_name() {
         let mut cfg = AppConfig::default();
         assert_eq!(cfg.webhook_display_name(), "Webhook");
@@ -894,6 +1081,35 @@ mod tests {
         assert_eq!(cfg.webhook_display_name(), "Announce");
         cfg.webhook_friendly_name = "Thông báo lớp".to_string();
         assert_eq!(cfg.webhook_display_name(), "Thông báo lớp");
+    }
+
+    /// Perf harness (ignored: run with `cargo test -- --ignored`).
+    /// Measures the raw `count_sends_today` query the Dashboard used
+    /// to run every frame. Kept in the repo so the number can be
+    /// re-measured after storage changes; it prints, never asserts
+    /// on timing (CI machines vary too much for timing asserts).
+    #[test]
+    #[ignore]
+    fn bench_count_sends_today() {
+        let store = Store::open_memory().unwrap();
+        let today = chrono::Utc::now().to_rfc3339();
+        {
+            let db = store.db.lock().unwrap();
+            for _ in 0..10_000 {
+                db.execute(
+                    "INSERT INTO send_logs (scenario_id, scenario_name, channel_id, status, detail, created_at) VALUES ('s','n','c','sent','d', ?1)",
+                    params![today],
+                )
+                .unwrap();
+            }
+        }
+        let start = std::time::Instant::now();
+        let n = 1000;
+        for _ in 0..n {
+            assert_eq!(store.count_sends_today(), 10_000);
+        }
+        let avg_us = start.elapsed().as_micros() as f64 / n as f64;
+        eprintln!("count_sends_today over 10k rows: {avg_us:.1} µs/call (1000 calls)");
     }
 
     #[test]

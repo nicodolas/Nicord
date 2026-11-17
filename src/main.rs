@@ -15,7 +15,9 @@ mod destination;
 mod discord;
 mod embed;
 mod gateway;
+mod health;
 mod i18n;
+mod notify;
 mod preview;
 mod scenario;
 mod scheduler;
@@ -74,8 +76,11 @@ fn main() -> eframe::Result<()> {
         "Nicord",
         options,
         Box::new(|cc| {
-            // Discord-like dark theme + bundled Inter font.
-            theme::apply_theme(&cc.egui_ctx);
+            // Saved theme (dark default) + bundled Inter font.
+            // NicordApp::new loads the config again; reading the
+            // small JSON twice at startup is harmless.
+            let saved = store::load_config();
+            theme::apply_theme(&cc.egui_ctx, theme::ThemeChoice::from_code(&saved.theme));
             Ok(Box::new(NicordApp::new(store)))
         }),
     )

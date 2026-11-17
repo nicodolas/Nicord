@@ -517,6 +517,78 @@ over a 20% chance of needing to survive a restart or a move,
 persist it — and include it in export/import. Full rules:
 `docs/CONFIG-RULES.md`.
 
+## Quality of life (P2)
+
+- **Notification sounds (Q11, `src/notify.rs`).** A short beep on
+  send failure, destination auto-pause, and (opt-in) send success.
+  No audio files or new dependencies: a sine-wave WAV is generated
+  in code and played with the platform's built-in player
+  (PowerShell `SoundPlayer` on Windows, `paplay`/`aplay` on Linux,
+  `afplay` on macOS). Playback runs on a detached thread, failures
+  are silent, and sounds are throttled to one per 10 s so a failing
+  engine cannot beep every second. Defaults: on for failures/pauses,
+  off for successes. Settings live in `AppConfig` and are mirrored
+  into the module for engine threads. Unverified on real
+  Windows/macOS machines (no GUI run here).
+- **Themes (Q12, `src/theme.rs`).** Dark (original) and Light
+  palettes behind one `Palette` struct; `ThemeChoice` is stored as
+  a code string in config like the language, applied instantly
+  from Settings and at startup. The current palette is process-wide
+  (`palette()`), read by every helper and screen — the old
+  per-color constants are gone, so a missed call site fails to
+  compile instead of staying dark.
+- **Manual delete (Q13).** One sent message at a time, from the
+  Logs screen, webhook mode only, with an inline confirmation.
+  Nothing automatic calls it: no engine, schedule, or bulk path.
+  The send history stores the Discord `message_id` and the
+  `destination_id` per row (new `send_logs` columns, added to older
+  databases by a guarded `ALTER TABLE` migration; old rows read
+  back as ""). Delete goes to the exact webhook that sent the
+  message (destination must still exist with a URL; the id must be
+  digits-only before it enters the URL path). Every deletion writes
+  an audit row (status `deleted`); a 404 is reported honestly as
+  "already deleted" and audited as such. Verified Discord facts
+  used: message delete returns 204 and supports `thread_id`.
+- **Startup health report (Q15, `src/health.rs`).** Offline checks
+  over the loaded config, destinations, and scenarios, shown once
+  on the Dashboard until dismissed: no webhook URL, all
+  destinations disabled, paused destinations, zero global cap,
+  destination count over the limit, enabled scenarios that fail
+  validation, no token in user-token mode, no scenarios yet, and a
+  backup reminder when no export was ever made (tracked via
+  `AppConfig.last_export_at`, set on every successful export). No
+  network calls; each issue points at the screen where it is
+  fixed. Pure functions, unit-tested.
+- **Bug found by the health checks: `AppConfig::default()`.**
+  `AppConfig` derived `Default`, so a fresh or corrupt config
+  silently got `global_daily_cap = 0`, `max_destinations = 0`,
+  `consecutive_error_limit = 0`, and update checks off — while the
+  serde defaults for missing fields said 300 / 10 / 5 / on. The
+  struct now has a manual `Default` using the same default
+  functions, guarded by `default_matches_serde_defaults`, which
+  compares `Default` against deserializing `{}`.
+
+## Performance notes
+
+Measured on this Linux VM (debug build, `cargo test -- --ignored`,
+harness tests in `src/store.rs` and `src/app.rs`; re-run them after
+storage or runtime changes — they print, never assert on timing):
+
+- `count_sends_today()` over 10,000 log rows: **~3.3 ms/call**
+  (full scan, no index on `created_at`). It used to run every frame
+  in `update()` — ~3,600 queries/minute at 60 fps. The Dashboard
+  now refreshes the count at most every 5 s (12/minute); the value
+  is computed once at startup so the first frame is correct.
+- `tokio::runtime::Runtime::new()`: **~420 µs/call**. Eleven UI
+  call sites each built a fresh runtime per click. They now share
+  one process-wide runtime (`shared_runtime()` in `src/app.rs`,
+  ~0.1 µs/call after warm-up). Safe because no call site blocks
+  nested inside another `block_on` on it.
+- Not optimized: nothing else was measured, so nothing else was
+  changed. In particular the per-frame `load_destinations()` calls
+  in the Logs filter and the engine's per-tick queries were left
+  alone — measure before touching them.
+
 ## Known limitations
 
 - **System tray is Windows-only.** On Linux the tray checkbox is
@@ -527,6 +599,11 @@ persist it — and include it in export/import. Full rules:
   docs), but sending into a locked thread has not been tested.
 - **Spike not run yet:** 7 days of stable sending on a spare account has
   not been proven — run it before releasing.
+- **Platform testing:** the GUI has only been exercised on Linux, and
+  never in this headless environment. Windows/macOS builds compile in
+  CI (Linux-only CI job), but real-machine behaviour there — tray,
+  autostart, sounds — is unverified. The README does not carry this
+  kind of note by design (brand + features only); it lives here.
 - Sending is REST-based; a gateway connection is used only to obtain
   a session ID for slash commands (`src/gateway.rs`). The channel
   picker is wired (Load servers/channels), with a hand-typed channel

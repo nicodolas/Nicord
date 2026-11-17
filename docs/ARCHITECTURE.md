@@ -84,7 +84,14 @@ Webhook mode (same tick, queue, cap, and retry policy; simpler send):
   for slash commands (user-token mode only).
 - `spintax.rs` — spin-text + message variation (user-token mode only;
   skipped in webhook mode).
-- `theme.rs` — Discord-like dark theme, embedded fonts.
+- `theme.rs` — two palettes (Dark/Light) behind one `Palette`
+  struct + `ThemeChoice`; the current palette is process-wide
+  (`palette()`), applied via `apply_theme`. Embedded fonts.
+- `notify.rs` — notification sounds: code-generated WAV beeps via
+  the platform player, throttled, best-effort, never blocking.
+  Settings mirror from `AppConfig` into a process-wide cell.
+- `health.rs` — startup health report: pure offline checks over
+  config + destinations + scenarios; no network calls.
 - `tray.rs` — Windows-only system tray (see below).
 - `autostart.rs` — real OS autostart (Windows Run key / Linux XDG).
 - `updater.rs` — in-app auto-update from GitHub Releases.
@@ -95,8 +102,13 @@ Webhook mode (same tick, queue, cap, and retry policy; simpler send):
 - `backup.rs` — config export/import: versioned JSON format,
   Portable/Safe/Local modes, passphrase KDF, replacement import
   with validation + warnings. See `docs/CONFIG-RULES.md`.
-- `store.rs` — SQLite tables `scenarios` / `send_logs`; JSON `AppConfig`
-  (incl. `SendMode`, encrypted webhook URL, webhook display metadata).
+- `store.rs` — SQLite tables `scenarios` / `send_logs` / `destinations`
+  / `templates` / `meta`; JSON `AppConfig` (incl. `SendMode`,
+  encrypted webhook URL, webhook display metadata). `send_logs`
+  carries `message_id` / `destination_id` (Q13) with a guarded
+  `ALTER TABLE` migration for older databases. `AppConfig::default()`
+  is manual and must match the serde field defaults (guarded by a
+  test — a derived Default silently zeroed the caps).
 
 ## License keys — removed in v0.1.0
 

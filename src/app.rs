@@ -66,6 +66,11 @@ pub struct NicordApp {
     /// editor panel; other kinds show no editor yet).
     pub selected_node: Option<String>,
     pub sent_today: u32,
+    /// When `sent_today` was last re-read from the database. The
+    /// count is refreshed at most every 5 seconds (see `update()`):
+    /// the query costs ~3.3 ms over 10k rows, and running it every
+    /// frame at 60 fps was pure waste.
+    pub sent_today_updated: std::time::Instant,
     pub guilds: Arc<Mutex<Vec<Guild>>>,
     pub channels: Arc<Mutex<Vec<Channel>>>,
     pub picker_guild_id: String,
@@ -76,6 +81,8 @@ pub struct NicordApp {
     pub log_scenario_filter: String,
     /// Logs destination filter ("" = all, else a channel id).
     pub log_channel_filter: String,
+    /// Log row awaiting delete confirmation (Q13). Session-only.
+    pub pending_delete_log: Option<i64>,
     pub import_path: String,
     /// Warnings from the last import analysis (QoL, shown in Builder).
     pub import_warnings: Vec<String>,
@@ -111,6 +118,10 @@ pub struct NicordApp {
     pub backup_import_passphrase: String,
     pub backup_import_confirm: bool,
     pub backup_warnings: Vec<String>,
+    /// Startup health report (Q15). Computed once at startup and on
+    /// demand; dismissing is session-only.
+    pub health_issues: Vec<crate::health::HealthIssue>,
+    pub health_dismissed: bool,
     /// Result of the last "Kiểm tra token" (Token Validator).
     pub token_info: Arc<Mutex<Option<Me>>>,
     /// Auto-update state, shared with the background check/download
@@ -220,7 +231,10 @@ impl NicordApp {
             config.consecutive_error_limit,
         ));
         let has_enabled = scenarios.iter().any(|s| s.enabled);
-        let app = Self {
+        // First "sent today" value, so the Dashboard is correct from
+        // the first frame (the 5 s cache in update() takes over after).
+        let sent_today_init = store.count_sends_today();
+        let mut app = Self {
             store,
             engine,
             scenarios: Arc::new(Mutex::new(scenarios)),
@@ -237,7 +251,8 @@ impl NicordApp {
             new_message: String::new(),
             selected: None,
             selected_node: None,
-            sent_today: 0,
+            sent_today: sent_today_init,
+            sent_today_updated: std::time::Instant::now(),
             guilds: Arc::new(Mutex::new(Vec::new())),
             channels: Arc::new(Mutex::new(Vec::new())),
             picker_guild_id: String::new(),
@@ -245,6 +260,7 @@ impl NicordApp {
             log_status_filter: String::new(),
             log_scenario_filter: String::new(),
             log_channel_filter: String::new(),
+            pending_delete_log: None,
             import_path: String::new(),
             import_warnings: Vec::new(),
             webhook_health_shared: Arc::new(Mutex::new(webhook_health_init)),
@@ -266,6 +282,8 @@ impl NicordApp {
             backup_import_passphrase: String::new(),
             backup_import_confirm: false,
             backup_warnings: Vec::new(),
+            health_issues: Vec::new(),
+            health_dismissed: false,
             token_info: Arc::new(Mutex::new(None)),
             update_status: Arc::new(Mutex::new(updater::UpdateStatus::default())),
             #[cfg(target_os = "windows")]
@@ -307,7 +325,17 @@ impl NicordApp {
         if app.config.auto_check_updates && app.screen != Screen::Onboarding {
             app.check_updates(false);
         }
+        // Startup health report (Q15): offline checks, shown on the
+        // Dashboard until dismissed.
+        app.refresh_health();
         app
+    }
+
+    /// Recompute the startup health report from the current state.
+    fn refresh_health(&mut self) {
+        let destinations = self.store.load_destinations().unwrap_or_default();
+        let scenarios = self.scenarios.lock().map(|l| l.clone()).unwrap_or_default();
+        self.health_issues = crate::health::startup_checks(&self.config, &destinations, &scenarios);
     }
 
     /// Current UI language (from config, applied instantly).
@@ -359,7 +387,7 @@ impl NicordApp {
         let engine = self.engine.clone();
         let status = self.status.clone();
         std::thread::spawn(move || {
-            let rt = match tokio::runtime::Runtime::new() {
+            let rt = match shared_runtime() {
                 Ok(rt) => rt,
                 Err(e) => {
                     if let Ok(mut s) = status.lock() {
@@ -400,6 +428,14 @@ impl NicordApp {
                 &username,
                 &server_name,
             ));
+            // The engine already beeps on success; beep here too for
+            // failures (test sends bypass the run loop's failure log).
+            // The throttle keeps a success from beeping twice.
+            if result.is_ok() {
+                crate::notify::play(crate::notify::SoundEvent::SendSuccess);
+            } else {
+                crate::notify::play(crate::notify::SoundEvent::SendFailure);
+            }
             if let Ok(mut s) = status.lock() {
                 *s = match result {
                     Ok(id) if id.is_empty() => "Test sent! (webhook, no id returned)".to_string(),
@@ -424,7 +460,7 @@ impl NicordApp {
         let info = self.token_info.clone();
         let status = self.status.clone();
         std::thread::spawn(move || {
-            let rt = match tokio::runtime::Runtime::new() {
+            let rt = match shared_runtime() {
                 Ok(rt) => rt,
                 Err(e) => {
                     if let Ok(mut s) = status.lock() {
@@ -481,7 +517,7 @@ impl NicordApp {
         let checked_shared = self.webhook_last_checked_shared.clone();
         let engine = self.engine.clone();
         std::thread::spawn(move || {
-            let rt = match tokio::runtime::Runtime::new() {
+            let rt = match shared_runtime() {
                 Ok(rt) => rt,
                 Err(e) => {
                     if let Ok(mut s) = status.lock() {
@@ -669,7 +705,7 @@ impl NicordApp {
         let engine = self.engine.clone();
         let status = self.status.clone();
         std::thread::spawn(move || {
-            let rt = match tokio::runtime::Runtime::new() {
+            let rt = match shared_runtime() {
                 Ok(rt) => rt,
                 Err(e) => {
                     if let Ok(mut s) = status.lock() {
@@ -720,7 +756,7 @@ impl NicordApp {
             self.set_status("Đang kiểm tra cập nhật…");
         }
         std::thread::spawn(move || {
-            let rt = match tokio::runtime::Runtime::new() {
+            let rt = match shared_runtime() {
                 Ok(rt) => rt,
                 Err(e) => {
                     if let Ok(mut u) = shared.lock() {
@@ -823,7 +859,7 @@ impl NicordApp {
             u.plan = None;
         }
         std::thread::spawn(move || {
-            let rt = match tokio::runtime::Runtime::new() {
+            let rt = match shared_runtime() {
                 Ok(rt) => rt,
                 Err(e) => {
                     if let Ok(mut u) = shared.lock() {
@@ -969,7 +1005,7 @@ impl NicordApp {
         let config = self.config.clone();
         let store = self.store.clone();
         std::thread::spawn(move || {
-            let rt = match tokio::runtime::Runtime::new() {
+            let rt = match shared_runtime() {
                 Ok(rt) => rt,
                 Err(_) => return,
             };
@@ -1003,7 +1039,7 @@ impl NicordApp {
         let guilds = self.guilds.clone();
         let status = self.status.clone();
         std::thread::spawn(move || {
-            let rt = match tokio::runtime::Runtime::new() {
+            let rt = match shared_runtime() {
                 Ok(rt) => rt,
                 Err(_) => return,
             };
@@ -1039,7 +1075,7 @@ impl NicordApp {
         let channels = self.channels.clone();
         let status = self.status.clone();
         std::thread::spawn(move || {
-            let rt = match tokio::runtime::Runtime::new() {
+            let rt = match shared_runtime() {
                 Ok(rt) => rt,
                 Err(_) => return,
             };
@@ -1067,8 +1103,17 @@ impl NicordApp {
 
 impl eframe::App for NicordApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Mirror sound settings for engine threads (cheap, idempotent).
+        crate::notify::sync_settings(self.config.sound_enabled, self.config.sound_on_success);
         // "Sent today" is the persisted count, not a memory counter.
-        self.sent_today = self.store.count_sends_today();
+        // Refreshed at most every 5 s: the query is a full scan
+        // (~3.3 ms over 10k rows, measured) and the Dashboard only
+        // needs a recent number, not a per-frame one. At 60 fps this
+        // cuts ~3,600 queries/minute to 12.
+        if self.sent_today_updated.elapsed() >= std::time::Duration::from_secs(5) {
+            self.sent_today = self.store.count_sends_today();
+            self.sent_today_updated = std::time::Instant::now();
+        }
         // Sync webhook health from the check thread into the config
         // (persisted). Runs at most once per change: after syncing,
         // shared and config agree, so no save happens next frame.
@@ -1130,7 +1175,7 @@ impl eframe::App for NicordApp {
             .show_separator_line(false)
             .frame(
                 egui::Frame::new()
-                    .fill(theme::SIDEBAR_BG)
+                    .fill(theme::palette().sidebar_bg)
                     .inner_margin(egui::Margin::same(12)),
             )
             .show(ctx, |ui| {
@@ -1140,7 +1185,7 @@ impl eframe::App for NicordApp {
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
-                    .fill(theme::BG)
+                    .fill(theme::palette().bg)
                     .inner_margin(egui::Margin {
                         left: 18,
                         right: 18,
@@ -1177,13 +1222,17 @@ impl eframe::App for NicordApp {
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
                             ui.heading(title);
-                            ui.label(RichText::new(subtitle).small().color(theme::TEXT_MUTED));
+                            ui.label(
+                                RichText::new(subtitle)
+                                    .small()
+                                    .color(theme::palette().text_muted),
+                            );
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.label(
                                 RichText::new("1 channel • 300 messages/day • resets 00:00 UTC")
                                     .small()
-                                    .color(theme::TEXT_MUTED),
+                                    .color(theme::palette().text_muted),
                             );
                         });
                     });
@@ -1193,13 +1242,13 @@ impl eframe::App for NicordApp {
                 let status = self.status_text();
                 if !status.is_empty() {
                     egui::Frame::new()
-                        .fill(theme::CARD)
-                        .stroke(egui::Stroke::new(1.0_f32, theme::WARNING))
+                        .fill(theme::palette().card)
+                        .stroke(egui::Stroke::new(1.0_f32, theme::palette().warning))
                         .corner_radius(8)
                         .inner_margin(10)
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
-                            ui.label(RichText::new(&status).color(theme::WARNING));
+                            ui.label(RichText::new(&status).color(theme::palette().warning));
                         });
                     ui.add_space(10.0);
                 }
@@ -1224,13 +1273,13 @@ impl NicordApp {
     /// Left sidebar: brand, nav, today status card, Emergency Stop.
     fn show_sidebar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(theme::semibold("Nicord", 22.0).color(theme::TEXT));
+            ui.label(theme::semibold("Nicord", 22.0).color(theme::palette().text));
             ui.label(RichText::new("•").size(22.0).color(theme::ACCENT_LIGHT));
         });
         ui.label(
             RichText::new("Discord auto-sender")
                 .small()
-                .color(theme::TEXT_MUTED),
+                .color(theme::palette().text_muted),
         );
         ui.add_space(12.0);
         if self.screen != Screen::Onboarding {
@@ -1250,7 +1299,7 @@ impl NicordApp {
             ui.label(
                 RichText::new("Hoàn tất thiết lập để tiếp tục")
                     .small()
-                    .color(theme::TEXT_MUTED),
+                    .color(theme::palette().text_muted),
             );
         }
         // Bottom of the sidebar: today status, then Emergency Stop last.
@@ -1259,7 +1308,7 @@ impl NicordApp {
                 .add_sized(
                     [ui.available_width(), 40.0],
                     egui::Button::new(RichText::new("Emergency Stop").color(theme::WHITE))
-                        .fill(theme::DANGER),
+                        .fill(theme::palette().danger),
                 )
                 .clicked()
             {
@@ -1292,9 +1341,9 @@ impl NicordApp {
                         .load(std::sync::atomic::Ordering::SeqCst);
                     ui.horizontal(|ui| {
                         ui.label(theme::dot(if running {
-                            theme::SUCCESS
+                            theme::palette().success
                         } else {
-                            theme::TEXT_MUTED
+                            theme::palette().text_muted
                         }));
                         ui.label(
                             RichText::new(if running {
@@ -1451,7 +1500,7 @@ impl NicordApp {
             ui.set_width(ui.available_width());
             ui.label(
                 RichText::new("WARNING — READ FIRST")
-                    .color(theme::DANGER)
+                    .color(theme::palette().danger)
                     .text_style(egui::TextStyle::Name("SectionTitle".into())),
             );
             ui.label(
@@ -1538,7 +1587,7 @@ impl NicordApp {
                     RichText::new(
                         "Discord yêu cầu chờ toàn cục (429) — mọi đích đến đang tạm chờ, sẽ tự tiếp tục.",
                     )
-                    .color(theme::DANGER),
+                    .color(theme::palette().danger),
                 );
             });
             ui.add_space(8.0);
@@ -1560,11 +1609,11 @@ impl NicordApp {
                         self.store.count_sends_today_for_channel(&dest.channel_id)
                     };
                     let state_color = if !dest.enabled {
-                        theme::TEXT_SECONDARY
+                        theme::palette().text_secondary
                     } else if dest.failure_state.is_paused() {
-                        theme::DANGER
+                        theme::palette().danger
                     } else {
-                        theme::SUCCESS
+                        theme::palette().success
                     };
                     let state_text = if !dest.enabled {
                         "Đã tắt"
@@ -1613,6 +1662,64 @@ impl NicordApp {
     }
 
     fn show_dashboard(&mut self, ui: &mut egui::Ui) {
+        // Startup health report (Q15): shown until dismissed.
+        if !self.health_dismissed && !self.health_issues.is_empty() {
+            let mut jump_to: Option<Screen> = None;
+            let mut dismiss = false;
+            let mut recheck = false;
+            theme::card(ui, |ui| {
+                theme::section_title(ui, "Tình trạng khởi động");
+                for issue in &self.health_issues {
+                    let (dot, label) = match issue.severity {
+                        crate::health::Severity::Error => {
+                            (theme::dot(theme::palette().danger), "Lỗi")
+                        }
+                        crate::health::Severity::Warning => {
+                            (theme::dot(theme::palette().warning), "Chú ý")
+                        }
+                        crate::health::Severity::Info => (theme::dot(theme::ACCENT_LIGHT), "Gợi ý"),
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label(dot);
+                        ui.label(format!("[{label}] {}", issue.message));
+                        if let Some(target) = issue.target {
+                            let (screen, text) = match target {
+                                crate::health::HealthTarget::Destinations => {
+                                    (Screen::Destinations, "Đi tới Đích đến")
+                                }
+                                crate::health::HealthTarget::Builder => {
+                                    (Screen::Builder, "Đi tới Soạn")
+                                }
+                                crate::health::HealthTarget::Settings => {
+                                    (Screen::Settings, "Đi tới Cài đặt")
+                                }
+                            };
+                            if theme::ghost_button(ui, text).clicked() {
+                                jump_to = Some(screen);
+                            }
+                        }
+                    });
+                }
+                ui.horizontal(|ui| {
+                    if theme::ghost_button(ui, "Đã hiểu").clicked() {
+                        dismiss = true;
+                    }
+                    if theme::ghost_button(ui, "Kiểm tra lại").clicked() {
+                        recheck = true;
+                    }
+                });
+            });
+            ui.add_space(12.0);
+            if dismiss {
+                self.health_dismissed = true;
+            }
+            if recheck {
+                self.refresh_health();
+            }
+            if let Some(screen) = jump_to {
+                self.screen = screen;
+            }
+        }
         // Stat cards: scenarios, running, sent today.
         let count = self.scenarios.lock().map(|l| l.len()).unwrap_or(0);
         let running = self
@@ -1680,11 +1787,11 @@ impl NicordApp {
         });
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            ui.label(theme::dot(theme::TEXT_MUTED));
+            ui.label(theme::dot(theme::palette().text_muted));
             ui.label(
                 RichText::new(format!("Next run: {next_text}"))
                     .small()
-                    .color(theme::TEXT_MUTED),
+                    .color(theme::palette().text_muted),
             );
         });
         ui.add_space(4.0);
@@ -1701,8 +1808,12 @@ impl NicordApp {
             ),
         };
         ui.horizontal(|ui| {
-            ui.label(theme::dot(theme::TEXT_MUTED));
-            ui.label(RichText::new(mode_text).small().color(theme::TEXT_MUTED));
+            ui.label(theme::dot(theme::palette().text_muted));
+            ui.label(
+                RichText::new(mode_text)
+                    .small()
+                    .color(theme::palette().text_muted),
+            );
         });
         ui.add_space(12.0);
         // Destination card (QoL Q2/Q4): health, last check, last send,
@@ -1805,24 +1916,24 @@ impl NicordApp {
                 for (i, name, enabled, schedule, next) in &rows {
                     ui.horizontal(|ui| {
                         ui.label(theme::dot(if *enabled {
-                            theme::SUCCESS
+                            theme::palette().success
                         } else {
-                            theme::TEXT_MUTED
+                            theme::palette().text_muted
                         }));
                         ui.label(theme::semibold(name, 15.0));
                         ui.label(
                             RichText::new(if *enabled { "enabled" } else { "disabled" })
                                 .small()
                                 .color(if *enabled {
-                                    theme::SUCCESS
+                                    theme::palette().success
                                 } else {
-                                    theme::TEXT_MUTED
+                                    theme::palette().text_muted
                                 }),
                         );
                         ui.label(
                             RichText::new(format!("{schedule}  {next}"))
                                 .small()
-                                .color(theme::TEXT_MUTED),
+                                .color(theme::palette().text_muted),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if theme::ghost_button(ui, "Edit").clicked() {
@@ -1943,8 +2054,10 @@ impl NicordApp {
                             // never be confused with Enable at a glance.
                             if ui
                                 .add(
-                                    egui::Button::new(RichText::new("Delete").color(theme::DANGER))
-                                        .fill(theme::BTN_BG),
+                                    egui::Button::new(
+                                        RichText::new("Delete").color(theme::palette().danger),
+                                    )
+                                    .fill(theme::palette().btn_bg),
                                 )
                                 .clicked()
                             {
@@ -2220,7 +2333,7 @@ impl NicordApp {
                                 RichText::new(format!(
                                     "• {m} (quá 2000 ký tự — sẽ bị chặn khi bật)"
                                 ))
-                                .color(theme::DANGER),
+                                .color(theme::palette().danger),
                             );
                         } else {
                             ui.label(format!("• {m}"));
@@ -2380,7 +2493,7 @@ impl NicordApp {
                         RichText::new(
                             "Cảnh báo: đang dùng bộ tin của đích đến nhưng đích đến chưa có tin nào — kịch bản sẽ không gửi được.",
                         )
-                        .color(theme::DANGER),
+                        .color(theme::palette().danger),
                     );
                 }
             }
@@ -2407,11 +2520,13 @@ impl NicordApp {
                     RichText::new(
                         "Cảnh báo: kịch bản và đích đến đều chưa có tin nào — kịch bản sẽ không gửi được.",
                     )
-                    .color(theme::DANGER),
+                    .color(theme::palette().danger),
                 );
             }
         } else if scenario.messages.is_empty() {
-            ui.label(RichText::new("Cảnh báo: kịch bản chưa có tin nào.").color(theme::DANGER));
+            ui.label(
+                RichText::new("Cảnh báo: kịch bản chưa có tin nào.").color(theme::palette().danger),
+            );
         }
     }
 
@@ -2631,7 +2746,7 @@ impl NicordApp {
                 );
             }
             if let Some(e) = &error {
-                ui.label(RichText::new(e).color(theme::DANGER));
+                ui.label(RichText::new(e).color(theme::palette().danger));
             }
         });
         // Write back (only when valid: schedule validates + timezone parses).
@@ -2864,7 +2979,7 @@ impl NicordApp {
                     ),
                 );
                 if let Err(validation) = e.validate() {
-                    ui.label(RichText::new(validation).color(theme::DANGER));
+                    ui.label(RichText::new(validation).color(theme::palette().danger));
                 }
                 // Preview card.
                 ui.add_space(4.0);
@@ -2872,7 +2987,7 @@ impl NicordApp {
                     if let Some(color) = e.color {
                         ui.label(
                             RichText::new(format!("■ Màu #{color:06X}"))
-                                .color(theme::TEXT_SECONDARY),
+                                .color(theme::palette().text_secondary),
                         );
                     }
                     if !e.author_name.trim().is_empty() {
@@ -2896,7 +3011,7 @@ impl NicordApp {
                 });
             }
             if let Some(e) = &error {
-                ui.label(RichText::new(e).color(theme::DANGER));
+                ui.label(RichText::new(e).color(theme::palette().danger));
             }
         });
         if changed && error.is_none() {
@@ -2930,7 +3045,7 @@ impl NicordApp {
             ui.label("Xem trước:");
             let counter = format!("{count}/2000 ký tự");
             if too_long {
-                ui.label(RichText::new(counter).color(theme::DANGER));
+                ui.label(RichText::new(counter).color(theme::palette().danger));
             } else {
                 theme::muted(ui, &counter);
             }
@@ -3278,7 +3393,7 @@ impl NicordApp {
         let status = self.status.clone();
         let username = dest.effective_username();
         std::thread::spawn(move || {
-            let rt = match tokio::runtime::Runtime::new() {
+            let rt = match shared_runtime() {
                 Ok(rt) => rt,
                 Err(e) => {
                     if let Ok(mut s) = status.lock() {
@@ -3289,6 +3404,11 @@ impl NicordApp {
             };
             let result =
                 rt.block_on(engine.send_once(&scenario, &sender, Some(&dest), &username, ""));
+            if result.is_ok() {
+                crate::notify::play(crate::notify::SoundEvent::SendSuccess);
+            } else {
+                crate::notify::play(crate::notify::SoundEvent::SendFailure);
+            }
             if let Ok(mut s) = status.lock() {
                 *s = match result {
                     Ok(id) if id.is_empty() => "Test sent! (webhook, no id returned)".to_string(),
@@ -3649,7 +3769,7 @@ impl NicordApp {
                 ui.separator();
                 ui.label(
                     RichText::new(format!("Đang tạm dừng: {}", draft.failure_state.label()))
-                        .color(theme::DANGER),
+                        .color(theme::palette().danger),
                 );
                 if !draft.last_error.is_empty() {
                     theme::muted(ui, &format!("Lỗi: {}", draft.last_error));
@@ -3927,18 +4047,20 @@ impl NicordApp {
                             channel.as_deref(),
                         )
                         .map(|rows| {
-                            let mut csv = String::from("time,scenario,status,detail\n");
-                            for (ts, name, status, detail) in rows {
+                            let mut csv = String::from("time,scenario,status,detail,message_id\n");
+                            for row in rows {
                                 // Proper CSV quoting + secret scrubbing
                                 // (QoL Q4): an export can never leak a
                                 // webhook URL, even if one ever reached
-                                // a log detail.
+                                // a log detail. Message ids are not
+                                // secrets and help match rows to Discord.
                                 csv.push_str(&format!(
-                                    "{},{},{},{}\n",
-                                    csv_escape(&ts),
-                                    csv_escape(&scrub_secrets(&name)),
-                                    csv_escape(&status),
-                                    csv_escape(&scrub_secrets(&detail))
+                                    "{},{},{},{},{}\n",
+                                    csv_escape(&row.created_at),
+                                    csv_escape(&scrub_secrets(&row.scenario_name)),
+                                    csv_escape(&row.status),
+                                    csv_escape(&scrub_secrets(&row.detail)),
+                                    csv_escape(&row.message_id)
                                 ));
                             }
                             std::fs::write(&path, csv)
@@ -3985,24 +4107,70 @@ impl NicordApp {
                         theme::muted(ui, "No logs yet — send history will appear here.");
                     });
                 } else {
+                    // Destinations for manual delete (Q13): a row is
+                    // deletable only when its destination still exists
+                    // with a URL, so the delete goes to the exact
+                    // webhook that sent it.
+                    let deletable: std::collections::HashSet<String> =
+                        if self.config.send_mode == SendMode::Webhook {
+                            self.store
+                                .load_destinations()
+                                .unwrap_or_default()
+                                .into_iter()
+                                .filter(|d| !d.encrypted_url.trim().is_empty())
+                                .map(|d| d.id)
+                                .collect()
+                        } else {
+                            std::collections::HashSet::new()
+                        };
                     theme::card(ui, |ui| {
                         egui::ScrollArea::vertical().show(ui, |ui| {
-                            for (ts, name, status, detail) in rows {
-                                let status_color = if status == "sent" {
-                                    theme::SUCCESS
-                                } else if status.contains("fail") || status.contains("error") {
-                                    theme::DANGER
+                            for row in rows {
+                                let status_color = if row.status == "sent" {
+                                    theme::palette().success
+                                } else if row.status.contains("fail")
+                                    || row.status.contains("error")
+                                {
+                                    theme::palette().danger
                                 } else {
-                                    theme::TEXT_SECONDARY
+                                    theme::palette().text_secondary
                                 };
                                 ui.horizontal(|ui| {
                                     ui.label(
-                                        RichText::new(&ts).monospace().color(theme::TEXT_MUTED),
+                                        RichText::new(&row.created_at)
+                                            .monospace()
+                                            .color(theme::palette().text_muted),
                                     );
-                                    ui.label(theme::semibold(&name, 15.0));
-                                    ui.label(RichText::new(&status).color(status_color));
+                                    ui.label(theme::semibold(&row.scenario_name, 15.0));
+                                    ui.label(
+                                        RichText::new(&row.status).color(status_color),
+                                    );
+                                    // Manual delete (Q13): webhook mode
+                                    // only, one message at a time, with
+                                    // confirmation. Never automatic.
+                                    let can_delete = row.status == "sent"
+                                        && !row.message_id.is_empty()
+                                        && deletable.contains(&row.destination_id);
+                                    if can_delete {
+                                        if self.pending_delete_log == Some(row.id) {
+                                            ui.label(
+                                                RichText::new("Xóa tin này khỏi Discord? Không hoàn tác được.")
+                                                    .color(theme::palette().danger),
+                                            );
+                                            if theme::danger_button(ui, "Xóa").clicked() {
+                                                self.pending_delete_log = None;
+                                                self.delete_log_message(row.clone());
+                                            }
+                                            if theme::ghost_button(ui, "Hủy").clicked() {
+                                                self.pending_delete_log = None;
+                                            }
+                                        } else if theme::ghost_button(ui, "Xóa tin").clicked()
+                                        {
+                                            self.pending_delete_log = Some(row.id);
+                                        }
+                                    }
                                 });
-                                theme::muted(ui, &detail);
+                                theme::muted(ui, &row.detail);
                                 ui.separator();
                             }
                         });
@@ -4013,6 +4181,85 @@ impl NicordApp {
                 ui.label(format!("Cannot load logs: {e}"));
             }
         }
+    }
+
+    /// Delete one sent Discord message (Q13), after the Logs UI
+    /// confirmation. Runs on a background thread: resolve the exact
+    /// destination that sent it, delete via its webhook, then write
+    /// an audit row (status "deleted") so the deletion itself is in
+    /// the history. A 404 means the message was already gone and is
+    /// reported honestly, with an audit row saying so. Nothing
+    /// automatic ever calls this: no engine, schedule, or bulk path.
+    fn delete_log_message(&mut self, row: crate::store::LogRow) {
+        let store = self.store.clone();
+        let status = self.status.clone();
+        std::thread::spawn(move || {
+            let fail = |msg: String| {
+                if let Ok(mut s) = status.lock() {
+                    *s = msg;
+                }
+            };
+            let dest = match store.load_destination(&row.destination_id) {
+                Ok(Some(d)) => d,
+                _ => {
+                    fail("Cannot delete: the destination no longer exists.".to_string());
+                    return;
+                }
+            };
+            let url = match crate::crypto::decrypt_token(&dest.encrypted_url)
+                .ok()
+                .and_then(|u| crate::webhook::parse_webhook_url(&u).ok())
+            {
+                Some(u) => u,
+                None => {
+                    fail("Cannot delete: the destination URL is unreadable.".to_string());
+                    return;
+                }
+            };
+            let client =
+                crate::webhook::WebhookClient::new(url, "").with_thread_id(&dest.thread_id);
+            let rt = match shared_runtime() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    fail(format!("cannot start runtime: {e}"));
+                    return;
+                }
+            };
+            let message_id = row.message_id.clone();
+            let result = rt.block_on(client.delete_message(&message_id));
+            let audit = |detail: String| {
+                let _ = store.log_send(&crate::scheduler::SendLogEntry {
+                    scenario_id: row.scenario_id.clone(),
+                    scenario_name: row.scenario_name.clone(),
+                    channel_id: row.channel_id.clone(),
+                    status: "deleted".into(),
+                    detail,
+                    message_id: message_id.clone(),
+                    destination_id: row.destination_id.clone(),
+                });
+            };
+            match result {
+                Ok(()) => {
+                    audit(format!(
+                        "User deleted Discord message {message_id} (log #{})",
+                        row.id
+                    ));
+                    fail(format!("Deleted message {message_id} from Discord."));
+                }
+                Err(crate::discord::DiscordError::NotFound(_)) => {
+                    audit(format!(
+                        "Delete requested for message {message_id} (log #{}): already gone (404)",
+                        row.id
+                    ));
+                    fail(format!(
+                        "Message {message_id} was already deleted on Discord."
+                    ));
+                }
+                Err(e) => {
+                    fail(format!("Delete failed: {e}"));
+                }
+            }
+        });
     }
 
     /// Backup card (Settings): export/import the whole config for
@@ -4091,6 +4338,10 @@ impl NicordApp {
                             };
                             match std::fs::write(&path, json) {
                                 Ok(()) => {
+                                    // Record the export for the startup
+                                    // health report's backup reminder.
+                                    self.config.last_export_at = chrono::Utc::now().to_rfc3339();
+                                    let _ = save_config(&self.config);
                                     self.set_status(&format!(
                                         "Config exported to {}",
                                         path.display()
@@ -4114,7 +4365,7 @@ impl NicordApp {
                     RichText::new(
                         "Dừng engine trước khi nhập (import thay thế cấu hình engine đang dùng).",
                     )
-                    .color(theme::DANGER),
+                    .color(theme::palette().danger),
                 );
             }
             ui.horizontal(|ui| {
@@ -4298,9 +4549,9 @@ impl NicordApp {
                         .map(|s| s.clone())
                         .unwrap_or_default();
                     let health_color = match health {
-                        WebhookHealth::Ok => theme::SUCCESS,
-                        WebhookHealth::Unknown => theme::TEXT_SECONDARY,
-                        _ => theme::DANGER,
+                        WebhookHealth::Ok => theme::palette().success,
+                        WebhookHealth::Unknown => theme::palette().text_secondary,
+                        _ => theme::palette().danger,
                     };
                     ui.label(
                         RichText::new(format!("Trạng thái: {}", health.label()))
@@ -4314,7 +4565,7 @@ impl NicordApp {
                             RichText::new(
                                 "Webhook đã bị xóa hoặc URL đã đổi. Tạo webhook mới trong Discord (Cài đặt kênh → Tích hợp → Webhook), dán URL mới bên dưới và lưu lại.",
                             )
-                            .color(theme::DANGER),
+                            .color(theme::palette().danger),
                         );
                     }
                     // Paused destinations (if any) are listed in the
@@ -4581,6 +4832,47 @@ impl NicordApp {
                     self.set_status("Language switched.");
                 }
             });
+            // Theme (Q12): instant switch, saved immediately.
+            ui.horizontal(|ui| {
+                ui.label("Giao diện:");
+                let mut choice = crate::theme::ThemeChoice::from_code(&self.config.theme);
+                egui::ComboBox::from_id_salt("ui_theme")
+                    .selected_text(match choice {
+                        crate::theme::ThemeChoice::Dark => "Tối",
+                        crate::theme::ThemeChoice::Light => "Sáng",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut choice, crate::theme::ThemeChoice::Dark, "Tối");
+                        ui.selectable_value(&mut choice, crate::theme::ThemeChoice::Light, "Sáng");
+                    });
+                if choice.code() != self.config.theme {
+                    self.config.theme = choice.code().to_string();
+                    let _ = save_config(&self.config);
+                    crate::theme::apply_theme(ui.ctx(), choice);
+                    self.set_status("Theme switched.");
+                }
+            });
+            // Notification sounds (Q11): instant toggles, saved immediately.
+            let sound_changed = ui
+                .checkbox(
+                    &mut self.config.sound_enabled,
+                    "Âm báo khi gửi lỗi hoặc kênh bị tạm dừng",
+                )
+                .changed()
+                | ui.checkbox(
+                    &mut self.config.sound_on_success,
+                    "Âm báo cả khi gửi thành công",
+                )
+                .changed();
+            if sound_changed {
+                let _ = save_config(&self.config);
+            }
+            ui.horizontal(|ui| {
+                if theme::ghost_button(ui, "Thử âm thanh").clicked() {
+                    crate::notify::play_preview();
+                }
+                theme::muted(ui, "Âm báo không bao giờ chặn việc gửi tin.");
+            });
             ui.add_space(8.0);
             if theme::primary_button(ui, t(self.lang(), "btn.save_settings")).clicked() {
                 // Clamp destination limits to their documented bounds.
@@ -4634,7 +4926,7 @@ impl NicordApp {
             ui.set_width(ui.available_width());
             ui.label(
                 RichText::new("Danger zone")
-                    .color(theme::DANGER)
+                    .color(theme::palette().danger)
                     .text_style(egui::TextStyle::Name("SectionTitle".into())),
             );
             if theme::danger_button(ui, "Delete all local data (token, scenarios)").clicked() {
@@ -4752,4 +5044,46 @@ impl NicordApp {
 
 fn ctx_request_repaint(ui: &mut egui::Ui) {
     ui.ctx().request_repaint();
+}
+
+/// Process-wide shared tokio runtime for UI-triggered blocking calls
+/// (token checks, webhook checks, test sends, deletes). Every call
+/// site used to build a fresh multi-thread runtime per click; the
+/// shared one is built once and reused. Safe because no call site
+/// ever blocks nested inside another `block_on` on this runtime:
+/// each handler blocks at most once, on the UI thread or on a
+/// spawned thread that does one call. See the perf notes in
+/// `docs/TECHNICAL.md` for the measured difference.
+fn shared_runtime() -> Result<&'static tokio::runtime::Runtime, String> {
+    static RT: std::sync::OnceLock<Result<tokio::runtime::Runtime, String>> =
+        std::sync::OnceLock::new();
+    RT.get_or_init(|| tokio::runtime::Runtime::new().map_err(|e| e.to_string()))
+        .as_ref()
+        .map_err(|e| e.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Perf harness (ignored: run with `cargo test -- --ignored`).
+    /// Compares building a fresh runtime per call against the shared
+    /// runtime. Prints, never asserts on timing.
+    #[test]
+    #[ignore]
+    fn bench_runtime_new_vs_shared() {
+        let _ = shared_runtime(); // warm up, excluded from timing
+        let n = 50u32;
+        let start = std::time::Instant::now();
+        for _ in 0..n {
+            let _rt = tokio::runtime::Runtime::new().unwrap();
+        }
+        let new_avg_us = start.elapsed().as_micros() as f64 / n as f64;
+        let start = std::time::Instant::now();
+        for _ in 0..n {
+            let _ = shared_runtime().unwrap();
+        }
+        let shared_avg_us = start.elapsed().as_micros() as f64 / n as f64;
+        eprintln!("Runtime::new: {new_avg_us:.1} µs/call; shared_runtime: {shared_avg_us:.1} µs/call ({n} calls each)");
+    }
 }

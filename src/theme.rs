@@ -31,40 +31,126 @@ use std::sync::Arc;
 // Palette
 // ---------------------------------------------------------------------------
 
-/// Window / central-panel background.
-pub const BG: Color32 = Color32::from_rgb(0x1E, 0x1F, 0x22);
-/// Left navigation sidebar background (darker than the main surface).
-pub const SIDEBAR_BG: Color32 = Color32::from_rgb(0x16, 0x17, 0x19);
-/// Card / panel surface (Discord secondary).
-pub const CARD: Color32 = Color32::from_rgb(0x2B, 0x2D, 0x31);
-/// Subtle card border.
-pub const CARD_BORDER: Color32 = Color32::from_rgb(0x3F, 0x41, 0x47);
-/// Default button background.
-pub const BTN_BG: Color32 = Color32::from_rgb(0x35, 0x37, 0x3C);
-/// Default button background on hover.
-pub const BTN_HOVER: Color32 = Color32::from_rgb(0x40, 0x42, 0x49);
-/// Text-edit background (darkest).
-pub const INPUT_BG: Color32 = Color32::from_rgb(0x11, 0x12, 0x14);
+/// One full set of theme colors. The dark palette is the original
+/// Discord-like look; the light palette is its counterpart. The
+/// accent colors (blurple, white) are identical in both and stay
+/// plain constants below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Palette {
+    /// Window / central-panel background.
+    pub bg: Color32,
+    /// Left navigation sidebar background.
+    pub sidebar_bg: Color32,
+    /// Card / panel surface.
+    pub card: Color32,
+    /// Subtle card border.
+    pub card_border: Color32,
+    /// Default button background.
+    pub btn_bg: Color32,
+    /// Default button background on hover.
+    pub btn_hover: Color32,
+    /// Text-edit background.
+    pub input_bg: Color32,
+    /// Primary text.
+    pub text: Color32,
+    /// Secondary text.
+    pub text_secondary: Color32,
+    /// Muted / hint text.
+    pub text_muted: Color32,
+    /// Danger (Emergency Stop, delete).
+    pub danger: Color32,
+    /// Success (sent, running).
+    pub success: Color32,
+    /// Warning (status banner, caution text).
+    pub warning: Color32,
+}
 
-/// Primary text.
-pub const TEXT: Color32 = Color32::from_rgb(0xF2, 0xF3, 0xF5);
-/// Secondary text.
-pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(0xB5, 0xBA, 0xC1);
-/// Muted / hint text.
-pub const TEXT_MUTED: Color32 = Color32::from_rgb(0x80, 0x84, 0x8E);
+/// Discord-like dark palette (the original look).
+pub const DARK_PALETTE: Palette = Palette {
+    bg: Color32::from_rgb(0x1E, 0x1F, 0x22),
+    sidebar_bg: Color32::from_rgb(0x16, 0x17, 0x19),
+    card: Color32::from_rgb(0x2B, 0x2D, 0x31),
+    card_border: Color32::from_rgb(0x3F, 0x41, 0x47),
+    btn_bg: Color32::from_rgb(0x35, 0x37, 0x3C),
+    btn_hover: Color32::from_rgb(0x40, 0x42, 0x49),
+    input_bg: Color32::from_rgb(0x11, 0x12, 0x14),
+    text: Color32::from_rgb(0xF2, 0xF3, 0xF5),
+    text_secondary: Color32::from_rgb(0xB5, 0xBA, 0xC1),
+    text_muted: Color32::from_rgb(0x80, 0x84, 0x8E),
+    danger: Color32::from_rgb(0xED, 0x42, 0x45),
+    success: Color32::from_rgb(0x57, 0xF2, 0x87),
+    warning: Color32::from_rgb(0xFA, 0xA8, 0x1A),
+};
+
+/// Light palette (Discord light surfaces, dark text). The status
+/// colors are darkened so small text stays readable on white.
+pub const LIGHT_PALETTE: Palette = Palette {
+    bg: Color32::from_rgb(0xF2, 0xF3, 0xF5),
+    sidebar_bg: Color32::from_rgb(0xE3, 0xE5, 0xE8),
+    card: Color32::from_rgb(0xFF, 0xFF, 0xFF),
+    card_border: Color32::from_rgb(0xC9, 0xCD, 0xD2),
+    btn_bg: Color32::from_rgb(0xE3, 0xE5, 0xE8),
+    btn_hover: Color32::from_rgb(0xD4, 0xD7, 0xDC),
+    input_bg: Color32::from_rgb(0xE3, 0xE5, 0xE8),
+    text: Color32::from_rgb(0x06, 0x06, 0x07),
+    text_secondary: Color32::from_rgb(0x4E, 0x50, 0x58),
+    text_muted: Color32::from_rgb(0x6D, 0x6F, 0x78),
+    danger: Color32::from_rgb(0xD9, 0x2D, 0x20),
+    success: Color32::from_rgb(0x24, 0x80, 0x46),
+    warning: Color32::from_rgb(0x9A, 0x6A, 0x00),
+};
 
 /// Discord blurple — primary accent (matches the app icon).
 pub const ACCENT: Color32 = Color32::from_rgb(0x58, 0x65, 0xF2);
 /// Blurple gradient end (matches the app icon).
 pub const ACCENT_LIGHT: Color32 = Color32::from_rgb(0x7B, 0x61, 0xFF);
-/// Danger (Emergency Stop, delete).
-pub const DANGER: Color32 = Color32::from_rgb(0xED, 0x42, 0x45);
-/// Success (sent, running).
-pub const SUCCESS: Color32 = Color32::from_rgb(0x57, 0xF2, 0x87);
-/// Warning (status banner, caution text).
-pub const WARNING: Color32 = Color32::from_rgb(0xFA, 0xA8, 0x1A);
 
 pub const WHITE: Color32 = Color32::WHITE;
+
+/// The user's theme choice. Stored as a code string in config
+/// ("dark"/"light"), mirroring the language code in `i18n`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThemeChoice {
+    #[default]
+    Dark,
+    Light,
+}
+
+impl ThemeChoice {
+    /// Unknown codes fall back to Dark, like unknown languages fall
+    /// back to Vietnamese.
+    pub fn from_code(code: &str) -> Self {
+        match code.trim().to_ascii_lowercase().as_str() {
+            "light" => Self::Light,
+            _ => Self::Dark,
+        }
+    }
+
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Dark => "dark",
+            Self::Light => "light",
+        }
+    }
+
+    pub fn palette(self) -> Palette {
+        match self {
+            Self::Dark => DARK_PALETTE,
+            Self::Light => LIGHT_PALETTE,
+        }
+    }
+}
+
+/// The palette currently in effect for the whole process (one window,
+/// one theme). Set by `apply_theme`; read by every helper and screen
+/// through `palette()`. A lock poisoning falls back to the dark
+/// palette rather than panicking the UI.
+static CURRENT_PALETTE: std::sync::RwLock<Palette> = std::sync::RwLock::new(DARK_PALETTE);
+
+/// The palette currently in effect.
+pub fn palette() -> Palette {
+    CURRENT_PALETTE.read().map(|p| *p).unwrap_or(DARK_PALETTE)
+}
 
 // ---------------------------------------------------------------------------
 // Fonts
@@ -132,12 +218,17 @@ fn install_fonts(ctx: &egui::Context) -> bool {
 // Theme application
 // ---------------------------------------------------------------------------
 
-/// Install fonts + visuals + text styles + spacing on `ctx`.
-/// Call once at startup (from the eframe creation closure).
-pub fn apply_theme(ctx: &egui::Context) {
+/// Install fonts + visuals + text styles + spacing on `ctx` for the
+/// given theme. Called once at startup (from the eframe creation
+/// closure) and again whenever the user switches theme in Settings
+/// (font installation is idempotent, so re-running it is harmless).
+pub fn apply_theme(ctx: &egui::Context, choice: ThemeChoice) {
+    if let Ok(mut current) = CURRENT_PALETTE.write() {
+        *current = choice.palette();
+    }
     let semibold_ok = install_fonts(ctx);
     let mut style = (*ctx.style()).clone();
-    apply_visuals(&mut style, semibold_ok);
+    apply_visuals(&mut style, semibold_ok, choice);
     ctx.set_style(style);
 }
 
@@ -152,7 +243,8 @@ fn widget_visuals(bg: Color32, weak_bg: Color32, stroke: Stroke, fg: Color32) ->
     }
 }
 
-fn apply_visuals(style: &mut Style, semibold_ok: bool) {
+fn apply_visuals(style: &mut Style, semibold_ok: bool, choice: ThemeChoice) {
+    let p = choice.palette();
     let heading_family = if semibold_ok {
         FontFamily::Name(FONT_SEMIBOLD.into())
     } else {
@@ -195,42 +287,52 @@ fn apply_visuals(style: &mut Style, semibold_ok: bool) {
     style.spacing.window_margin = egui::Margin::same(12);
 
     // -- Colors -------------------------------------------------------------
+    let hover_stroke = if choice == ThemeChoice::Dark {
+        Color32::from_rgb(0x4E, 0x50, 0x57)
+    } else {
+        Color32::from_rgb(0xB5, 0xB9, 0xC0)
+    };
     let v = &mut style.visuals;
-    v.dark_mode = true;
-    v.override_text_color = Some(TEXT);
-    v.window_fill = BG;
-    v.panel_fill = BG;
-    v.window_stroke = Stroke::new(1.0_f32, CARD_BORDER);
+    v.dark_mode = choice == ThemeChoice::Dark;
+    v.override_text_color = Some(p.text);
+    v.window_fill = p.bg;
+    v.panel_fill = p.bg;
+    v.window_stroke = Stroke::new(1.0_f32, p.card_border);
     v.window_corner_radius = CornerRadius::same(8);
-    v.faint_bg_color = CARD;
-    v.extreme_bg_color = INPUT_BG;
-    v.code_bg_color = INPUT_BG;
-    v.warn_fg_color = WARNING;
-    v.error_fg_color = DANGER;
+    v.faint_bg_color = p.card;
+    v.extreme_bg_color = p.input_bg;
+    v.code_bg_color = p.input_bg;
+    v.warn_fg_color = p.warning;
+    v.error_fg_color = p.danger;
     v.hyperlink_color = ACCENT_LIGHT;
     v.selection = Selection {
         bg_fill: ACCENT,
         stroke: Stroke::new(1.0_f32, WHITE),
     };
     v.widgets.noninteractive = widget_visuals(
-        CARD,
+        p.card,
         Color32::TRANSPARENT,
-        Stroke::new(1.0_f32, CARD_BORDER),
-        TEXT,
+        Stroke::new(1.0_f32, p.card_border),
+        p.text,
     );
-    v.widgets.inactive = widget_visuals(BTN_BG, BTN_BG, Stroke::new(1.0_f32, CARD_BORDER), TEXT);
+    v.widgets.inactive = widget_visuals(
+        p.btn_bg,
+        p.btn_bg,
+        Stroke::new(1.0_f32, p.card_border),
+        p.text,
+    );
     v.widgets.hovered = widget_visuals(
-        BTN_HOVER,
-        BTN_HOVER,
-        Stroke::new(1.0_f32, Color32::from_rgb(0x4E, 0x50, 0x57)),
-        TEXT,
+        p.btn_hover,
+        p.btn_hover,
+        Stroke::new(1.0_f32, hover_stroke),
+        p.text,
     );
     v.widgets.active = widget_visuals(ACCENT, ACCENT, Stroke::new(1.0_f32, ACCENT), WHITE);
     v.widgets.open = widget_visuals(
-        BTN_HOVER,
-        BTN_HOVER,
-        Stroke::new(1.0_f32, Color32::from_rgb(0x4E, 0x50, 0x57)),
-        TEXT,
+        p.btn_hover,
+        p.btn_hover,
+        Stroke::new(1.0_f32, hover_stroke),
+        p.text,
     );
 }
 
@@ -238,11 +340,12 @@ fn apply_visuals(style: &mut Style, semibold_ok: bool) {
 // Layout helpers (shared by all screens)
 // ---------------------------------------------------------------------------
 
-/// Rounded card frame: dark surface, subtle border, generous padding.
+/// Rounded card frame: theme surface, subtle border, generous padding.
 pub fn card_frame() -> egui::Frame {
+    let p = palette();
     egui::Frame::new()
-        .fill(CARD)
-        .stroke(Stroke::new(1.0_f32, CARD_BORDER))
+        .fill(p.card)
+        .stroke(Stroke::new(1.0_f32, p.card_border))
         .corner_radius(10)
         .inner_margin(14)
 }
@@ -250,18 +353,20 @@ pub fn card_frame() -> egui::Frame {
 /// Slim card frame (tighter padding) for the Builder action bar, where
 /// every pixel of height counts in the 700 px window.
 pub fn slim_card_frame() -> egui::Frame {
+    let p = palette();
     egui::Frame::new()
-        .fill(CARD)
-        .stroke(Stroke::new(1.0_f32, CARD_BORDER))
+        .fill(p.card)
+        .stroke(Stroke::new(1.0_f32, p.card_border))
         .corner_radius(10)
         .inner_margin(10)
 }
 
 /// Card with a red border (warnings, danger zone).
 pub fn danger_frame() -> egui::Frame {
+    let p = palette();
     egui::Frame::new()
-        .fill(CARD)
-        .stroke(Stroke::new(1.0_f32, DANGER))
+        .fill(p.card)
+        .stroke(Stroke::new(1.0_f32, p.danger))
         .corner_radius(10)
         .inner_margin(14)
 }
@@ -285,7 +390,7 @@ pub fn section_title(ui: &mut egui::Ui, text: &str) {
 
 /// Small muted hint / secondary text.
 pub fn muted(ui: &mut egui::Ui, text: &str) {
-    ui.label(RichText::new(text).small().color(TEXT_MUTED));
+    ui.label(RichText::new(text).small().color(palette().text_muted));
 }
 
 /// SemiBold text at any size (headings, numbers, emphasis).
@@ -302,15 +407,16 @@ pub fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
 
 /// Danger button (red fill, white text) — Emergency Stop, delete.
 pub fn danger_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
-    ui.add(egui::Button::new(RichText::new(text).color(WHITE)).fill(DANGER))
+    ui.add(egui::Button::new(RichText::new(text).color(WHITE)).fill(palette().danger))
 }
 
 /// Secondary button (transparent fill, subtle border).
 pub fn ghost_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    let p = palette();
     ui.add(
-        egui::Button::new(RichText::new(text).color(TEXT_SECONDARY))
+        egui::Button::new(RichText::new(text).color(p.text_secondary))
             .fill(Color32::TRANSPARENT)
-            .stroke(Stroke::new(1.0_f32, CARD_BORDER)),
+            .stroke(Stroke::new(1.0_f32, p.card_border)),
     )
 }
 
@@ -320,7 +426,8 @@ pub fn nav_button(ui: &mut egui::Ui, label: &str, active: bool) -> egui::Respons
     let btn = if active {
         egui::Button::new(semibold(label, 15.0).color(WHITE)).fill(ACCENT)
     } else {
-        egui::Button::new(RichText::new(label).color(TEXT_SECONDARY)).fill(Color32::TRANSPARENT)
+        egui::Button::new(RichText::new(label).color(palette().text_secondary))
+            .fill(Color32::TRANSPARENT)
     };
     ui.add_sized([ui.available_width(), 36.0], btn)
 }
@@ -330,7 +437,7 @@ pub fn stat_card(ui: &mut egui::Ui, label: &str, value: &str) {
     card_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.label(RichText::new(value).text_style(TextStyle::Name("BigNumber".into())));
-        ui.label(RichText::new(label).small().color(TEXT_MUTED));
+        ui.label(RichText::new(label).small().color(palette().text_muted));
     });
 }
 
@@ -353,12 +460,13 @@ pub fn progress_bar(ui: &mut egui::Ui, frac: f32, text: &str) {
         egui::Sense::hover(),
     );
     let painter = ui.painter();
+    let p = palette();
     // Track.
-    painter.rect_filled(rect, CornerRadius::same(6), INPUT_BG);
+    painter.rect_filled(rect, CornerRadius::same(6), p.input_bg);
     painter.rect_stroke(
         rect,
         CornerRadius::same(6),
-        Stroke::new(1.0_f32, CARD_BORDER),
+        Stroke::new(1.0_f32, p.card_border),
         egui::StrokeKind::Inside,
     );
     // Fill — nothing at 0, so no pill.
@@ -383,13 +491,49 @@ pub fn progress_bar(ui: &mut egui::Ui, frac: f32, text: &str) {
         egui::Align2::CENTER_CENTER,
         text,
         FontId::new(12.0, FontFamily::Proportional),
-        TEXT_SECONDARY,
+        p.text_secondary,
     );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn theme_choice_codes_and_palettes() {
+        assert_eq!(ThemeChoice::from_code("dark"), ThemeChoice::Dark);
+        assert_eq!(ThemeChoice::from_code("LIGHT"), ThemeChoice::Light);
+        assert_eq!(ThemeChoice::from_code("bogus"), ThemeChoice::Dark);
+        assert_eq!(ThemeChoice::from_code(""), ThemeChoice::Dark);
+        assert_eq!(ThemeChoice::Dark.code(), "dark");
+        assert_eq!(ThemeChoice::Light.code(), "light");
+        assert_eq!(ThemeChoice::Dark.palette(), DARK_PALETTE);
+        assert_eq!(ThemeChoice::Light.palette(), LIGHT_PALETTE);
+        assert_ne!(DARK_PALETTE, LIGHT_PALETTE);
+        // The light theme must actually be light, the dark one dark.
+        assert!(LIGHT_PALETTE.bg.r() > 200);
+        assert!(DARK_PALETTE.bg.r() < 60);
+        assert!(LIGHT_PALETTE.text.r() < 60);
+        assert!(DARK_PALETTE.text.r() > 200);
+    }
+
+    #[test]
+    fn apply_theme_light_sets_light_visuals() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            apply_theme(ctx, ThemeChoice::Light);
+        });
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            assert!(!ctx.style().visuals.dark_mode);
+            assert_eq!(ctx.style().visuals.panel_fill, LIGHT_PALETTE.bg);
+            assert_eq!(palette(), LIGHT_PALETTE);
+        });
+        // Restore dark so other tests (and the process) see the default.
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            apply_theme(ctx, ThemeChoice::Dark);
+        });
+        assert_eq!(palette(), DARK_PALETTE);
+    }
 
     #[test]
     fn embedded_fonts_decode_and_look_like_ttf() {
@@ -409,7 +553,7 @@ mod tests {
         // Pass 1: install the theme. Fonts set via `set_fonts` are
         // (re)loaded on the *next* pass, so glyph checks need pass 2.
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            apply_theme(ctx);
+            apply_theme(ctx, ThemeChoice::Dark);
         });
         // Pass 2: fonts are live now — assert sizes and glyph coverage.
         let _ = ctx.run(egui::RawInput::default(), |ctx| {

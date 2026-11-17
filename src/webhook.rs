@@ -277,6 +277,40 @@ impl WebhookClient {
         }
     }
 
+    /// Delete one message sent through this webhook (Q13, manual
+    /// only — the Logs screen calls this after explicit confirmation;
+    /// nothing automatic ever calls it). Discord returns 204 and
+    /// honours `thread_id` for thread messages. A 404 means the
+    /// message is already gone (or never existed under this webhook)
+    /// and surfaces as `NotFound` so the UI can say so honestly.
+    /// The id must be digits-only (a snowflake): it goes into the
+    /// URL path, so anything else is rejected before any request.
+    pub async fn delete_message(&self, message_id: &str) -> Result<(), DiscordError> {
+        let id = message_id.trim();
+        if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(DiscordError::Other(
+                "message id must be a numeric Discord snowflake".into(),
+            ));
+        }
+        let mut url = format!("{}/messages/{id}", self.url.base_url);
+        if !self.thread_id.is_empty() {
+            url.push_str(&format!("?thread_id={}", self.thread_id));
+        }
+        let resp = self
+            .http
+            .delete(url)
+            .send()
+            .await
+            .map_err(|e| DiscordError::Other(format!("network error: {e}")))?;
+        match resp.status() {
+            StatusCode::NO_CONTENT | StatusCode::OK => Ok(()),
+            s => Err(discord_error_from_status(
+                s,
+                &resp.text().await.unwrap_or_default(),
+            )),
+        }
+    }
+
     /// GET the webhook object (validation + display: name, channel).
     pub async fn get_webhook(&self) -> Result<WebhookInfo, DiscordError> {
         let resp = self
