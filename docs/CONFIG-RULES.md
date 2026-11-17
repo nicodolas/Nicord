@@ -57,6 +57,19 @@ Rules for adding a persisted field:
    that the new field round-trips.
 5. Document it in `TECHNICAL.md` (and here, if it changes the rules).
 
+Fields added after the initial rules, each evaluated under §1:
+
+- `ui_scale`, `start_minimized`, `window_width`, `window_height`,
+  `window_x`, `window_y` (`AppConfig`, Group 2): a chosen font
+  size, start-minimized preference, and window placement are
+  plainly expected to survive restarts — persisted. They ride
+  along in exports as part of `AppConfig`; a foreign window
+  geometry is clamped on load, so importing it on another
+  machine is harmless.
+- Deliberately NOT persisted: the Builder search query (a
+  transient filter — nobody expects it back after a restart)
+  and keyboard shortcuts (fixed bindings, no state to save).
+
 ## 3. Export / import must cover every persisted setting
 
 The export format (`src/backup.rs`, `format: "nicord-export"`,

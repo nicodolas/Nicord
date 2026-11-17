@@ -51,7 +51,8 @@ Webhook mode (same tick, queue, cap, and retry policy; simpler send):
 
 ## Modules
 
-- `main.rs` — eframe window (1100×700), tracing init, store open.
+- `main.rs` — eframe window (1100×700 default; remembered
+  geometry restored, clamped), tracing init, store open.
 - `app.rs` — egui screens. Onboarding shows the red ToS warning first and
   requires an explicit accept checkbox before token entry.
 - `scenario.rs` — scenario JSON (schemaVersion 1), schedules, node kinds,
@@ -85,14 +86,16 @@ Webhook mode (same tick, queue, cap, and retry policy; simpler send):
 - `spintax.rs` — spin-text + message variation (user-token mode only;
   skipped in webhook mode).
 - `theme.rs` — two palettes (Dark/Light) behind one `Palette`
-  struct + `ThemeChoice`; the current palette is process-wide
-  (`palette()`), applied via `apply_theme`. Embedded fonts.
+  struct + `ThemeChoice`, and three text sizes via `UiScale`;
+  the current palette is process-wide (`palette()`), applied via
+  `apply_theme`. Embedded fonts.
 - `notify.rs` — notification sounds: code-generated WAV beeps via
   the platform player, throttled, best-effort, never blocking.
   Settings mirror from `AppConfig` into a process-wide cell.
 - `health.rs` — startup health report: pure offline checks over
   config + destinations + scenarios; no network calls.
-- `tray.rs` — Windows-only system tray (see below).
+- `tray.rs` — Windows-only system tray: show, open Dashboard,
+  engine pause/resume (label follows engine state), quit.
 - `autostart.rs` — real OS autostart (Windows Run key / Linux XDG).
 - `updater.rs` — in-app auto-update from GitHub Releases.
 - `crypto.rs` — `machine_key()` = SHA-256(`nicord-machine-key-v1` +

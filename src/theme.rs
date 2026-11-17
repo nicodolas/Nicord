@@ -141,6 +141,44 @@ impl ThemeChoice {
     }
 }
 
+/// UI text size. Only the text sizes scale; spacing and padding
+/// stay fixed so layouts never break. Unknown codes fall back to
+/// Medium, like unknown themes fall back to Dark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UiScale {
+    Small,
+    #[default]
+    Medium,
+    Large,
+}
+
+impl UiScale {
+    pub fn from_code(code: &str) -> Self {
+        match code.trim().to_ascii_lowercase().as_str() {
+            "small" => Self::Small,
+            "large" => Self::Large,
+            _ => Self::Medium,
+        }
+    }
+
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Small => "small",
+            Self::Medium => "medium",
+            Self::Large => "large",
+        }
+    }
+
+    /// Multiplier applied to every text size in `apply_visuals`.
+    pub fn factor(self) -> f32 {
+        match self {
+            Self::Small => 0.875,
+            Self::Medium => 1.0,
+            Self::Large => 1.15,
+        }
+    }
+}
+
 /// The palette currently in effect for the whole process (one window,
 /// one theme). Set by `apply_theme`; read by every helper and screen
 /// through `palette()`. A lock poisoning falls back to the dark
@@ -222,13 +260,13 @@ fn install_fonts(ctx: &egui::Context) -> bool {
 /// given theme. Called once at startup (from the eframe creation
 /// closure) and again whenever the user switches theme in Settings
 /// (font installation is idempotent, so re-running it is harmless).
-pub fn apply_theme(ctx: &egui::Context, choice: ThemeChoice) {
+pub fn apply_theme(ctx: &egui::Context, choice: ThemeChoice, scale: UiScale) {
     if let Ok(mut current) = CURRENT_PALETTE.write() {
         *current = choice.palette();
     }
     let semibold_ok = install_fonts(ctx);
     let mut style = (*ctx.style()).clone();
-    apply_visuals(&mut style, semibold_ok, choice);
+    apply_visuals(&mut style, semibold_ok, choice, scale.factor());
     ctx.set_style(style);
 }
 
@@ -243,7 +281,7 @@ fn widget_visuals(bg: Color32, weak_bg: Color32, stroke: Stroke, fg: Color32) ->
     }
 }
 
-fn apply_visuals(style: &mut Style, semibold_ok: bool, choice: ThemeChoice) {
+fn apply_visuals(style: &mut Style, semibold_ok: bool, choice: ThemeChoice, scale: f32) {
     let p = choice.palette();
     let heading_family = if semibold_ok {
         FontFamily::Name(FONT_SEMIBOLD.into())
@@ -251,33 +289,34 @@ fn apply_visuals(style: &mut Style, semibold_ok: bool, choice: ThemeChoice) {
         FontFamily::Proportional
     };
 
-    // -- Text sizes ---------------------------------------------------------
+    // -- Text sizes (all multiplied by the UI scale) ------------------------
     style.text_styles.insert(
         TextStyle::Heading,
-        FontId::new(24.0, heading_family.clone()),
+        FontId::new(24.0 * scale, heading_family.clone()),
     );
-    style
-        .text_styles
-        .insert(TextStyle::Body, FontId::new(15.0, FontFamily::Proportional));
+    style.text_styles.insert(
+        TextStyle::Body,
+        FontId::new(15.0 * scale, FontFamily::Proportional),
+    );
     style.text_styles.insert(
         TextStyle::Button,
-        FontId::new(15.0, FontFamily::Proportional),
+        FontId::new(15.0 * scale, FontFamily::Proportional),
     );
     style.text_styles.insert(
         TextStyle::Small,
-        FontId::new(13.0, FontFamily::Proportional),
+        FontId::new(13.0 * scale, FontFamily::Proportional),
     );
     style.text_styles.insert(
         TextStyle::Monospace,
-        FontId::new(13.0, FontFamily::Monospace),
+        FontId::new(13.0 * scale, FontFamily::Monospace),
     );
     style.text_styles.insert(
         TextStyle::Name("SectionTitle".into()),
-        FontId::new(17.0, heading_family.clone()),
+        FontId::new(17.0 * scale, heading_family.clone()),
     );
     style.text_styles.insert(
         TextStyle::Name("BigNumber".into()),
-        FontId::new(28.0, heading_family),
+        FontId::new(28.0 * scale, heading_family),
     );
 
     // -- Spacing ------------------------------------------------------------
@@ -518,10 +557,40 @@ mod tests {
     }
 
     #[test]
+    fn ui_scale_from_code_and_factors() {
+        assert_eq!(UiScale::from_code("small"), UiScale::Small);
+        assert_eq!(UiScale::from_code("LARGE"), UiScale::Large);
+        assert_eq!(UiScale::from_code("bogus"), UiScale::Medium);
+        assert_eq!(UiScale::from_code(""), UiScale::Medium);
+        assert_eq!(UiScale::Small.code(), "small");
+        assert_eq!(UiScale::Medium.code(), "medium");
+        assert_eq!(UiScale::Large.code(), "large");
+        assert!(UiScale::Small.factor() < 1.0);
+        assert_eq!(UiScale::Medium.factor(), 1.0);
+        assert!(UiScale::Large.factor() > 1.0);
+    }
+
+    #[test]
+    fn apply_theme_scales_text_sizes() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            apply_theme(ctx, ThemeChoice::Dark, UiScale::Large);
+        });
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let body = ctx.style().text_styles[&TextStyle::Body].size;
+            assert!((body - 15.0 * UiScale::Large.factor()).abs() < f32::EPSILON);
+        });
+        // Restore medium so other tests see the default sizes.
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            apply_theme(ctx, ThemeChoice::Dark, UiScale::Medium);
+        });
+    }
+
+    #[test]
     fn apply_theme_light_sets_light_visuals() {
         let ctx = egui::Context::default();
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            apply_theme(ctx, ThemeChoice::Light);
+            apply_theme(ctx, ThemeChoice::Light, UiScale::Medium);
         });
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             assert!(!ctx.style().visuals.dark_mode);
@@ -530,7 +599,7 @@ mod tests {
         });
         // Restore dark so other tests (and the process) see the default.
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            apply_theme(ctx, ThemeChoice::Dark);
+            apply_theme(ctx, ThemeChoice::Dark, UiScale::Medium);
         });
         assert_eq!(palette(), DARK_PALETTE);
     }
@@ -553,7 +622,7 @@ mod tests {
         // Pass 1: install the theme. Fonts set via `set_fonts` are
         // (re)loaded on the *next* pass, so glyph checks need pass 2.
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            apply_theme(ctx, ThemeChoice::Dark);
+            apply_theme(ctx, ThemeChoice::Dark, UiScale::Medium);
         });
         // Pass 2: fonts are live now — assert sizes and glyph coverage.
         let _ = ctx.run(egui::RawInput::default(), |ctx| {

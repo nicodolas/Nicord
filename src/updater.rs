@@ -567,7 +567,11 @@ pub fn prepare_install(zip_path: &Path) -> Result<InstallPlan, String> {
 /// Single-quote a value for POSIX sh: wrap it in `'...'`, escaping
 /// an embedded quote as `'\''`. The result can be interpolated
 /// into a script safely — `$`, backticks, and newlines inside
-/// single quotes are literal.
+/// single quotes are literal. Compiled on non-Windows targets
+/// (where the `.sh` script needs it) and in tests (where its
+/// behaviour is verified on every platform); without the gate,
+/// Windows clippy fails on dead code (`-D warnings`).
+#[cfg(any(not(target_os = "windows"), test))]
 fn sh_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }

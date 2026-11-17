@@ -65,6 +65,7 @@ Bạn chỉ cần mở app, soạn nội dung, đặt lịch, rồi để app ch
 - Lịch sử gửi đầy đủ, lọc theo từ khóa, trạng thái, kịch bản và kênh; xuất ra file CSV.
 - Xóa một tin đã gửi ngay từ lịch sử — chỉ khi bạn bấm và xác nhận.
 - Âm báo khi gửi lỗi hoặc kênh bị tạm dừng, bật/tắt tùy ý.
+- Tìm kiếm kịch bản, bật/tắt hàng loạt, và phím tắt cho các thao tác thường dùng.
 
 ### Mang cấu hình theo máy
 
@@ -73,7 +74,8 @@ Bạn chỉ cần mở app, soạn nội dung, đặt lịch, rồi để app ch
 ### Cá nhân hóa
 
 - Giao diện tiếng Việt và English, chuyển ngay lập tức.
-- Giao diện Tối và Sáng.
+- Giao diện Tối và Sáng, cỡ chữ Nhỏ/Vừa/Lớn.
+- Cửa sổ tự ghi nhớ kích thước và vị trí, có thể mở thu nhỏ khi khởi động.
 
 ---
 

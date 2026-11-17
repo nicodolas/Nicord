@@ -79,6 +79,9 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
         (Lang::En, "builder.embed") => "Embed (optional)",
         (Lang::En, "builder.messages") => "Messages",
         (Lang::En, "builder.your_scenarios") => "Your scenarios",
+        (Lang::En, "builder.search_hint") => "Search scenarios…",
+        (Lang::En, "builder.enable_all") => "Enable all",
+        (Lang::En, "builder.disable_all") => "Disable all",
         // Destinations.
         (Lang::En, "dest.list") => "Destination list",
         (Lang::En, "dest.new") => "+ Add destination",
@@ -94,6 +97,13 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
         (Lang::En, "settings.general") => "General",
         (Lang::En, "settings.updates") => "Updates",
         (Lang::En, "settings.language") => "Language",
+        (Lang::En, "settings.font_size") => "Font size",
+        (Lang::En, "settings.font_small") => "Small",
+        (Lang::En, "settings.font_medium") => "Medium",
+        (Lang::En, "settings.font_large") => "Large",
+        (Lang::En, "settings.start_minimized") => "Start minimized",
+        (Lang::En, "settings.shortcuts") => "Keyboard shortcuts",
+        (Lang::En, "settings.reset_window") => "Reset window size",
         // Vietnamese (source strings).
         (Lang::Vi, "nav.dashboard") => "Dashboard",
         (Lang::Vi, "nav.builder") => "Builder",
@@ -135,6 +145,9 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
         (Lang::Vi, "builder.embed") => "Embed (tùy chọn)",
         (Lang::Vi, "builder.messages") => "Messages",
         (Lang::Vi, "builder.your_scenarios") => "Your scenarios",
+        (Lang::Vi, "builder.search_hint") => "Tìm kịch bản…",
+        (Lang::Vi, "builder.enable_all") => "Bật tất cả",
+        (Lang::Vi, "builder.disable_all") => "Tắt tất cả",
         (Lang::Vi, "dest.list") => "Danh sách đích đến",
         (Lang::Vi, "dest.new") => "+ Thêm đích đến",
         (Lang::Vi, "dest.edit") => "Sửa đích đến",
@@ -148,6 +161,13 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
         (Lang::Vi, "settings.general") => "General",
         (Lang::Vi, "settings.updates") => "Cập nhật",
         (Lang::Vi, "settings.language") => "Ngôn ngữ",
+        (Lang::Vi, "settings.font_size") => "Cỡ chữ",
+        (Lang::Vi, "settings.font_small") => "Nhỏ",
+        (Lang::Vi, "settings.font_medium") => "Vừa",
+        (Lang::Vi, "settings.font_large") => "Lớn",
+        (Lang::Vi, "settings.start_minimized") => "Mở thu nhỏ khi khởi động",
+        (Lang::Vi, "settings.shortcuts") => "Phím tắt",
+        (Lang::Vi, "settings.reset_window") => "Đặt lại kích thước cửa sổ",
         // Unknown key: visible, not silent.
         (_, key) => {
             // `key` is not 'static, so return a fixed marker.
@@ -175,6 +195,8 @@ mod tests {
         assert_eq!(t(Lang::Vi, "nav.destinations"), "Đích đến");
         assert_eq!(t(Lang::En, "nav.destinations"), "Destinations");
         assert_eq!(t(Lang::En, "settings.language"), "Language");
+        assert_eq!(t(Lang::Vi, "builder.enable_all"), "Bật tất cả");
+        assert_eq!(t(Lang::En, "settings.font_size"), "Font size");
         assert_eq!(t(Lang::Vi, "no.such.key"), "???");
     }
 }

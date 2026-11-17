@@ -135,6 +135,27 @@ pub struct AppConfig {
     /// Missing in old config.json files → true.
     #[serde(default = "default_true")]
     pub auto_check_updates: bool,
+    /// UI text size code ("small" / "medium" default / "large").
+    /// Applied instantly; unknown codes fall back to Medium
+    /// (see `theme::UiScale`).
+    #[serde(default = "default_ui_scale")]
+    pub ui_scale: String,
+    /// Start with the window minimized (the first frame sends the
+    /// minimize command). Useful with autostart + tray.
+    #[serde(default)]
+    pub start_minimized: bool,
+    /// Remembered window geometry. 0.0 on all four means "unset"
+    /// (first run, or after a reset): the default size/position
+    /// applies. Saved on exit and on hide-to-tray, restored at
+    /// startup, clamped by `clamp_window_geometry` in main.rs.
+    #[serde(default)]
+    pub window_width: f32,
+    #[serde(default)]
+    pub window_height: f32,
+    #[serde(default)]
+    pub window_x: f32,
+    #[serde(default)]
+    pub window_y: f32,
 }
 
 impl Default for AppConfig {
@@ -171,6 +192,12 @@ impl Default for AppConfig {
             sound_enabled: true,
             sound_on_success: false,
             last_export_at: String::new(),
+            ui_scale: default_ui_scale(),
+            start_minimized: false,
+            window_width: 0.0,
+            window_height: 0.0,
+            window_x: 0.0,
+            window_y: 0.0,
         }
     }
 }
@@ -212,6 +239,10 @@ fn default_language() -> String {
 
 fn default_theme() -> String {
     "dark".to_string()
+}
+
+fn default_ui_scale() -> String {
+    "medium".to_string()
 }
 
 pub fn config_dir() -> PathBuf {

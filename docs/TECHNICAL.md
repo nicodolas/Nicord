@@ -350,7 +350,13 @@ treated as "no update" and logged quietly — no error dialog.
   `cargo check --release` on **Linux, Windows, and macOS** for
   every push to `main`. The matrix exists because Windows-only
   code (`src/tray.rs`, `winreg`) is invisible to a Linux build;
-  before the matrix, no automation ever compiled it.
+  before the matrix, no automation ever compiled it. The first
+  matrix run (run #56, for the Packages A–D tree) caught exactly
+  this class of bug: `sh_quote` in `src/updater.rs` is only used
+  by the `.sh` script branch, so Windows clippy failed it as
+  dead code under `-D warnings`. It is now gated
+  `#[cfg(any(not(target_os = "windows"), test))]`, mirroring
+  `validate_bat_value`'s gate on the Windows side.
 - Releases are cut from **tags on `main`** (no release branch):
   bump `version` in `Cargo.toml`, commit on `main`, then
   `git tag vX.Y.Z && git push origin vX.Y.Z`. The release workflow
@@ -630,6 +636,54 @@ persist it — and include it in export/import. Full rules:
   struct now has a manual `Default` using the same default
   functions, guarded by `default_matches_serde_defaults`, which
   compares `Default` against deserializing `{}`.
+
+## Daily-use improvements (Group 2)
+
+- **Builder search + bulk actions.** The scenario list has a
+  search field (case-insensitive substring on name or channel
+  id) and Enable-all / Disable-all buttons. Bulk actions apply
+  to exactly the visible (filtered) scenarios — what you see is
+  what you act on. Enabling reuses the single-toggle validation
+  (`try_enable_scenario`): an invalid scenario stays disabled
+  and is reported, the rest still go through; in user-token mode
+  the 1-channel rule still applies per scenario. The search query
+  is session-only (transient UI state, deliberately not
+  persisted — see `docs/CONFIG-RULES.md`); the enabled flags
+  themselves were already persisted per scenario.
+- **Keyboard shortcuts (`handle_shortcuts`).** Ctrl/Cmd+S saves
+  scenarios + config, Ctrl/Cmd+N creates a scenario (and opens
+  the Builder), Ctrl/Cmd+1..5 switches Dashboard / Builder /
+  Destinations / Logs / Settings, plain Esc dismisses the inline
+  delete confirmations and the emoji picker. Shortcuts are
+  ignored on the Onboarding screen so none can bypass the ToS
+  gate. Bindings are fixed (no state to persist); the list is
+  shown in Settings.
+- **Window geometry memory + start-minimized.** The last sane
+  window rect is remembered and restored at startup (clamped by
+  `clamp_window_geometry` in `main.rs`: size 640..3840 ×
+  480..2160, positions kept as-is for multi-monitor setups,
+  non-finite values fall back to the default). Only
+  non-minimized, non-maximized rects are recorded, so a
+  maximized window does not restore as a giant normal window.
+  The rect is written to config on exit (`on_exit`) and on
+  hide-to-tray — never per-frame. Settings has a reset button
+  (default size + position 100,100) for a lost window, and a
+  start-minimized toggle (the minimize command is sent on the
+  first frame; egui 0.31 has no start-minimized viewport
+  option, so the window may flash once). Geometry fields live
+  in `AppConfig` (0.0 = unset) and ride along in exports,
+  harmlessly clamped on load.
+- **Tray menu (Windows only, `src/tray.rs`).** The menu gained
+  "Mở Dashboard" (show + switch to the Dashboard) and an engine
+  pause/resume item whose label follows the engine state
+  ("Dừng engine" / "Tiếp tục engine", synced every frame, only
+  touching the menu on change). Tray labels stay Vietnamese,
+  matching the existing items.
+- **Font size (`UiScale` in `src/theme.rs`).** Small / Medium /
+  Large (factors 0.875 / 1.0 / 1.15) multiply every text size;
+  spacing and padding stay fixed so layouts never break. Stored
+  as a code string in config like theme/language, applied
+  instantly from Settings and at startup.
 
 ## Performance notes
 

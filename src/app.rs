@@ -65,6 +65,14 @@ pub struct NicordApp {
     pub webhook_check_status: Arc<Mutex<String>>,
     pub new_scenario_name: String,
     pub new_message: String,
+    /// Builder list search query. Session-only: a search is
+    /// transient, nobody expects it to survive a restart.
+    pub builder_search: String,
+    /// Last sane (non-minimized, non-maximized) window rect, for
+    /// the geometry memory saved on exit / hide-to-tray.
+    pub last_window_rect: Option<egui::Rect>,
+    /// The start-minimized command is sent once, on the first frame.
+    pub did_initial_minimize: bool,
     pub selected: Option<usize>,
     /// Builder: node selected for editing (command nodes have an
     /// editor panel; other kinds show no editor yet).
@@ -141,6 +149,52 @@ pub struct NicordApp {
     /// Set by the tray "Thoát" menu item: the next close is a real quit.
     #[cfg(target_os = "windows")]
     pub allow_quit: bool,
+}
+
+/// Builder list search: case-insensitive substring match against
+/// the scenario name or channel id. An empty query matches all.
+fn scenario_matches_query(s: &Scenario, query: &str) -> bool {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return true;
+    }
+    s.name.to_lowercase().contains(&q) || s.channel_id.to_lowercase().contains(&q)
+}
+
+/// Enable one scenario with the same validation the Builder's
+/// Enable button applies. Returns an error message when the
+/// scenario must stay disabled (invalid, or — user-token mode
+/// only — a second distinct channel). `None` means enabled.
+/// Already-enabled scenarios are a silent no-op.
+fn try_enable_scenario(list: &mut [Scenario], i: usize, is_webhook: bool) -> Option<String> {
+    let s = list.get(i)?;
+    if s.enabled {
+        return None;
+    }
+    let valid = if is_webhook {
+        s.validate_for_webhook()
+    } else {
+        s.validate()
+    };
+    if let Err(e) = valid {
+        return Some(format!("Cannot enable: {e}"));
+    }
+    if !is_webhook {
+        // Hypothetical list with this scenario enabled: only 1
+        // distinct channel is allowed across enabled scenarios
+        // (user mode; webhook mode ignores channel_id).
+        let mut hypo = list.to_vec();
+        if let Some(s) = hypo.get_mut(i) {
+            s.enabled = true;
+        }
+        if let Some(v) = channels_violation(&hypo) {
+            return Some(v);
+        }
+    }
+    if let Some(s) = list.get_mut(i) {
+        s.enabled = true;
+    }
+    None
 }
 
 /// Build a sender from a config snapshot, following its send mode.
@@ -288,6 +342,9 @@ impl NicordApp {
             webhook_check_status: Arc::new(Mutex::new(String::new())),
             new_scenario_name: String::new(),
             new_message: String::new(),
+            builder_search: String::new(),
+            last_window_rect: None,
+            did_initial_minimize: false,
             selected: None,
             selected_node: None,
             sent_today: sent_today_init,
@@ -418,6 +475,36 @@ impl NicordApp {
                 let _ = self.store.save_scenario(s);
             }
         }
+    }
+
+    /// Create a scenario from the "New scenario name" field (or
+    /// "Untitled scenario" when it is empty), pre-selecting the
+    /// first sendable destination in webhook mode. Shared by the
+    /// "+ New scenario" button and the Ctrl+N shortcut.
+    fn create_scenario(&mut self) {
+        // No scenario-count limit: the only limit is 1 distinct
+        // channel, enforced when a scenario is enabled.
+        let name = if self.new_scenario_name.trim().is_empty() {
+            "Untitled scenario".to_string()
+        } else {
+            self.new_scenario_name.trim().to_string()
+        };
+        let mut s = Scenario::new(&name);
+        // Webhook mode: pre-select the first enabled destination
+        // so the scenario can be enabled without an extra step
+        // (user can change it).
+        if self.config.send_mode == SendMode::Webhook {
+            if let Ok(dests) = self.store.load_destinations() {
+                if let Some(first) = dests.iter().find(|d| d.is_sendable()) {
+                    s.destination_id = Some(first.id.clone());
+                }
+            }
+        }
+        if let Ok(mut list) = self.scenarios.lock() {
+            list.push(s);
+        }
+        self.save_scenarios();
+        self.new_scenario_name.clear();
     }
 
     /// The scenario a Dashboard "Test send" would send: the
@@ -1195,10 +1282,113 @@ impl NicordApp {
             }
         });
     }
+
+    /// Keyboard shortcuts (listed in Settings). Ignored on the
+    /// Onboarding screen so no shortcut can bypass the ToS gate.
+    /// `command` is Ctrl on Windows/Linux, Cmd on macOS.
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        if self.screen == Screen::Onboarding {
+            return;
+        }
+        let (save, new_scenario, screen, dismiss) = ctx.input(|i| {
+            let cmd = i.modifiers.command;
+            let save = cmd && i.key_pressed(egui::Key::S);
+            let new_scenario = cmd && i.key_pressed(egui::Key::N);
+            let screen = if cmd {
+                if i.key_pressed(egui::Key::Num1) {
+                    Some(Screen::Dashboard)
+                } else if i.key_pressed(egui::Key::Num2) {
+                    Some(Screen::Builder)
+                } else if i.key_pressed(egui::Key::Num3) {
+                    Some(Screen::Destinations)
+                } else if i.key_pressed(egui::Key::Num4) {
+                    Some(Screen::Logs)
+                } else if i.key_pressed(egui::Key::Num5) {
+                    Some(Screen::Settings)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            // Plain Escape dismisses inline confirmations and the
+            // emoji picker; with modifiers it does nothing.
+            let dismiss = i.key_pressed(egui::Key::Escape) && i.modifiers.is_none();
+            (save, new_scenario, screen, dismiss)
+        });
+        if save {
+            self.save_scenarios();
+            let _ = save_config(&self.config);
+            self.set_status("Đã lưu.");
+        }
+        if new_scenario {
+            self.screen = Screen::Builder;
+            self.create_scenario();
+        }
+        if let Some(screen) = screen {
+            self.screen = screen;
+        }
+        if dismiss {
+            self.pending_delete_log = None;
+            self.dest_delete_confirm = None;
+            self.show_emoji_picker = false;
+        }
+    }
+
+    /// Remember the current window rect when it is a "normal" rect:
+    /// not minimized, not maximized, sane size. Maximized and
+    /// minimized rects would restore the wrong geometry, so the
+    /// last normal rect is kept instead.
+    fn capture_window_rect(&mut self, ctx: &egui::Context) {
+        let rect = ctx.input(|i| {
+            let v = i.viewport();
+            if v.minimized == Some(true) || v.maximized == Some(true) {
+                return None;
+            }
+            v.inner_rect.filter(|r| {
+                r.width() >= 100.0
+                    && r.height() >= 100.0
+                    && r.min.x.is_finite()
+                    && r.min.y.is_finite()
+            })
+        });
+        if let Some(rect) = rect {
+            if self.last_window_rect != Some(rect) {
+                self.last_window_rect = Some(rect);
+            }
+        }
+    }
+
+    /// Write the remembered rect into the config (only when it
+    /// changed). Called on exit and on hide-to-tray — never
+    /// per-frame, so resizing costs no disk writes.
+    fn persist_window_geometry(&mut self) {
+        if let Some(rect) = self.last_window_rect {
+            let (w, h, x, y) = (rect.width(), rect.height(), rect.min.x, rect.min.y);
+            if (self.config.window_width - w).abs() > f32::EPSILON
+                || (self.config.window_height - h).abs() > f32::EPSILON
+                || (self.config.window_x - x).abs() > f32::EPSILON
+                || (self.config.window_y - y).abs() > f32::EPSILON
+            {
+                self.config.window_width = w;
+                self.config.window_height = h;
+                self.config.window_x = x;
+                self.config.window_y = y;
+                let _ = save_config(&self.config);
+            }
+        }
+    }
 }
 
 impl eframe::App for NicordApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Keyboard shortcuts, window geometry memory, start-minimized.
+        self.handle_shortcuts(ctx);
+        self.capture_window_rect(ctx);
+        if self.config.start_minimized && !self.did_initial_minimize {
+            self.did_initial_minimize = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
         // Mirror sound settings for engine threads (cheap, idempotent).
         crate::notify::sync_settings(self.config.sound_enabled, self.config.sound_on_success);
         // "Sent today" is the persisted count, not a memory counter.
@@ -1244,12 +1434,31 @@ impl eframe::App for NicordApp {
             {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                // The window is about to hide: remember its geometry
+                // now, while the last normal rect is still valid.
+                self.persist_window_geometry();
             }
             if let Some(tray) = &self.tray {
+                // Keep the engine menu label truthful (it only
+                // touches the menu when the state changed).
+                tray.set_engine_running(self.engine.is_loop_active());
                 match tray.poll() {
                     crate::tray::TrayAction::Show => {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    }
+                    crate::tray::TrayAction::ShowDashboard => {
+                        self.screen = Screen::Dashboard;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    }
+                    crate::tray::TrayAction::ToggleEngine => {
+                        if self.engine.is_loop_active() {
+                            self.engine.stop_all();
+                            self.set_status("Engine stopped.");
+                        } else {
+                            self.start_engine();
+                        }
                     }
                     crate::tray::TrayAction::Quit => {
                         self.allow_quit = true;
@@ -1362,6 +1571,13 @@ impl eframe::App for NicordApp {
         self.show_update_dialog(ctx);
         // Keep the engine ticking / status fresh.
         ctx.request_repaint_after(std::time::Duration::from_secs(1));
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Last chance to remember the window geometry. Hide-to-tray
+        // does not reach here (the app keeps running), so this only
+        // fires on a real quit.
+        self.persist_window_geometry();
     }
 }
 
@@ -2114,29 +2330,30 @@ impl NicordApp {
                         .desired_width(field_w),
                 );
                 if theme::primary_button(ui, "+ New scenario").clicked() {
-                    // No scenario-count limit: the only limit is 1 distinct
-                    // channel, enforced when a scenario is enabled.
-                    let name = if self.new_scenario_name.trim().is_empty() {
-                        "Untitled scenario".to_string()
-                    } else {
-                        self.new_scenario_name.trim().to_string()
-                    };
-                    let mut s = Scenario::new(&name);
-                    // Webhook mode: pre-select the first enabled
-                    // destination so the scenario can be enabled
-                    // without an extra step (user can change it).
-                    if self.config.send_mode == SendMode::Webhook {
-                        if let Ok(dests) = self.store.load_destinations() {
-                            if let Some(first) = dests.iter().find(|d| d.is_sendable()) {
-                                s.destination_id = Some(first.id.clone());
-                            }
-                        }
-                    }
-                    if let Ok(mut list) = self.scenarios.lock() {
-                        list.push(s);
-                    }
-                    self.save_scenarios();
-                    self.new_scenario_name.clear();
+                    self.create_scenario();
+                }
+            });
+            ui.add_space(8.0);
+            // Search + bulk actions. Labels are resolved before the
+            // row: the search field holds a &mut borrow of the query
+            // while the row is built, so no `self` calls inside.
+            let search_hint = t(self.lang(), "builder.search_hint");
+            let enable_all_label = t(self.lang(), "builder.enable_all");
+            let disable_all_label = t(self.lang(), "builder.disable_all");
+            let mut bulk_enable = false;
+            let mut bulk_disable = false;
+            ui.horizontal(|ui| {
+                let field_w = (ui.available_width() - 170.0).max(80.0);
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.builder_search)
+                        .hint_text(search_hint)
+                        .desired_width(field_w),
+                );
+                if ui.button(enable_all_label).clicked() {
+                    bulk_enable = true;
+                }
+                if ui.button(disable_all_label).clicked() {
+                    bulk_disable = true;
                 }
             });
             ui.add_space(8.0);
@@ -2145,12 +2362,29 @@ impl NicordApp {
             let mut to_delete: Option<usize> = None;
             let mut to_toggle: Option<usize> = None;
             let mut to_clone: Option<usize> = None;
+            // Indices matching the search query, in list order. Bulk
+            // actions apply to exactly these (what you see is what
+            // you act on); indices stay valid because the list is
+            // only mutated after this scope.
+            let query = self.builder_search.clone();
+            let mut visible: Vec<usize> = Vec::new();
+            let total: usize;
             {
                 let list = self.scenarios.lock().unwrap();
+                total = list.len();
                 if list.is_empty() {
                     theme::muted(ui, "No scenarios yet — create your first one above.");
                 }
                 for (i, s) in list.iter().enumerate() {
+                    if scenario_matches_query(s, &query) {
+                        visible.push(i);
+                    }
+                }
+                if total > 0 && visible.is_empty() {
+                    theme::muted(ui, "Không có kịch bản nào khớp với tìm kiếm.");
+                }
+                for &i in &visible {
+                    let s = &list[i];
                     ui.horizontal(|ui| {
                         if ui.selectable_label(selected == Some(i), &s.name).clicked() {
                             selected = Some(i);
@@ -2188,46 +2422,80 @@ impl NicordApp {
                     ui.separator();
                 }
             }
+            if !query.trim().is_empty() && total > 0 {
+                theme::muted(
+                    ui,
+                    &format!("Hiển thị {} / {} kịch bản", visible.len(), total),
+                );
+            }
             self.selected = selected;
             if let Some(i) = to_toggle {
-                let mut msg: Option<String> = None;
                 let is_webhook = self.config.send_mode == SendMode::Webhook;
+                let mut msg: Option<String> = None;
                 if let Ok(mut list) = self.scenarios.lock() {
                     let was_enabled = list.get(i).map(|s| s.enabled).unwrap_or(false);
-                    if !was_enabled {
-                        // Mode-aware validation first: an invalid scenario
-                        // must not be enabled (it would only fail in the engine).
-                        let valid = match list.get(i) {
-                            Some(s) if is_webhook => s.validate_for_webhook(),
-                            Some(s) => s.validate(),
-                            None => Err("scenario not found".to_string()),
-                        };
-                        if let Err(e) = valid {
-                            msg = Some(format!("Cannot enable: {e}"));
-                        } else if !is_webhook {
-                            // Hypothetical list with this scenario enabled: only
-                            // 1 distinct channel is allowed across enabled scenarios
-                            // (user mode; webhook mode ignores channel_id).
-                            let mut hypo = list.clone();
-                            if let Some(s) = hypo.get_mut(i) {
-                                s.enabled = true;
-                            }
-                            if let Some(v) = channels_violation(&hypo) {
-                                msg = Some(v);
-                            } else if let Some(s) = list.get_mut(i) {
-                                s.enabled = true;
-                            }
-                        } else if let Some(s) = list.get_mut(i) {
-                            s.enabled = true;
+                    if was_enabled {
+                        if let Some(s) = list.get_mut(i) {
+                            s.enabled = false;
                         }
-                    } else if let Some(s) = list.get_mut(i) {
-                        s.enabled = false;
+                    } else {
+                        // Same validation as before, now shared with
+                        // bulk enable (see `try_enable_scenario`).
+                        msg = try_enable_scenario(&mut list, i, is_webhook);
                     }
                 }
                 self.save_scenarios();
                 if let Some(m) = msg {
                     self.set_status(&m);
                 }
+            }
+            if bulk_enable {
+                // Enable every visible scenario, validating each one
+                // in turn (a failure leaves that scenario disabled
+                // and is reported; the rest still go through).
+                let is_webhook = self.config.send_mode == SendMode::Webhook;
+                let mut enabled = 0usize;
+                let mut failed = 0usize;
+                let mut first_err: Option<String> = None;
+                if let Ok(mut list) = self.scenarios.lock() {
+                    for &i in &visible {
+                        if list.get(i).map(|s| s.enabled).unwrap_or(true) {
+                            continue;
+                        }
+                        match try_enable_scenario(&mut list, i, is_webhook) {
+                            None => enabled += 1,
+                            Some(e) => {
+                                failed += 1;
+                                if first_err.is_none() {
+                                    first_err = Some(e);
+                                }
+                            }
+                        }
+                    }
+                }
+                self.save_scenarios();
+                if failed == 0 {
+                    self.set_status(&format!("Đã bật {enabled} kịch bản."));
+                } else if let Some(e) = first_err {
+                    self.set_status(&format!(
+                        "Đã bật {enabled} kịch bản, {failed} không bật được: {e}"
+                    ));
+                }
+            }
+            if bulk_disable {
+                let mut disabled = 0usize;
+                if let Ok(mut list) = self.scenarios.lock() {
+                    for &i in &visible {
+                        if let Some(s) = list.get_mut(i) {
+                            if s.enabled {
+                                s.enabled = false;
+                                disabled += 1;
+                            }
+                        }
+                    }
+                }
+                self.save_scenarios();
+                self.set_status(&format!("Đã tắt {disabled} kịch bản."));
             }
             if let Some(i) = to_delete {
                 if let Ok(mut list) = self.scenarios.lock() {
@@ -4964,6 +5232,16 @@ impl NicordApp {
             );
             #[cfg(not(target_os = "windows"))]
             theme::muted(ui, "System tray: chỉ có trên Windows.");
+            // Start minimized: instant toggle, saved immediately.
+            // Label resolved first: the checkbox holds a &mut
+            // borrow of the config while it is built.
+            let start_minimized_label = t(self.lang(), "settings.start_minimized");
+            if ui
+                .checkbox(&mut self.config.start_minimized, start_minimized_label)
+                .changed()
+            {
+                let _ = save_config(&self.config);
+            }
             theme::muted(ui, "Khởi động cùng máy được ghi thật vào hệ thống (Windows Run / Linux autostart). Khi bật khay hệ thống, đóng cửa sổ sẽ ẩn Nicord xuống khay thay vì thoát — bấm chuột phải vào icon khay để thoát hẳn.");
             // Language (Q9): instant switch, saved immediately.
             ui.horizontal(|ui| {
@@ -5000,8 +5278,50 @@ impl NicordApp {
                 if choice.code() != self.config.theme {
                     self.config.theme = choice.code().to_string();
                     let _ = save_config(&self.config);
-                    crate::theme::apply_theme(ui.ctx(), choice);
+                    crate::theme::apply_theme(
+                        ui.ctx(),
+                        choice,
+                        crate::theme::UiScale::from_code(&self.config.ui_scale),
+                    );
                     self.set_status("Theme switched.");
+                }
+            });
+            // Font size: instant switch, saved immediately.
+            ui.horizontal(|ui| {
+                ui.label(t(self.lang(), "settings.font_size"));
+                let mut scale = crate::theme::UiScale::from_code(&self.config.ui_scale);
+                egui::ComboBox::from_id_salt("ui_scale")
+                    .selected_text(match scale {
+                        crate::theme::UiScale::Small => t(self.lang(), "settings.font_small"),
+                        crate::theme::UiScale::Medium => t(self.lang(), "settings.font_medium"),
+                        crate::theme::UiScale::Large => t(self.lang(), "settings.font_large"),
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut scale,
+                            crate::theme::UiScale::Small,
+                            t(self.lang(), "settings.font_small"),
+                        );
+                        ui.selectable_value(
+                            &mut scale,
+                            crate::theme::UiScale::Medium,
+                            t(self.lang(), "settings.font_medium"),
+                        );
+                        ui.selectable_value(
+                            &mut scale,
+                            crate::theme::UiScale::Large,
+                            t(self.lang(), "settings.font_large"),
+                        );
+                    });
+                if scale.code() != self.config.ui_scale {
+                    self.config.ui_scale = scale.code().to_string();
+                    let _ = save_config(&self.config);
+                    crate::theme::apply_theme(
+                        ui.ctx(),
+                        crate::theme::ThemeChoice::from_code(&self.config.theme),
+                        scale,
+                    );
+                    self.set_status("Font size switched.");
                 }
             });
             // Notification sounds (Q11): instant toggles, saved immediately.
@@ -5025,6 +5345,39 @@ impl NicordApp {
                 }
                 theme::muted(ui, "Âm báo không bao giờ chặn việc gửi tin.");
             });
+            // Window geometry is remembered automatically; the reset
+            // brings a lost/off-screen window back to the default.
+            ui.horizontal(|ui| {
+                if theme::ghost_button(ui, t(self.lang(), "settings.reset_window")).clicked() {
+                    self.config.window_width = 0.0;
+                    self.config.window_height = 0.0;
+                    self.config.window_x = 0.0;
+                    self.config.window_y = 0.0;
+                    let _ = save_config(&self.config);
+                    self.last_window_rect = None;
+                    ui.ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                            1100.0, 700.0,
+                        )));
+                    ui.ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+                            100.0, 100.0,
+                        )));
+                    self.set_status("Window size reset.");
+                }
+                theme::muted(
+                    ui,
+                    "Kích thước/vị trí cửa sổ được ghi nhớ tự động khi thoát.",
+                );
+            });
+            // Keyboard shortcuts (reference only; see `handle_shortcuts`).
+            theme::muted(
+                ui,
+                &format!(
+                    "{}: Ctrl+S lưu · Ctrl+N kịch bản mới · Ctrl+1..5 chuyển màn hình · Esc đóng xác nhận",
+                    t(self.lang(), "settings.shortcuts")
+                ),
+            );
             ui.add_space(8.0);
             if theme::primary_button(ui, t(self.lang(), "btn.save_settings")).clicked() {
                 // Clamp destination limits to their documented bounds.
@@ -5217,6 +5570,55 @@ fn shared_runtime() -> Result<&'static tokio::runtime::Runtime, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builder_search_matches_name_and_channel_case_insensitively() {
+        let mut s = Scenario::new("Morning Greeting");
+        s.channel_id = "123456789".to_string();
+        assert!(scenario_matches_query(&s, ""));
+        assert!(scenario_matches_query(&s, "   "));
+        assert!(scenario_matches_query(&s, "morning"));
+        assert!(scenario_matches_query(&s, "GREET"));
+        assert!(scenario_matches_query(&s, "3456"));
+        assert!(!scenario_matches_query(&s, "evening"));
+        assert!(!scenario_matches_query(&s, "999"));
+    }
+
+    #[test]
+    fn try_enable_validates_and_enables() {
+        // Webhook mode, no destination: stays disabled with a message.
+        let mut list = vec![Scenario::new("No dest")];
+        let msg = try_enable_scenario(&mut list, 0, true);
+        assert!(msg.is_some());
+        assert!(!list[0].enabled);
+
+        // With a destination the fresh scenario is valid: enabled.
+        list[0].destination_id = Some("dest-1".to_string());
+        let msg = try_enable_scenario(&mut list, 0, true);
+        assert_eq!(msg, None);
+        assert!(list[0].enabled);
+
+        // Already enabled: silent no-op.
+        let msg = try_enable_scenario(&mut list, 0, true);
+        assert_eq!(msg, None);
+        assert!(list[0].enabled);
+    }
+
+    #[test]
+    fn try_enable_user_mode_enforces_one_channel() {
+        // Two valid user-mode scenarios on different channels: the
+        // second enable must fail the 1-channel rule.
+        let mut a = Scenario::new("A");
+        a.channel_id = "111".to_string();
+        let mut b = Scenario::new("B");
+        b.channel_id = "222".to_string();
+        let mut list = vec![a, b];
+        assert_eq!(try_enable_scenario(&mut list, 0, false), None);
+        assert!(list[0].enabled);
+        let msg = try_enable_scenario(&mut list, 1, false);
+        assert!(msg.is_some());
+        assert!(!list[1].enabled);
+    }
 
     /// Perf harness (ignored: run with `cargo test -- --ignored`).
     /// Compares building a fresh runtime per call against the shared
