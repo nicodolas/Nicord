@@ -252,7 +252,19 @@ impl Store {
     pub fn open() -> Result<Self, String> {
         let dir = config_dir();
         std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {dir:?}: {e}"))?;
-        let conn = Connection::open(db_path()).map_err(|e| format!("cannot open database: {e}"))?;
+        Self::open_at(&db_path())
+    }
+
+    /// Open the database at `path`, creating tables and running the
+    /// column migration. Split out so tests can open a throwaway
+    /// file database (e.g. to verify the busy timeout).
+    fn open_at(path: &std::path::Path) -> Result<Self, String> {
+        let conn = Connection::open(path).map_err(|e| format!("cannot open database: {e}"))?;
+        // A second Nicord instance (or another process) holding the
+        // database must not make every write fail instantly with
+        // "database is locked": wait up to 5 s for the lock instead.
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| format!("cannot set busy timeout: {e}"))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS scenarios (
                 id TEXT PRIMARY KEY,
@@ -417,21 +429,36 @@ impl Store {
     }
 
     pub fn load_scenarios(&self) -> Result<Vec<Scenario>, String> {
+        Ok(self.load_scenarios_with_warnings()?.0)
+    }
+
+    /// Load scenarios plus one warning per row that could not be
+    /// parsed. Unparseable rows are skipped (the app must still
+    /// start), but the caller is told — previously they vanished
+    /// silently, and an export/import round-trip deleted them.
+    pub fn load_scenarios_with_warnings(&self) -> Result<(Vec<Scenario>, Vec<String>), String> {
         let conn = self.db.lock().map_err(|e| e.to_string())?;
         let mut stmt = conn
-            .prepare("SELECT json FROM scenarios ORDER BY updated_at DESC")
+            .prepare("SELECT id, json FROM scenarios ORDER BY updated_at DESC")
             .map_err(|e| e.to_string())?;
         let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
             .map_err(|e| e.to_string())?;
         let mut out = Vec::new();
+        let mut warnings = Vec::new();
         for row in rows {
-            let json = row.map_err(|e| e.to_string())?;
-            if let Ok(s) = serde_json::from_str::<Scenario>(&json) {
-                out.push(s);
+            let (id, json) = row.map_err(|e| e.to_string())?;
+            match serde_json::from_str::<Scenario>(&json) {
+                Ok(s) => out.push(s),
+                Err(e) => warnings.push(format!(
+                    "scenario row '{id}' could not be parsed and was skipped: {}",
+                    truncate_error(&e.to_string())
+                )),
             }
         }
-        Ok(out)
+        Ok((out, warnings))
     }
 
     // ---- Destinations (multi-channel, webhook mode only) ----
@@ -455,22 +482,69 @@ impl Store {
     /// order. Rows that fail to parse are skipped (same policy as
     /// scenarios); a corrupt row must not hide the rest.
     pub fn load_destinations(&self) -> Result<Vec<Destination>, String> {
+        Ok(self.load_destinations_with_warnings()?.0)
+    }
+
+    /// Like `load_scenarios_with_warnings`, for destinations:
+    /// unparseable rows are skipped with one warning each instead of
+    /// vanishing silently.
+    pub fn load_destinations_with_warnings(
+        &self,
+    ) -> Result<(Vec<Destination>, Vec<String>), String> {
         let conn = self.db.lock().map_err(|e| e.to_string())?;
         let mut stmt = conn
-            .prepare("SELECT json FROM destinations ORDER BY updated_at DESC")
+            .prepare("SELECT id, json FROM destinations ORDER BY updated_at DESC")
             .map_err(|e| e.to_string())?;
         let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
             .map_err(|e| e.to_string())?;
         let mut out = Vec::new();
+        let mut warnings = Vec::new();
         for row in rows {
-            let json = row.map_err(|e| e.to_string())?;
-            if let Ok(d) = serde_json::from_str::<Destination>(&json) {
-                out.push(d);
+            let (id, json) = row.map_err(|e| e.to_string())?;
+            match serde_json::from_str::<Destination>(&json) {
+                Ok(d) => out.push(d),
+                Err(e) => warnings.push(format!(
+                    "destination row '{id}' could not be parsed and was skipped: {}",
+                    truncate_error(&e.to_string())
+                )),
             }
         }
         out.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
-        Ok(out)
+        Ok((out, warnings))
+    }
+
+    /// Delete every row of a table, including rows too corrupt to
+    /// parse. Import-replace uses these instead of load-then-delete:
+    /// deleting only the rows that parse would leave corrupt rows
+    /// behind after a "replace everything" import.
+    pub fn delete_all_scenarios(&self) -> Result<(), String> {
+        self.db
+            .lock()
+            .map_err(|e| e.to_string())?
+            .execute("DELETE FROM scenarios", [])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn delete_all_destinations(&self) -> Result<(), String> {
+        self.db
+            .lock()
+            .map_err(|e| e.to_string())?
+            .execute("DELETE FROM destinations", [])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn delete_all_templates(&self) -> Result<(), String> {
+        self.db
+            .lock()
+            .map_err(|e| e.to_string())?
+            .execute("DELETE FROM templates", [])
+            .map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     pub fn load_destination(&self, id: &str) -> Result<Option<Destination>, String> {
@@ -757,6 +831,12 @@ impl Store {
 
 /// Escape a user-typed keyword for use inside a SQL LIKE pattern:
 /// backslash, `%`, and `_` become literals (with `ESCAPE '\'`).
+/// Shorten an error for a warning line: serde parse errors can be
+/// long, and the warning only needs the gist.
+fn truncate_error(msg: &str) -> String {
+    msg.chars().take(120).collect()
+}
+
 pub fn escape_like(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for c in input.chars() {
@@ -972,6 +1052,131 @@ mod tests {
             )
             .unwrap();
         assert_eq!((mid, did), (None, None));
+    }
+
+    #[test]
+    fn corrupt_rows_warn_instead_of_vanishing() {
+        let store = Store::open_memory().unwrap();
+        store.save_scenario(&Scenario::new("good")).unwrap();
+        store
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO scenarios (id, json, updated_at) VALUES ('bad1', '{not json', '2026-01-01')",
+                [],
+            )
+            .unwrap();
+        let (scenarios, warnings) = store.load_scenarios_with_warnings().unwrap();
+        assert_eq!(scenarios.len(), 1);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("bad1"), "warning names the row");
+        // The plain loader keeps its old shape (warnings dropped).
+        assert_eq!(store.load_scenarios().unwrap().len(), 1);
+
+        let d = Destination::new("good-dest");
+        store.save_destination(&d).unwrap();
+        store
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO destinations (id, json, updated_at) VALUES ('bad2', '[broken', '2026-01-01')",
+                [],
+            )
+            .unwrap();
+        let (dests, warnings) = store.load_destinations_with_warnings().unwrap();
+        assert_eq!(dests.len(), 1);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("bad2"));
+    }
+
+    #[test]
+    fn delete_all_removes_corrupt_rows_too() {
+        let store = Store::open_memory().unwrap();
+        store.save_scenario(&Scenario::new("good")).unwrap();
+        store
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO scenarios (id, json, updated_at) VALUES ('bad1', '{not json', '2026-01-01')",
+                [],
+            )
+            .unwrap();
+        store.delete_all_scenarios().unwrap();
+        let count: i64 = store
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM scenarios", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        store.save_destination(&Destination::new("d")).unwrap();
+        store.delete_all_destinations().unwrap();
+        assert!(store.load_destinations().unwrap().is_empty());
+        store.save_template("t", "c").unwrap();
+        store.delete_all_templates().unwrap();
+        assert!(store.load_templates().unwrap().is_empty());
+    }
+
+    #[test]
+    fn export_warns_and_import_replaces_corrupt_rows() {
+        use crate::backup::{apply_import, build_export, ExportMode};
+        let target = Store::open_memory().unwrap();
+        target.save_scenario(&Scenario::new("old")).unwrap();
+        target
+            .db
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO scenarios (id, json, updated_at) VALUES ('bad1', '{not json', '2026-01-01'); \
+                 INSERT INTO destinations (id, json, updated_at) VALUES ('bad2', '[broken', '2026-01-01');",
+            )
+            .unwrap();
+        // Export warns about both corrupt rows.
+        let (_, warnings) =
+            build_export(&target, &AppConfig::default(), ExportMode::Safe, "").unwrap();
+        assert_eq!(warnings.len(), 2);
+
+        // Import-replace removes the corrupt rows too.
+        let source = Store::open_memory().unwrap();
+        source.save_scenario(&Scenario::new("new")).unwrap();
+        source
+            .save_destination(&Destination::new("new-dest"))
+            .unwrap();
+        let (file, _) = build_export(&source, &AppConfig::default(), ExportMode::Safe, "").unwrap();
+        let (_, report) = apply_import(&target, &file, "").unwrap();
+        assert_eq!(report.scenarios_imported, 1);
+        assert_eq!(report.destinations_imported, 1);
+        let conn = target.db.lock().unwrap();
+        let scenarios: i64 = conn
+            .query_row("SELECT COUNT(*) FROM scenarios", [], |r| r.get(0))
+            .unwrap();
+        let destinations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM destinations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(scenarios, 1);
+        assert_eq!(destinations, 1);
+    }
+
+    #[test]
+    fn file_database_has_busy_timeout() {
+        let path = std::env::temp_dir().join(format!(
+            "nicord-busy-timeout-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = Store::open_at(&path).unwrap();
+        let timeout: i64 = store
+            .db
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(timeout, 5000);
+        drop(store);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
