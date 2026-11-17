@@ -740,16 +740,23 @@ pub struct ScenarioLimits {
     pub daily_cap: u32,
 }
 
-/// 0 = no per-scenario cap; the account cap (300/day) applies.
-/// A non-zero value caps this one scenario (per day) in addition to the
-/// account cap.
+/// 0 = no per-scenario cap; the account/global cap applies (the
+/// scheduler maps 0 to "unlimited" and takes the min with the
+/// account/global cap). A non-zero value caps this one scenario
+/// (per day) in addition to that cap.
 fn default_daily_cap() -> u32 {
     0
 }
 
 impl Default for ScenarioLimits {
+    /// Must match the serde default above: 0 (inherit the
+    /// account/global cap). A derived-style Default of 300 used to
+    /// make new scenarios behave differently from imported ones
+    /// missing the field. Guarded by `default_matches_serde_default`.
     fn default() -> Self {
-        Self { daily_cap: 300 }
+        Self {
+            daily_cap: default_daily_cap(),
+        }
     }
 }
 
@@ -1848,6 +1855,17 @@ mod tests {
         // replace with a real channel ID) and is structurally valid.
         assert_eq!(s.channel_id, "REPLACE_WITH_YOUR_CHANNEL_ID");
         assert!(s.validate().is_ok());
+    }
+
+    #[test]
+    fn limits_default_matches_serde_default() {
+        // 0 = inherit the account/global cap, in both paths: a
+        // scenario built in code and one imported without the field
+        // must behave identically.
+        let from_code = ScenarioLimits::default();
+        let from_json: ScenarioLimits = serde_json::from_str("{}").unwrap();
+        assert_eq!(from_code.daily_cap, 0);
+        assert_eq!(from_json.daily_cap, 0);
     }
 
     #[test]
