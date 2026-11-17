@@ -39,6 +39,19 @@ use std::{
 pub const RELEASES_LATEST_URL: &str =
     "https://api.github.com/repos/nicodolas/Nicord/releases/latest";
 
+/// Name of the checksum asset every release publishes (see
+/// `.github/workflows/release.yml`). The updater refuses to install
+/// a release that has no checksum file.
+pub const CHECKSUMS_ASSET_NAME: &str = "SHA256SUMS.txt";
+
+/// Largest release download accepted. A real Nicord zip is a few
+/// MB; 100 MiB leaves ample headroom while bounding a runaway or
+/// malicious response.
+pub const MAX_DOWNLOAD_BYTES: u64 = 100 * 1024 * 1024;
+
+/// Largest checksum file accepted. SHA256SUMS.txt is a few lines.
+pub const MAX_CHECKSUMS_BYTES: u64 = 64 * 1024;
+
 /// Version of the running binary, from Cargo.toml.
 pub fn current_version() -> Version {
     Version::parse(env!("CARGO_PKG_VERSION")).unwrap_or(Version {
@@ -94,6 +107,9 @@ pub struct ReleaseInfo {
     pub tag: String,
     pub version: Version,
     pub asset: ReleaseAsset,
+    /// Download URL of the release's SHA256SUMS.txt asset, when the
+    /// release published one. `None` fails the install closed.
+    pub checksums_url: Option<String>,
 }
 
 /// The release-zip name the release workflow produces, for this
@@ -146,10 +162,15 @@ pub fn parse_release(json: &serde_json::Value) -> Option<ReleaseInfo> {
         })
         .collect();
     let asset = pick_asset(&assets, &version)?;
+    let checksums_url = assets
+        .iter()
+        .find(|a| a.name == CHECKSUMS_ASSET_NAME)
+        .map(|a| a.url.clone());
     Some(ReleaseInfo {
         tag: tag.to_string(),
         version,
         asset,
+        checksums_url,
     })
 }
 
@@ -213,13 +234,18 @@ pub struct DownloadProgress {
     pub total: Option<u64>,
 }
 
-/// Stream the release zip to `dest`, reporting progress. The whole
-/// file is never held in memory (the zip is a few MB, but streaming
-/// also gives a real progress bar).
+/// Stream the release file to `dest`, reporting progress. The whole
+/// file is never held in memory (streaming also gives a real
+/// progress bar). At most `max_bytes` are written: a declared
+/// Content-Length above the cap is rejected before any byte is
+/// written, and a body that grows past the cap aborts mid-stream.
+/// On any failure the partial file is removed, so a failed
+/// download can never be mistaken for a complete one.
 pub async fn download_asset(
     url: &str,
     dest: &Path,
     progress: Arc<Mutex<DownloadProgress>>,
+    max_bytes: u64,
 ) -> Result<(), String> {
     let client = reqwest::Client::builder()
         .user_agent(format!("Nicord/{}", env!("CARGO_PKG_VERSION")))
@@ -234,21 +260,152 @@ pub async fn download_asset(
     if !resp.status().is_success() {
         return Err(format!("tải bản mới thất bại: HTTP {}", resp.status()));
     }
+    if let Some(len) = resp.content_length() {
+        if len > max_bytes {
+            return Err(format!(
+                "file tải về khai báo {len} byte, vượt quá giới hạn {max_bytes} byte"
+            ));
+        }
+    }
     if let Ok(mut p) = progress.lock() {
         p.total = resp.content_length();
     }
     let mut file =
         std::fs::File::create(dest).map_err(|e| format!("không ghi được file tạm: {e}"))?;
+    let mut downloaded: u64 = 0;
     let mut stream = resp.bytes_stream();
+    let mut result = Ok(());
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("tải bản mới thất bại: {e}"))?;
-        file.write_all(&chunk)
-            .map_err(|e| format!("không ghi được file tạm: {e}"))?;
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(e) => {
+                result = Err(format!("tải bản mới thất bại: {e}"));
+                break;
+            }
+        };
+        downloaded += chunk.len() as u64;
+        if downloaded > max_bytes {
+            result = Err(format!(
+                "file tải về vượt quá giới hạn {max_bytes} byte; dừng tải"
+            ));
+            break;
+        }
+        if let Err(e) = file.write_all(&chunk) {
+            result = Err(format!("không ghi được file tạm: {e}"));
+            break;
+        }
         if let Ok(mut p) = progress.lock() {
-            p.downloaded += chunk.len() as u64;
+            p.downloaded = downloaded;
         }
     }
+    // The handle must be closed before removing the file: Windows
+    // refuses to delete an open file.
+    drop(file);
+    if result.is_err() {
+        let _ = std::fs::remove_file(dest);
+    }
+    result
+}
+
+/// Parse a `SHA256SUMS.txt` body into (filename, lowercase hex)
+/// pairs. Accepts the conventional two-space separator and the
+/// GNU `*` binary-mode marker, and tolerates CRLF. A malformed
+/// line fails the whole file: checksums are a security control,
+/// not a best-effort hint.
+pub fn parse_checksums(text: &str) -> Result<Vec<(String, String)>, String> {
+    let mut out = Vec::new();
+    for (i, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(2, char::is_whitespace);
+        let hash = parts.next().unwrap_or("");
+        let name = parts
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_start_matches('*')
+            .trim();
+        let hash_ok = hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit());
+        if !hash_ok || name.is_empty() {
+            return Err(format!(
+                "file checksum: dòng {} không đúng định dạng",
+                i + 1
+            ));
+        }
+        out.push((name.to_string(), hash.to_lowercase()));
+    }
+    if out.is_empty() {
+        return Err("file checksum rỗng".to_string());
+    }
+    Ok(out)
+}
+
+/// SHA-256 hex digest of a file, streamed in 64 KiB chunks.
+pub fn sha256_file(path: &Path) -> Result<String, String> {
+    use sha2::Digest;
+    let mut file =
+        std::fs::File::open(path).map_err(|e| format!("không mở được file để kiểm tra: {e}"))?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|e| format!("không đọc được file để kiểm tra: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>())
+}
+
+/// Verify a downloaded release file against the release's
+/// checksums text. Fails when the file has no entry or the digest
+/// differs — a mismatch means the download is corrupt or was
+/// replaced, and it must never be extracted or executed.
+pub fn verify_download(
+    zip_path: &Path,
+    checksums_text: &str,
+    asset_name: &str,
+) -> Result<(), String> {
+    let sums = parse_checksums(checksums_text)?;
+    let expected = sums
+        .iter()
+        .find(|(name, _)| name == asset_name)
+        .map(|(_, hash)| hash.clone())
+        .ok_or_else(|| format!("file checksum không có mã băm cho {asset_name}"))?;
+    let actual = sha256_file(zip_path)?;
+    if actual != expected {
+        return Err(format!(
+            "mã băm SHA-256 của {asset_name} không khớp với file checksum — file tải về có thể đã hỏng hoặc bị thay đổi; từ chối cài đặt"
+        ));
+    }
     Ok(())
+}
+
+/// Download the release's checksum file and verify `zip_path`
+/// against it. A release without a checksum asset fails closed:
+/// unverified code is never installed.
+pub async fn download_and_verify_checksums(
+    info: &ReleaseInfo,
+    zip_path: &Path,
+    stage_dir: &Path,
+) -> Result<(), String> {
+    let url = info.checksums_url.as_ref().ok_or_else(|| {
+        "bản phát hành không có file checksum (SHA256SUMS.txt); từ chối cài đặt".to_string()
+    })?;
+    let sums_path = stage_dir.join(CHECKSUMS_ASSET_NAME);
+    let progress = Arc::new(Mutex::new(DownloadProgress::default()));
+    download_asset(url, &sums_path, progress, MAX_CHECKSUMS_BYTES).await?;
+    let text = std::fs::read_to_string(&sums_path)
+        .map_err(|e| format!("không đọc được file checksum: {e}"))?;
+    verify_download(zip_path, &text, &info.asset.name)
 }
 
 /// Zip-bomb guards for release extraction. A real Nicord release is a
@@ -407,19 +564,52 @@ pub fn prepare_install(zip_path: &Path) -> Result<InstallPlan, String> {
     })
 }
 
+/// Single-quote a value for POSIX sh: wrap it in `'...'`, escaping
+/// an embedded quote as `'\''`. The result can be interpolated
+/// into a script safely — `$`, backticks, and newlines inside
+/// single quotes are literal.
+fn sh_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// A value baked into the Windows `.bat` helper must not contain
+/// characters `cmd.exe` would interpret: `"` breaks out of the
+/// quoted `set`, `%` expands environment variables, and CR/LF ends
+/// the line (command injection via the install path). There is no
+/// reliable escaping for these in batch files, so the update is
+/// refused instead. Compiled on Windows (where the script needs
+/// it) and in tests (where its behaviour is verified on every
+/// platform); the `.sh` script needs no validation because
+/// single-quote escaping handles every character.
+#[cfg(any(target_os = "windows", test))]
+fn validate_bat_value(value: &str) -> Result<(), String> {
+    if value.chars().any(|c| matches!(c, '"' | '%' | '\r' | '\n')) {
+        return Err(
+            "đường dẫn cài đặt chứa ký tự không an toàn cho script cập nhật (\" % hoặc xuống dòng)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// The helper script the installer runs after Nicord exits. It waits
 /// for Nicord's PID to disappear, backs the old exe up to
 /// `<exe>.bak`, copies the staged files over the install folder,
 /// deletes the staging dir, relaunches Nicord and deletes itself.
-/// Paths are baked in quoted, so folders with spaces work.
-pub fn helper_script_text(plan: &InstallPlan) -> String {
-    let stage = plan.stage_dir.display();
-    let dir = plan.install_dir.display();
-    let exe = plan.exe_path.display();
-    let staged = &plan.staged_exe_name;
+/// Paths are baked in quoted, so folders with spaces work — and
+/// escaped/validated, so a hostile path cannot inject commands
+/// (see `sh_quote` / `validate_bat_value`).
+pub fn helper_script_text(plan: &InstallPlan) -> Result<String, String> {
+    let stage = plan.stage_dir.display().to_string();
+    let dir = plan.install_dir.display().to_string();
+    let exe = plan.exe_path.display().to_string();
+    let staged = plan.staged_exe_name.clone();
     #[cfg(target_os = "windows")]
     {
-        format!(
+        for value in [&stage, &dir, &exe, &staged] {
+            validate_bat_value(value)?;
+        }
+        Ok(format!(
             "@echo off\r\n\
              set \"PID=%1\"\r\n\
              set \"STAGE={stage}\"\r\n\
@@ -440,26 +630,31 @@ pub fn helper_script_text(plan: &InstallPlan) -> String {
              rmdir /S /Q \"%STAGE%\"\r\n\
              start \"\" \"%EXE%\"\r\n\
              del \"%~f0\"\r\n"
-        )
+        ))
     }
     #[cfg(not(target_os = "windows"))]
     {
-        format!(
+        let stage = sh_quote(&stage);
+        let dir = sh_quote(&dir);
+        let exe = sh_quote(&exe);
+        let staged = sh_quote(&staged);
+        Ok(format!(
             "#!/bin/sh\n\
              PID=\"$1\"\n\
-             STAGE=\"{stage}\"\n\
-             DIR=\"{dir}\"\n\
-             EXE=\"{exe}\"\n\
+             STAGE={stage}\n\
+             DIR={dir}\n\
+             EXE={exe}\n\
+             STAGED={staged}\n\
              while kill -0 \"$PID\" 2>/dev/null; do sleep 1; done\n\
              cp -f \"$EXE\" \"$EXE.bak\"\n\
-             cp -f \"$STAGE/{staged}\" \"$EXE\"\n\
+             cp -f \"$STAGE/$STAGED\" \"$EXE\"\n\
              cp -f \"$STAGE/README.txt\" \"$DIR/README.txt\"\n\
              cp -f \"$STAGE/LICENSE\" \"$DIR/LICENSE\"\n\
              cp -f \"$STAGE/icon.ico\" \"$DIR/icon.ico\"\n\
              rm -rf \"$STAGE\"\n\
              nohup \"$EXE\" >/dev/null 2>&1 &\n\
              rm -- \"$0\"\n"
-        )
+        ))
     }
 }
 
@@ -470,7 +665,7 @@ pub fn write_helper(plan: &InstallPlan) -> Result<PathBuf, String> {
     #[cfg(not(target_os = "windows"))]
     let name = "update.sh";
     let path = plan.stage_dir.join(name);
-    std::fs::write(&path, helper_script_text(plan))
+    std::fs::write(&path, helper_script_text(plan)?)
         .map_err(|e| format!("không ghi được script cập nhật: {e}"))?;
     #[cfg(not(target_os = "windows"))]
     {
@@ -752,6 +947,164 @@ mod tests {
         assert!(parse_release(&serde_json::json!({"tag_name": "v0.1.1"})).is_none());
     }
 
+    #[test]
+    fn parse_release_finds_checksums_asset() {
+        let v = Version {
+            major: 0,
+            minor: 1,
+            patch: 1,
+        };
+        let expected = expected_asset_name(&v);
+        let with_sums = release_json(
+            "v0.1.1",
+            &[
+                (
+                    &expected,
+                    "https://example.com/Nicord-v0.1.1-windows-x64.zip",
+                    4_551_454,
+                ),
+                (
+                    CHECKSUMS_ASSET_NAME,
+                    "https://example.com/SHA256SUMS.txt",
+                    128,
+                ),
+            ],
+        );
+        let info = parse_release(&with_sums).expect("release must parse");
+        assert_eq!(
+            info.checksums_url.as_deref(),
+            Some("https://example.com/SHA256SUMS.txt")
+        );
+        let without_sums = release_json(
+            "v0.1.1",
+            &[(
+                &expected,
+                "https://example.com/Nicord-v0.1.1-windows-x64.zip",
+                4_551_454,
+            )],
+        );
+        let info = parse_release(&without_sums).expect("release must parse");
+        assert!(info.checksums_url.is_none());
+    }
+
+    #[test]
+    fn checksums_parse_conventional_and_gnu_forms() {
+        let hash = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let text = format!("{hash}  file.zip\n{hash} *other.zip\r\n");
+        let sums = parse_checksums(&text).unwrap();
+        assert_eq!(sums.len(), 2);
+        assert_eq!(sums[0], ("file.zip".to_string(), hash.to_string()));
+        assert_eq!(sums[1], ("other.zip".to_string(), hash.to_string()));
+        // Uppercase hex is normalized to lowercase.
+        let sums = parse_checksums(&format!("{}  f.zip", hash.to_uppercase())).unwrap();
+        assert_eq!(sums[0].1, hash);
+        assert!(parse_checksums("").is_err());
+        assert!(parse_checksums("not-a-hash  f.zip").is_err());
+        assert!(parse_checksums(hash).is_err());
+        assert!(parse_checksums(&format!("{hash}  ok.zip\nbroken line")).is_err());
+    }
+
+    #[test]
+    fn sha256_and_verify_download_match_and_mismatch() {
+        let dir = std::env::temp_dir().join(format!("nicord-hash-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("abc.bin");
+        std::fs::write(&file, b"abc").unwrap();
+        let hash = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert_eq!(sha256_file(&file).unwrap(), hash);
+        assert!(verify_download(&file, &format!("{hash}  abc.bin"), "abc.bin").is_ok());
+        let wrong = "00".to_string() + &hash[2..];
+        assert!(verify_download(&file, &format!("{wrong}  abc.bin"), "abc.bin").is_err());
+        assert!(verify_download(&file, &format!("{hash}  other.bin"), "abc.bin").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sh_quote_neutralizes_shell_metacharacters() {
+        assert_eq!(sh_quote("plain"), "'plain'");
+        assert_eq!(sh_quote("a'b"), "'a'\\''b'");
+        assert_eq!(sh_quote("$(rm -rf /)"), "'$(rm -rf /)'");
+        assert_eq!(sh_quote("a`id`b"), "'a`id`b'");
+        assert_eq!(sh_quote("a\nb"), "'a\nb'");
+    }
+
+    #[test]
+    fn bat_values_reject_injection_characters() {
+        assert!(validate_bat_value(r"C:\Program Files\Nicord").is_ok());
+        assert!(validate_bat_value("Nicord.exe").is_ok());
+        assert!(validate_bat_value("a\"b").is_err());
+        assert!(validate_bat_value("a%b").is_err());
+        assert!(validate_bat_value("a\nb").is_err());
+        assert!(validate_bat_value("a\rb").is_err());
+    }
+
+    /// Serve one fixed HTTP response on 127.0.0.1 and return its URL.
+    /// The server thread reads (and ignores) the request, writes the
+    /// response, and exits. Tests download caps without network.
+    fn serve_once(response: Vec<u8>) -> String {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(&response);
+                let _ = stream.flush();
+            }
+        });
+        format!("http://{addr}/file.zip")
+    }
+
+    fn cap_test_dest() -> PathBuf {
+        std::env::temp_dir().join(format!("nicord-cap-test-{}.zip", uuid::Uuid::new_v4()))
+    }
+
+    #[tokio::test]
+    async fn download_asset_rejects_oversized_declared_length() {
+        let mut response =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5000\r\nConnection: close\r\n\r\n".to_vec();
+        response.extend_from_slice(&[b'x'; 100]);
+        let url = serve_once(response);
+        let dest = cap_test_dest();
+        let progress = Arc::new(Mutex::new(DownloadProgress::default()));
+        let result = download_asset(&url, &dest, progress, 1024).await;
+        assert!(result.is_err());
+        assert!(
+            !dest.exists(),
+            "no partial file when the declared size is rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_asset_aborts_when_body_exceeds_cap() {
+        let mut response = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_vec();
+        response.extend_from_slice(&[b'x'; 4096]);
+        let url = serve_once(response);
+        let dest = cap_test_dest();
+        let progress = Arc::new(Mutex::new(DownloadProgress::default()));
+        let result = download_asset(&url, &dest, progress, 1024).await;
+        assert!(result.is_err());
+        assert!(
+            !dest.exists(),
+            "partial file removed when the body exceeds the cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_asset_succeeds_under_cap() {
+        let mut response = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_vec();
+        response.extend_from_slice(&[b'x'; 100]);
+        let url = serve_once(response);
+        let dest = cap_test_dest();
+        let progress = Arc::new(Mutex::new(DownloadProgress::default()));
+        let result = download_asset(&url, &dest, progress, 1024).await;
+        assert!(result.is_ok());
+        assert_eq!(std::fs::read(&dest).unwrap().len(), 100);
+        let _ = std::fs::remove_file(&dest);
+    }
+
     /// Build a tiny zip in memory: Nicord.exe + README.txt + a
     /// subfolder file, using the same crate the installer uses.
     fn sample_zip_bytes() -> Vec<u8> {
@@ -870,7 +1223,7 @@ mod tests {
             install_dir: PathBuf::from("C:/Nicord"),
             exe_path: PathBuf::from("C:/Nicord/Nicord.exe"),
         };
-        let script = helper_script_text(&plan);
+        let script = helper_script_text(&plan).unwrap();
         // Waits for the old process, backs it up, swaps, relaunches.
         assert!(script.contains("Nicord.exe.bak") || script.contains(".bak"));
         assert!(script.contains("Nicord.exe"));
@@ -879,6 +1232,22 @@ mod tests {
         assert!(script.contains("tasklist"));
         #[cfg(not(target_os = "windows"))]
         assert!(script.contains("kill -0"));
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn helper_script_quotes_hostile_paths() {
+        let plan = InstallPlan {
+            stage_dir: PathBuf::from("/tmp/$(touch /tmp/pwned)"),
+            staged_exe_name: "Nicord.exe".to_string(),
+            install_dir: PathBuf::from("/home/u/`id`"),
+            exe_path: PathBuf::from("/home/u/`id`/Nicord"),
+        };
+        let script = helper_script_text(&plan).unwrap();
+        // The metacharacters survive only inside single quotes, where
+        // the shell treats them as literal text.
+        assert!(script.contains("STAGE='/tmp/$(touch /tmp/pwned)'"));
+        assert!(script.contains("DIR='/home/u/`id`'"));
     }
 
     #[test]
