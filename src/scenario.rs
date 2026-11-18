@@ -801,7 +801,9 @@ impl CommandConfig {
 
     /// Validate before running: a name is always required; slash also
     /// needs the bot's application ID. Command ID / version are
-    /// optional (auto-resolved when empty).
+    /// optional (auto-resolved when empty). Slash options are checked
+    /// too (H-CMD): fail fast with a clear error instead of a cryptic
+    /// Discord 400 for a malformed payload.
     pub fn validate(&self) -> Result<(), String> {
         if self.name.trim().is_empty() {
             return Err("Send Command node needs a command name".into());
@@ -810,6 +812,28 @@ impl CommandConfig {
             return Err(
                 "Slash command needs the bot's Application ID (paste it in the node editor)".into(),
             );
+        }
+        // Prefix commands ignore options, so stale options on a prefix
+        // config must not fail it — only slash options are checked.
+        if self.is_slash() {
+            let mut seen: Vec<String> = Vec::new();
+            for opt in &self.options {
+                let name = opt.name.trim();
+                if name.is_empty() {
+                    return Err("Slash command has an option with an empty name — fill it in or remove the row".into());
+                }
+                if !SLASH_OPTION_KINDS.iter().any(|(k, _)| *k == opt.kind) {
+                    return Err(format!(
+                        "Slash option '{name}' has unsupported type code {}",
+                        opt.kind
+                    ));
+                }
+                let key = name.to_lowercase();
+                if seen.contains(&key) {
+                    return Err(format!("Slash command has duplicate option name '{name}'"));
+                }
+                seen.push(key);
+            }
         }
         Ok(())
     }
@@ -2300,6 +2324,130 @@ mod tests {
         assert!(cfg.validate().is_ok());
         assert_eq!(cfg.display_name(), "/rank");
         assert!(cfg.is_slash());
+    }
+
+    #[test]
+    fn slash_option_validation_rejects_bad_options() {
+        // H-CMD: slash options fail fast with clear errors.
+        let mut cfg = CommandConfig {
+            kind: "slash".into(),
+            name: "daily".into(),
+            application_id: "123456789".into(),
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_ok());
+        // Empty option name.
+        cfg.options = vec![SlashOption {
+            name: "  ".into(),
+            ..Default::default()
+        }];
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("empty name"), "unexpected error: {err}");
+        // Unsupported type codes (1/2 are subcommands, 0/9 invalid).
+        for bad in [0u8, 1, 2, 9, 11] {
+            cfg.options = vec![SlashOption {
+                name: "count".into(),
+                kind: bad,
+                value: "1".into(),
+            }];
+            let err = cfg.validate().unwrap_err();
+            assert!(
+                err.contains("unsupported type"),
+                "kind {bad}: unexpected error: {err}"
+            );
+        }
+        // Duplicate names, including a case variant.
+        cfg.options = vec![
+            SlashOption {
+                name: "count".into(),
+                kind: 4,
+                value: "1".into(),
+            },
+            SlashOption {
+                name: "Count".into(),
+                kind: 4,
+                value: "2".into(),
+            },
+        ];
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("duplicate"), "unexpected error: {err}");
+        // Every supported kind passes together.
+        cfg.options = vec![
+            SlashOption {
+                name: "text".into(),
+                kind: 3,
+                value: "hi".into(),
+            },
+            SlashOption {
+                name: "n".into(),
+                kind: 4,
+                value: "5".into(),
+            },
+            SlashOption {
+                name: "f".into(),
+                kind: 10,
+                value: "2.5".into(),
+            },
+            SlashOption {
+                name: "b".into(),
+                kind: 5,
+                value: "true".into(),
+            },
+            SlashOption {
+                name: "u".into(),
+                kind: 6,
+                value: "123".into(),
+            },
+            SlashOption {
+                name: "ch".into(),
+                kind: 7,
+                value: "456".into(),
+            },
+            SlashOption {
+                name: "r".into(),
+                kind: 8,
+                value: "789".into(),
+            },
+        ];
+        assert!(cfg.validate().is_ok());
+        // Prefix commands ignore options: junk options must not fail.
+        cfg.kind = "prefix".into();
+        cfg.options = vec![SlashOption {
+            name: "".into(),
+            kind: 0,
+            value: "".into(),
+        }];
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn command_node_returns_first_command_node_only() {
+        // H-CMD: one firing runs exactly the FIRST command node.
+        let mut s = Scenario::new("cmd");
+        assert!(s.command_node().is_none());
+        let mut first = Node::new(NodeKind::ActionSendCommand);
+        first.config = serde_json::json!({"kind": "prefix", "name": "first"});
+        let mut second = Node::new(NodeKind::ActionSendCommand);
+        second.config = serde_json::json!({"kind": "prefix", "name": "second"});
+        s.nodes.push(first);
+        s.nodes.push(second);
+        let found = s.command_node().unwrap();
+        assert_eq!(CommandConfig::from_node(found).name, "first");
+    }
+
+    #[test]
+    fn malformed_command_config_fails_closed() {
+        // H-CMD: from_node tolerates malformed JSON by returning the
+        // default config — and the default fails validation, so a
+        // corrupt row can never send (no bare "!" message).
+        let mut node = Node::new(NodeKind::ActionSendCommand);
+        node.config = serde_json::json!({"kind": 123, "name": ["not", "a", "string"]});
+        let cfg = CommandConfig::from_node(&node);
+        assert_eq!(cfg.name, "");
+        assert!(cfg.validate().is_err());
+        // A slash config missing name + application ID also fails.
+        node.config = serde_json::json!({"kind": "slash"});
+        assert!(CommandConfig::from_node(&node).validate().is_err());
     }
 
     #[test]

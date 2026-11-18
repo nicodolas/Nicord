@@ -1035,6 +1035,10 @@ impl Engine {
         let MessageSender::User(client) = sender else {
             return Err("webhook mode cannot send commands".into());
         };
+        // Defensive: send_once already validates the scenario, but a
+        // direct caller must never send a malformed command (H-CMD).
+        cfg.validate()
+            .map_err(|e| format!("invalid command: {e}"))?;
         let mut rng = StdRng::from_os_rng();
         if cfg.is_slash() {
             return self.send_slash(scenario, cfg, sender, antiban).await;

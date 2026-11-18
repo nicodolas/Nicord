@@ -194,6 +194,49 @@ What the user must provide for slash: the bot's Application ID
 Command ID only if auto-resolve fails. The gateway token is the same
 stored token (Identify reuses it in-memory; never logged).
 
+**Hardening audit (H-CMD, 2026-11-18).** The command paths were
+audited end to end (routing, validation, prefix/slash sends,
+gateway session handling, payload building, UI editor, test
+send). Findings, all addressed or documented:
+
+- Validation is fail-closed at three layers: scenario
+  validation (name required; slash requires Application ID;
+  command nodes rejected in webhook mode), `send_once`
+  re-validates every scenario before firing, and `send_command`
+  re-validates the config defensively. A malformed node config
+  parses to the default (empty name), which validation rejects
+  — a corrupt row can never send a bare prefix.
+- Slash options are now validated: non-empty names, type codes
+  limited to the supported set (3, 4, 5, 6, 7, 8, 10), no
+  duplicate names (case-insensitive). Previously a bad option
+  produced a malformed payload and a cryptic Discord 400.
+  Prefix commands ignore options, so stale options on a prefix
+  config do not fail validation. Note: a scenario saved with an
+  empty option row now fails validation with a clear error
+  instead of silently dropping that option — fill in or remove
+  the row.
+- Known limits (by design, unchanged): one firing runs only the
+  FIRST command node; no subcommand/subcommand-group option
+  types (1/2); no component interactions (the bot's reply
+  buttons/selects cannot be clicked); option values that fail
+  to parse fall back silently (bad integer → 0, bad number →
+  0.0, unrecognized boolean → false); a failed channel read
+  fails the whole slash send (no guild cache).
+- Test coverage: validation, prefix composition, first-node
+  routing, fail-closed malformed configs, interaction payload
+  shapes (guild/DM, version, typed options), search-response
+  parsing, option-value fallbacks, nonce shape, and gateway
+  payload/sequence parsing. The live retry loop and gateway
+  session flow have no unit tests (no mock client) and need
+  the live checks below.
+- **Live verification checklist (user, account mode):** one
+  real prefix command; one real slash command with auto-resolved
+  ID; one slash with a manually pasted Command ID; one slash
+  with options of several types; one unknown command name (must
+  fail with the "paste its Command ID" error); one run with the
+  gateway unreachable (must fail with the gateway error while
+  message sends keep working).
+
 ## Scheduler — fires exactly once per scheduled time
 
 Each scenario records `last_run_at` (the last scheduled time it fired) in
