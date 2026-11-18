@@ -144,10 +144,24 @@ impl AntiBanConfig {
 
 /// Layer 4 — content checks. Returns (cleaned_content, warnings).
 /// @everyone / @here are stripped when blocked; over-long messages are cut.
-pub fn sanitize_content(content: &str, cfg: &AntiBanConfig) -> (String, Vec<String>) {
+///
+/// `defang_mass_mentions` is false only in webhook mode when the
+/// scenario explicitly allows mass mentions (idea #7): there,
+/// Discord's official `allowed_mentions` mechanism governs, and
+/// mangling the text would silently override the user's opt-in.
+/// Every other path passes true — user-token mode always defangs
+/// when blocked, exactly as before (F-GUI-3).
+pub fn sanitize_content(
+    content: &str,
+    cfg: &AntiBanConfig,
+    defang_mass_mentions: bool,
+) -> (String, Vec<String>) {
     let mut warnings = Vec::new();
     let mut out = content.to_string();
-    if cfg.block_everyone && (out.contains("@everyone") || out.contains("@here")) {
+    if defang_mass_mentions
+        && cfg.block_everyone
+        && (out.contains("@everyone") || out.contains("@here"))
+    {
         out = out.replace("@everyone", "@\u{200b}everyone");
         out = out.replace("@here", "@\u{200b}here");
         warnings.push("@everyone/@here blocked by default (anti-ban layer 4)".to_string());
@@ -198,9 +212,20 @@ mod tests {
     #[test]
     fn everyone_is_blocked_by_default() {
         let cfg = AntiBanConfig::default();
-        let (clean, warnings) = sanitize_content("hi @everyone", &cfg);
+        let (clean, warnings) = sanitize_content("hi @everyone", &cfg, true);
         assert!(!clean.contains("@everyone"));
         assert!(!warnings.is_empty());
+    }
+
+    #[test]
+    fn everyone_survives_when_defang_is_off() {
+        // F-GUI-3: webhook mode + explicit opt-in. The text keeps a
+        // literal @everyone (Discord's allowed_mentions governs) and
+        // no block warning is emitted.
+        let cfg = AntiBanConfig::default();
+        let (clean, warnings) = sanitize_content("hi @everyone and @here", &cfg, false);
+        assert_eq!(clean, "hi @everyone and @here");
+        assert!(warnings.is_empty());
     }
 
     #[test]

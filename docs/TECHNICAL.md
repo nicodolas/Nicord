@@ -954,6 +954,17 @@ official message-object documentation; one real test message
 is still recommended to confirm Discord honors `allowed_mentions`
 via webhook execute, as with the other webhook behaviors.
 
+**Text defang vs. opt-in (F-GUI-3).** The scheduler's content
+check (`sanitize_content`, anti-ban layer 4) used to defang
+`@everyone`/`@here` with a zero-width space in every mode,
+which silently overrode an explicit opt-in: the text no longer
+contained a literal mention, so Discord had nothing to parse
+even with `allowed_mentions` omitted. Since the GUI-fix batch,
+the defang is skipped only in webhook mode when the scenario
+opts in — there, the official `allowed_mentions` mechanism is
+the single control. User-token mode and the command path keep
+the defang exactly as before.
+
 ## Maintenance (Group 3)
 
 - **Scheduled automatic backups.** On by default: every
@@ -1131,3 +1142,33 @@ are covered by code review (the loop is not unit-testable).
   stored tokens will stop decrypting.
 - Cron schedules use the scenario timezone; double-check schedules that
   cross midnight.
+
+## GUI fixes from live verification (F-GUI-1, F-GUI-2, F-GUI-4, F-GUI-5)
+
+Found by running the real binary under Xvfb and driving it
+(2026-11-18, screenshots in the verification notes, not the repo):
+
+- **F-GUI-1:** the health card was computed once at startup, so
+  after onboarding saved a webhook it still showed the
+  startup-time token-mode warning. All three onboarding exits
+  (webhook save, token save, skip) now call `refresh_health()`
+  before showing the Dashboard.
+- **F-GUI-2:** the Builder search row reserved a fixed 170 px
+  for the two bulk buttons, which they overflow at the default
+  window width (the second button slid under the editor panel).
+  The search field now takes a full row, with the buttons on
+  the row below — robust at any width, language, or UI scale.
+- **F-GUI-4:** the 10-minute engine pause after 3 consecutive
+  errors was invisible (Dashboard still said "Running"). The
+  engine now records the pause end (`error_pause_until`,
+  runtime-only: a restart resets the breaker), and the sidebar
+  + Dashboard engine card show "Paused (m:ss)" with a warning
+  dot while it lasts.
+- **F-GUI-5:** Dashboard, Destinations, and Settings had no
+  vertical `ScrollArea`, so at the default 1100x700 window
+  their lower content (Actions row, timeline, lower Settings
+  cards) was unreachable without resizing. The three screens
+  are now wrapped in a `ScrollArea` at the `CentralPanel`
+  dispatch (distinct `id_salt`s); Builder and Logs already
+  scroll internally, and Onboarding is left unwrapped because
+  it centers from `available_height`.

@@ -545,6 +545,15 @@ impl NicordApp {
     }
 
     /// Recompute the startup health report from the current state.
+    /// "m:ss" left in the 3-consecutive-errors engine pause, if
+    /// the pause is in effect (F-GUI-4). Read fresh every frame
+    /// by the sidebar and the Dashboard engine card.
+    fn error_pause_label(&self) -> Option<String> {
+        self.engine
+            .error_pause_remaining()
+            .map(|d| format!("{}:{:02}", d.as_secs() / 60, d.as_secs() % 60))
+    }
+
     fn refresh_health(&mut self) {
         let destinations = self.store.load_destinations().unwrap_or_default();
         let scenarios = self.scenarios.lock().map(|l| l.clone()).unwrap_or_default();
@@ -1708,13 +1717,34 @@ impl eframe::App for NicordApp {
                         });
                     ui.add_space(10.0);
                 }
+                // F-GUI-5: Dashboard, Destinations, and Settings
+                // have no ScrollArea of their own, so at the default
+                // 1100x700 window their lower content (Actions row,
+                // timeline, lower Settings cards) was unreachable
+                // without resizing. Wrap those three here; Builder
+                // and Logs already scroll internally, and Onboarding
+                // centers from available_height (a ScrollArea would
+                // break its layout). Distinct id_salts keep each
+                // screen's scroll state separate.
                 match self.screen {
                     Screen::Onboarding => self.show_onboarding(ui),
-                    Screen::Dashboard => self.show_dashboard(ui),
+                    Screen::Dashboard => {
+                        egui::ScrollArea::vertical()
+                            .id_salt("scroll_dashboard")
+                            .show(ui, |ui| self.show_dashboard(ui));
+                    }
                     Screen::Builder => self.show_builder(ui),
-                    Screen::Destinations => self.show_destinations(ui),
+                    Screen::Destinations => {
+                        egui::ScrollArea::vertical()
+                            .id_salt("scroll_destinations")
+                            .show(ui, |ui| self.show_destinations(ui));
+                    }
                     Screen::Logs => self.show_logs(ui),
-                    Screen::Settings => self.show_settings(ui),
+                    Screen::Settings => {
+                        egui::ScrollArea::vertical()
+                            .id_salt("scroll_settings")
+                            .show(ui, |ui| self.show_settings(ui));
+                    }
                 }
             });
         // Auto-update dialog (only when a newer release was found, or
@@ -1948,20 +1978,26 @@ impl NicordApp {
                         .engine
                         .running
                         .load(std::sync::atomic::Ordering::SeqCst);
+                    // F-GUI-4: surface the 3-error engine pause
+                    // (warning dot + countdown) instead of a
+                    // misleading "running".
+                    let pause_label = self.error_pause_label();
                     ui.horizontal(|ui| {
-                        ui.label(theme::dot(if running {
+                        ui.label(theme::dot(if pause_label.is_some() {
+                            theme::palette().warning
+                        } else if running {
                             theme::palette().success
                         } else {
                             theme::palette().text_muted
                         }));
-                        ui.label(
-                            RichText::new(if running {
-                                "Engine running"
-                            } else {
-                                "Engine stopped"
-                            })
-                            .small(),
-                        );
+                        let status = if let Some(left) = &pause_label {
+                            format!("Engine paused ({left})")
+                        } else if running {
+                            "Engine running".to_string()
+                        } else {
+                            "Engine stopped".to_string()
+                        };
+                        ui.label(RichText::new(status).small());
                     });
                     let count = self.scenarios.lock().map(|l| l.len()).unwrap_or(0);
                     theme::muted(ui, &format!("Scenarios: {count}"));
@@ -2015,6 +2051,10 @@ impl NicordApp {
                 if theme::ghost_button(ui, "Skip for now -> Dashboard").clicked() {
                     self.config.tos_accepted = self.tos_checked;
                     let _ = save_config(&self.config);
+                    // F-GUI-1: the health card was computed at startup
+                    // (before this choice); refresh so Dashboard does
+                    // not show stale issues for the other mode.
+                    self.refresh_health();
                     self.screen = Screen::Dashboard;
                 }
             });
@@ -2073,6 +2113,10 @@ impl NicordApp {
                                 if save_config(&self.config).is_ok() {
                                     self.upsert_destination_from_legacy();
                                     self.webhook_url_input.clear();
+                                    // F-GUI-1: refresh so the health card
+                                    // reflects webhook mode, not the
+                                    // startup-time token-mode warning.
+                                    self.refresh_health();
                                     self.screen = Screen::Dashboard;
                                     self.set_status("Webhook saved (encrypted, local only).");
                                 } else {
@@ -2163,6 +2207,9 @@ impl NicordApp {
                             self.config.send_mode = SendMode::UserToken;
                             if save_config(&self.config).is_ok() {
                                 self.token_input.clear();
+                                // F-GUI-1: same staleness as the webhook
+                                // path — refresh before showing Dashboard.
+                                self.refresh_health();
                                 self.screen = Screen::Dashboard;
                                 self.set_status("Token saved (encrypted, local only).");
                             } else {
@@ -2375,13 +2422,18 @@ impl NicordApp {
         } else {
             0.0
         };
+        // F-GUI-4: show the 3-error engine pause (with countdown)
+        // instead of a misleading "Running".
+        let engine_status = if let Some(left) = self.error_pause_label() {
+            format!("Paused ({left})")
+        } else if running {
+            "Running".to_string()
+        } else {
+            "Stopped".to_string()
+        };
         ui.columns(3, |cols| {
             theme::stat_card(&mut cols[0], "Scenarios", &count.to_string());
-            theme::stat_card(
-                &mut cols[1],
-                "Engine",
-                if running { "Running" } else { "Stopped" },
-            );
+            theme::stat_card(&mut cols[1], "Engine", &engine_status);
             theme::stat_card(
                 &mut cols[2],
                 "Sent today (limit 300)",
@@ -2698,13 +2750,19 @@ impl NicordApp {
             let disable_all_label = t(self.lang(), "builder.disable_all");
             let mut bulk_enable = false;
             let mut bulk_disable = false;
+            // F-GUI-2: the search field and the two bulk buttons used
+            // to share one row with a fixed 170 px reserve, which the
+            // buttons overflow at the default window width (the second
+            // button slid under the editor panel). Two rows: the field
+            // takes the full width, the buttons sit below it — robust
+            // at any width, language, or UI scale.
+            ui.add(
+                egui::TextEdit::singleline(&mut self.builder_search)
+                    .hint_text(search_hint)
+                    .desired_width(ui.available_width()),
+            );
+            ui.add_space(4.0);
             ui.horizontal(|ui| {
-                let field_w = (ui.available_width() - 170.0).max(80.0);
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.builder_search)
-                        .hint_text(search_hint)
-                        .desired_width(field_w),
-                );
                 if ui.button(enable_all_label).clicked() {
                     bulk_enable = true;
                 }

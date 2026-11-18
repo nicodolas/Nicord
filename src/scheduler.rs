@@ -139,6 +139,12 @@ pub struct Engine {
     /// error is remembered for the Dashboard health card until a
     /// later save succeeds. None = no failure recorded.
     last_persist_error: std::sync::Mutex<Option<String>>,
+    /// End of the 10-minute engine pause after 3 consecutive
+    /// errors (F-GUI-4). Runtime-only on purpose: a restart
+    /// resets the circuit breaker, like a fresh engine. None =
+    /// not paused. The UI reads it so the pause is visible
+    /// instead of silently looking like "Running".
+    error_pause_until: std::sync::Mutex<Option<Instant>>,
 }
 
 impl Engine {
@@ -174,6 +180,7 @@ impl Engine {
             deleted_today: std::sync::Mutex::new(0),
             started_at: Instant::now(),
             last_persist_error: std::sync::Mutex::new(None),
+            error_pause_until: std::sync::Mutex::new(None),
         }
     }
 
@@ -198,6 +205,23 @@ impl Engine {
     /// successful run-state save.
     pub fn last_persist_error(&self) -> Option<String> {
         self.last_persist_error.lock().ok().and_then(|s| s.clone())
+    }
+
+    /// Time left in the 3-consecutive-errors engine pause, if
+    /// the pause is still in effect (F-GUI-4). Read by the
+    /// Dashboard and sidebar so the pause is visible. Expires
+    /// by time comparison; no clearing needed.
+    pub fn error_pause_remaining(&self) -> Option<Duration> {
+        self.error_pause_until
+            .lock()
+            .ok()
+            .and_then(|g| (*g).and_then(|t| t.checked_duration_since(Instant::now())))
+    }
+
+    fn set_error_pause(&self, secs: u64) {
+        if let Ok(mut slot) = self.error_pause_until.lock() {
+            *slot = Some(Instant::now() + Duration::from_secs(secs.max(1)));
+        }
     }
 
     /// Save a scenario's run state, recording failures (M2)
@@ -662,7 +686,12 @@ impl Engine {
         };
         // Layer 4: content checks. Empty content is allowed when an
         // embed is attached (Discord requires content OR embeds).
-        let (clean, warnings) = sanitize_content(&final_text, &antiban);
+        // F-GUI-3: in webhook mode the scenario's own mass-mention
+        // setting governs (idea #7, via Discord's official
+        // allowed_mentions); the text defang must not silently
+        // override an explicit opt-in. User-token mode unchanged.
+        let defang = !(sender.is_webhook() && scenario.allow_mass_mentions);
+        let (clean, warnings) = sanitize_content(&final_text, &antiban, defang);
         for w in &warnings {
             tracing::warn!("anti-ban: {w}");
         }
@@ -1027,7 +1056,9 @@ impl Engine {
             &vars,
             &HashMap::new(),
         );
-        let (clean, warnings) = sanitize_content(&rendered, antiban);
+        // Commands are user-token only: the defang stays on, exactly
+        // as before (F-GUI-3 does not apply here).
+        let (clean, warnings) = sanitize_content(&rendered, antiban, true);
         for w in &warnings {
             tracing::warn!("anti-ban: {w}");
         }
@@ -1486,6 +1517,9 @@ impl Engine {
                         // out the full 10 minutes.
                         if consecutive_errors >= 3 {
                             tracing::error!("3 consecutive errors — pausing engine for 10 min");
+                            // F-GUI-4: record the pause so the UI can
+                            // show it instead of a misleading "Running".
+                            self.set_error_pause(600);
                             if self.sleep_interruptible(Duration::from_secs(600)).await {
                                 break;
                             }
@@ -1592,6 +1626,20 @@ mod tests {
         let scenario = Scenario::new("t");
         engine.save_run_state(&scenario, "test save");
         assert!(engine.last_persist_error().is_none());
+    }
+
+    #[test]
+    fn error_pause_remaining_tracks_the_pause() {
+        // F-GUI-4: fresh engine = no pause; after set, the
+        // remaining time is ~the full pause (a few ms of test
+        // overhead at most); it expires by time comparison.
+        let store = Arc::new(Store::open_memory().unwrap());
+        let engine = Engine::new(store, AntiBanConfig::default(), 300, 5);
+        assert!(engine.error_pause_remaining().is_none());
+        engine.set_error_pause(600);
+        let remaining = engine.error_pause_remaining().unwrap();
+        assert!(remaining.as_secs() <= 600);
+        assert!(remaining.as_secs() >= 590);
     }
 
     #[test]
