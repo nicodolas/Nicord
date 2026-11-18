@@ -9,6 +9,9 @@
 //!   missed intervals for EveryMinutes/EveryHours.
 //! - `Once` fires exactly once, then the scenario is disabled.
 //! - Cron is a real 5-field parser (minute hour dom month dow), not hourly.
+//! - DST policy (L4, one policy for firing and display): an ambiguous
+//!   wall-clock time fires once, at its FIRST occurrence; a nonexistent
+//!   wall-clock time never fires. See `resolve_wall_time`.
 
 use crate::preview::{char_count, DISCORD_CONTENT_LIMIT};
 use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveTime, Timelike, Utc};
@@ -69,29 +72,28 @@ impl Schedule {
                 from + chrono::Duration::hours(h)
             }
             Schedule::Daily { time } => {
-                let today = from_tz
-                    .date_naive()
-                    .and_time(*time)
-                    .and_local_timezone(tz)
-                    .single();
-                let next_tz = match today {
-                    Some(t) if t > from_tz => t,
-                    Some(t) => t + chrono::Duration::days(1),
-                    // Ambiguous/nonexistent wall time (DST gap):
-                    // fall back to 24h out rather than guessing.
-                    None => from_tz + chrono::Duration::days(1),
-                };
-                next_tz.with_timezone(&Local)
+                // Same DST policy as the firing decision (L4):
+                // ambiguous resolves to the first occurrence,
+                // nonexistent skips to the next day. Resolving
+                // per date (instead of adding 24h to today's
+                // occurrence) also keeps the wall time exact
+                // across a DST transition.
+                for day_offset in 0..8 {
+                    let candidate_date = from_tz.date_naive() + chrono::Duration::days(day_offset);
+                    if let Some(c) = resolve_wall_time(candidate_date, *time, tz) {
+                        if c > from_tz {
+                            return c.with_timezone(&Local);
+                        }
+                    }
+                }
+                (from_tz + chrono::Duration::days(1)).with_timezone(&Local)
             }
             Schedule::Weekly { weekdays, time } => {
                 for day_offset in 0..8 {
                     let candidate_date = from_tz.date_naive() + chrono::Duration::days(day_offset);
                     let weekday = candidate_date.weekday().num_days_from_monday() as u8;
                     if weekdays.contains(&weekday) {
-                        let candidate = candidate_date
-                            .and_time(*time)
-                            .and_local_timezone(tz)
-                            .single();
+                        let candidate = resolve_wall_time(candidate_date, *time, tz);
                         if let Some(c) = candidate {
                             if c > from_tz {
                                 return c.with_timezone(&Local);
@@ -311,7 +313,51 @@ pub fn cron_matches(fields: &CronFields, dt: DateTime<chrono_tz::Tz>) -> bool {
     }
 }
 
+/// Resolve a wall-clock time in a timezone under Nicord's single
+/// DST policy (L4), shared by the firing decision (`due_time`)
+/// and the display computation (`next_after`):
+///
+/// - An ambiguous wall-clock time (one that occurs twice when
+///   clocks fall back) resolves to its FIRST occurrence: the
+///   schedule fires once, at the first.
+/// - A nonexistent wall-clock time (one skipped when clocks
+///   spring forward) resolves to nothing: it never fires.
+///
+/// Before L4, Daily/Weekly skipped ambiguous days entirely
+/// (`.single()`), while the cron path could fire twice in an
+/// ambiguous hour — two distinct instants share the wall time,
+/// and the last-run anchor only suppresses the earlier one.
+/// The cron minute-walk cannot use this helper (it visits
+/// absolute instants, not wall times), so it applies the same
+/// policy via `is_second_occurrence` instead.
+fn resolve_wall_time(
+    date: NaiveDate,
+    time: NaiveTime,
+    tz: chrono_tz::Tz,
+) -> Option<DateTime<chrono_tz::Tz>> {
+    match date.and_time(time).and_local_timezone(tz) {
+        chrono::LocalResult::Single(t) => Some(t),
+        chrono::LocalResult::Ambiguous(early, _late) => Some(early),
+        chrono::LocalResult::None => None,
+    }
+}
+
+/// True when `dt` is the second occurrence of an ambiguous
+/// wall-clock time (L4 policy: fire at the first only). Used by
+/// the cron backward walk in `due_time`, which visits absolute
+/// instants and would otherwise match both occurrences.
+fn is_second_occurrence(dt: DateTime<chrono_tz::Tz>, tz: chrono_tz::Tz) -> bool {
+    matches!(
+        dt.naive_local().and_local_timezone(tz),
+        chrono::LocalResult::Ambiguous(early, _) if early != dt
+    )
+}
+
 /// First cron match strictly after `from` (scans at most ~366 days).
+/// The forward scan implements the L4 DST policy naturally: it
+/// reaches the first occurrence of an ambiguous wall time first,
+/// and a nonexistent wall time is never an instant, so it never
+/// matches.
 pub fn cron_next_after(
     fields: &CronFields,
     from: DateTime<chrono_tz::Tz>,
@@ -394,7 +440,15 @@ pub fn due_time(
                     return None;
                 }
                 if cand > anchor_tz && cron_matches(&fields, cand) {
-                    return Some(cand.with_timezone(&Local));
+                    // L4 DST policy: skip the second occurrence
+                    // of an ambiguous wall time — it fires once,
+                    // at the first. Without this, the walk fires
+                    // at the first occurrence, then fires again
+                    // when it reaches the second (a different
+                    // instant, so the anchor cannot suppress it).
+                    if !is_second_occurrence(cand, tz) {
+                        return Some(cand.with_timezone(&Local));
+                    }
                 }
                 cand -= chrono::Duration::minutes(1);
             }
@@ -427,8 +481,16 @@ fn wall_clock_due(
     tz: chrono_tz::Tz,
 ) -> Option<DateTime<Local>> {
     let mut best: Option<DateTime<chrono_tz::Tz>> = None;
-    let mut date = anchor.date_naive();
+    // L4: clamp the scan to the last 7 days + today (8 dates).
+    // Daily/Weekly schedules recur within every 7-day window,
+    // so the latest occurrence in (anchor, now] is always inside
+    // it — the window's 8th date covers a weekday whose time has
+    // not occurred yet today (its latest occurrence is exactly
+    // 7 days back). An ancient anchor (long-off machine, old
+    // import) used to scan every day since the anchor, on every
+    // engine tick. The `> anchor` filter below still applies.
     let end = now.date_naive();
+    let mut date = anchor.date_naive().max(end - chrono::Duration::days(7));
     while date <= end {
         if let Some(wds) = weekdays {
             let wd = date.weekday().num_days_from_monday() as u8;
@@ -437,10 +499,7 @@ fn wall_clock_due(
                 continue;
             }
         }
-        if let Some(cand) = date
-            .and_time(time)
-            .and_local_timezone(tz)
-            .single()
+        if let Some(cand) = resolve_wall_time(date, time, tz)
             .filter(|c| *c > anchor && *c <= now)
             .filter(|c| best.map(|b| *c > b).unwrap_or(true))
         {
@@ -2024,6 +2083,155 @@ mod tests {
         assert!(due.is_some());
         // The due instant is 02:00 UTC.
         assert_eq!(due.unwrap().with_timezone(&Utc).hour(), 2);
+    }
+
+    #[test]
+    fn daily_fires_once_at_first_occurrence_in_ambiguous_hour() {
+        // 2026-11-01: clocks fall back in New York; 01:30 occurs
+        // twice (05:30 UTC as EDT, 06:30 UTC as EST). L4 policy:
+        // fire once, at the first.
+        let sched = Schedule::Daily {
+            time: NaiveTime::from_hms_opt(1, 30, 0).unwrap(),
+        };
+        let anchor = Utc
+            .with_ymd_and_hms(2026, 10, 31, 6, 0, 0)
+            .single()
+            .unwrap();
+        // Between the two occurrences: due at the FIRST one.
+        let now = local(2026, 11, 1, 6, 0); // 01:00 EST
+        let due = due_time(&sched, Some(anchor), None, now, "America/New_York").unwrap();
+        let first = Utc
+            .with_ymd_and_hms(2026, 11, 1, 5, 30, 0)
+            .single()
+            .unwrap();
+        assert_eq!(due.with_timezone(&Utc), first);
+        // After firing at the first occurrence, the second must
+        // not fire again.
+        let now = local(2026, 11, 1, 7, 0); // 02:00 EST
+        assert!(due_time(&sched, Some(first), None, now, "America/New_York").is_none());
+    }
+
+    #[test]
+    fn daily_skips_nonexistent_time_in_spring_gap() {
+        // 2026-03-08: clocks spring forward in New York; 02:30
+        // does not exist. L4 policy: never fires.
+        let sched = Schedule::Daily {
+            time: NaiveTime::from_hms_opt(2, 30, 0).unwrap(),
+        };
+        // Anchor after 03-07's 02:30 EST (07:30 UTC).
+        let anchor = Utc.with_ymd_and_hms(2026, 3, 7, 8, 0, 0).single().unwrap();
+        let now = local(2026, 3, 8, 12, 0);
+        assert!(due_time(&sched, Some(anchor), None, now, "America/New_York").is_none());
+    }
+
+    #[test]
+    fn cron_fires_once_at_first_occurrence_in_ambiguous_hour() {
+        // Regression: the backward minute-walk used to return
+        // the second occurrence, and then fire again at the
+        // first — two sends for one wall-clock time.
+        let sched = Schedule::Cron {
+            expr: "30 1 * * *".to_string(),
+        };
+        let anchor = Utc
+            .with_ymd_and_hms(2026, 10, 31, 6, 0, 0)
+            .single()
+            .unwrap();
+        let now = local(2026, 11, 1, 7, 0); // after both occurrences
+        let due = due_time(&sched, Some(anchor), None, now, "America/New_York").unwrap();
+        let first = Utc
+            .with_ymd_and_hms(2026, 11, 1, 5, 30, 0)
+            .single()
+            .unwrap();
+        assert_eq!(due.with_timezone(&Utc), first);
+        // After firing at the first, no second fire.
+        assert!(due_time(&sched, Some(first), None, now, "America/New_York").is_none());
+    }
+
+    #[test]
+    fn cron_skips_nonexistent_time_in_spring_gap() {
+        let sched = Schedule::Cron {
+            expr: "30 2 * * *".to_string(),
+        };
+        let anchor = Utc.with_ymd_and_hms(2026, 3, 7, 8, 0, 0).single().unwrap();
+        let now = local(2026, 3, 8, 12, 0);
+        assert!(due_time(&sched, Some(anchor), None, now, "America/New_York").is_none());
+    }
+
+    #[test]
+    fn wall_clock_scan_handles_ancient_anchor() {
+        // L4 clamp: a 1970 anchor must not scan ~20k days; the
+        // latest occurrence is still found.
+        let sched = Schedule::Daily {
+            time: NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
+        };
+        let anchor = Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 0).single().unwrap();
+        let now = local(2026, 11, 18, 10, 0);
+        let due = due_time(&sched, Some(anchor), None, now, "UTC").unwrap();
+        assert_eq!(
+            due.with_timezone(&Utc),
+            Utc.with_ymd_and_hms(2026, 11, 18, 9, 0, 0)
+                .single()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn weekly_clamp_keeps_occurrence_exactly_seven_days_back() {
+        // Monday 09:00; now is Monday 08:00, so the latest
+        // occurrence is exactly 7 days back — the clamp window
+        // must include it. (2026-11-16 and 2026-11-23 are
+        // Mondays; Monday is weekday 0.)
+        let sched = Schedule::Weekly {
+            weekdays: vec![0],
+            time: NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
+        };
+        let anchor = Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 0).single().unwrap();
+        let now = local(2026, 11, 23, 8, 0);
+        let due = due_time(&sched, Some(anchor), None, now, "UTC").unwrap();
+        assert_eq!(
+            due.with_timezone(&Utc),
+            Utc.with_ymd_and_hms(2026, 11, 16, 9, 0, 0)
+                .single()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn next_after_ambiguous_hour_returns_first_occurrence() {
+        let s = Schedule::Daily {
+            time: NaiveTime::from_hms_opt(1, 30, 0).unwrap(),
+        };
+        let from = local(2026, 11, 1, 4, 0); // 00:00 EDT
+        let next = s.next_after(from, "America/New_York");
+        assert_eq!(
+            next.with_timezone(&Utc),
+            Utc.with_ymd_and_hms(2026, 11, 1, 5, 30, 0)
+                .single()
+                .unwrap()
+        );
+        // Between the two occurrences: the day's fire has
+        // passed; next is tomorrow's 01:30 EST.
+        let from = local(2026, 11, 1, 6, 0); // 01:00 EST
+        let next = s.next_after(from, "America/New_York");
+        assert_eq!(
+            next.with_timezone(&Utc),
+            Utc.with_ymd_and_hms(2026, 11, 2, 6, 30, 0)
+                .single()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn next_after_skips_spring_gap_day() {
+        let s = Schedule::Daily {
+            time: NaiveTime::from_hms_opt(2, 30, 0).unwrap(),
+        };
+        let from = local(2026, 3, 8, 5, 0); // 00:00 EST
+        let next = s.next_after(from, "America/New_York");
+        assert_eq!(
+            next.with_timezone(&Utc),
+            Utc.with_ymd_and_hms(2026, 3, 9, 6, 30, 0).single().unwrap()
+        );
     }
 
     #[test]

@@ -814,6 +814,36 @@ by reading the code (no new features):
   the database no longer makes writes fail instantly with
   "database is locked".
 
+## DST policy + wall-clock scan clamp (L4)
+
+One DST policy, shared by the firing decision (`due_time`)
+and the display computation (`next_after`), implemented in
+`resolve_wall_time` / `is_second_occurrence` (`scenario.rs`):
+
+- An ambiguous wall-clock time (occurs twice when clocks fall
+  back) fires once, at its FIRST occurrence.
+- A nonexistent wall-clock time (skipped when clocks spring
+  forward) never fires; display moves to the next valid day.
+
+Before this fix the two paths disagreed: Daily/Weekly skipped
+ambiguous days entirely (`.single()` returned `None`), while
+the cron backward minute-walk could fire twice in an ambiguous
+hour (two distinct instants share the wall time, and the
+last-run anchor only suppresses the earlier one). The cron
+walk now skips the second occurrence; the forward scan used
+for display already returned the first occurrence. `next_after`
+for Daily now resolves per date instead of adding 24h to
+today's occurrence, so the wall time stays exact across a
+transition.
+
+`wall_clock_due` also clamps its day-scan to the last 7 days +
+today (8 dates, matching the cron path's 7-day clamp). Daily
+and Weekly schedules recur within every 7-day window, so the
+latest occurrence in (anchor, now] is always inside it — the
+8th date covers a weekday whose time has not occurred yet
+today. An ancient anchor (long-off machine, old import) used
+to scan every day since the anchor on every engine tick.
+
 ## Run-state persistence failures (M2)
 
 The engine's run loop used to ignore `save_scenario` failures
