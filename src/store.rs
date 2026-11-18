@@ -8,7 +8,7 @@ use crate::scenario::Scenario;
 use crate::scheduler::SendLogEntry;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use std::{path::PathBuf, sync::Mutex};
+use std::{collections::HashMap, path::PathBuf, sync::Mutex};
 
 /// How Nicord sends messages. Default is UserToken so existing
 /// configs keep their current behavior; new users choose in
@@ -156,6 +156,26 @@ pub struct AppConfig {
     pub window_x: f32,
     #[serde(default)]
     pub window_y: f32,
+    /// Scheduled automatic local backups (Group 3): a local-mode
+    /// export written to `<config_dir>/backups/` every
+    /// `auto_backup_interval_days`, keeping the newest
+    /// `auto_backup_keep` files. On by default: losing the config
+    /// means losing every schedule, and the files are small,
+    /// machine-bound, and owner-only.
+    #[serde(default = "default_true")]
+    pub auto_backup_enabled: bool,
+    #[serde(default = "default_auto_backup_interval_days")]
+    pub auto_backup_interval_days: u32,
+    #[serde(default = "default_auto_backup_keep")]
+    pub auto_backup_keep: u32,
+    /// RFC 3339 timestamp of the last automatic backup ("" = never).
+    #[serde(default)]
+    pub last_auto_backup_at: String,
+    /// Send-log retention in days (Group 3): rows older than this
+    /// are deleted on startup and by the manual cleanup button.
+    /// 0 = keep forever.
+    #[serde(default = "default_log_retention_days")]
+    pub log_retention_days: u32,
 }
 
 impl Default for AppConfig {
@@ -198,6 +218,11 @@ impl Default for AppConfig {
             window_height: 0.0,
             window_x: 0.0,
             window_y: 0.0,
+            auto_backup_enabled: true,
+            auto_backup_interval_days: default_auto_backup_interval_days(),
+            auto_backup_keep: default_auto_backup_keep(),
+            last_auto_backup_at: String::new(),
+            log_retention_days: default_log_retention_days(),
         }
     }
 }
@@ -243,6 +268,18 @@ fn default_theme() -> String {
 
 fn default_ui_scale() -> String {
     "medium".to_string()
+}
+
+fn default_auto_backup_interval_days() -> u32 {
+    1
+}
+
+fn default_auto_backup_keep() -> u32 {
+    7
+}
+
+fn default_log_retention_days() -> u32 {
+    90
 }
 
 pub fn config_dir() -> PathBuf {
@@ -291,11 +328,33 @@ impl Store {
     /// file database (e.g. to verify the busy timeout).
     fn open_at(path: &std::path::Path) -> Result<Self, String> {
         let conn = Connection::open(path).map_err(|e| format!("cannot open database: {e}"))?;
+        // The database holds encrypted secrets and log details: keep
+        // it owner-only on Unix, including WAL sidecars when present
+        // (a -wal file created mid-session keeps default permissions
+        // until the next open — a known, accepted residual window).
+        restrict_permissions(path);
+        let mut wal = path.as_os_str().to_owned();
+        wal.push("-wal");
+        restrict_permissions(std::path::Path::new(&wal));
+        let mut shm = path.as_os_str().to_owned();
+        shm.push("-shm");
+        restrict_permissions(std::path::Path::new(&shm));
         // A second Nicord instance (or another process) holding the
         // database must not make every write fail instantly with
         // "database is locked": wait up to 5 s for the lock instead.
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .map_err(|e| format!("cannot set busy timeout: {e}"))?;
+        // WAL + FULL durability: each `log_send` commit no longer
+        // fsyncs the whole database file (measured ~90 ms per
+        // insert on slow storage in DELETE mode), while FULL
+        // synchronous keeps the same crash durability as before —
+        // a power loss cannot lose the last scenario edit. WAL
+        // degrades gracefully to DELETE mode on filesystems that
+        // do not support it; correctness never depends on it.
+        // Export/import never copy the raw DB file (SQL + JSON),
+        // so the -wal/-shm sidecars are safe.
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
+            .map_err(|e| format!("cannot set WAL mode: {e}"))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS scenarios (
                 id TEXT PRIMARY KEY,
@@ -335,6 +394,7 @@ impl Store {
         // EXISTS never adds them). Guarded by a PRAGMA check, so
         // running it on every open is safe.
         Self::ensure_send_log_columns(&conn)?;
+        Self::ensure_send_log_indexes(&conn)?;
         Ok(Self {
             db: Mutex::new(conn),
         })
@@ -370,6 +430,26 @@ impl Store {
         Ok(())
     }
 
+    /// Indexes over `send_logs`, created idempotently on every
+    /// open (existing databases gain them on first launch after
+    /// the upgrade; measured ~0.9 s for 100k rows). Without them
+    /// every Dashboard frame scanned the whole log table. The
+    /// today-count queries use range bounds on `created_at` (see
+    /// `utc_today_bounds`) so the planner can seek these indexes
+    /// — an index alone does not help a `substr(...)` predicate.
+    fn ensure_send_log_indexes(conn: &Connection) -> Result<(), String> {
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_send_logs_status_created
+                 ON send_logs (status, created_at);
+             CREATE INDEX IF NOT EXISTS idx_send_logs_dest_status_created
+                 ON send_logs (destination_id, status, created_at);
+             CREATE INDEX IF NOT EXISTS idx_send_logs_scenario_id
+                 ON send_logs (scenario_id, id);",
+        )
+        .map_err(|e| format!("cannot create send_logs indexes: {e}"))?;
+        Ok(())
+    }
+
     /// Open a throwaway in-memory store (used by tests).
     #[cfg(test)]
     pub fn open_memory() -> Result<Self, String> {
@@ -382,6 +462,7 @@ impl Store {
              CREATE TABLE templates (id TEXT PRIMARY KEY, name TEXT NOT NULL, content TEXT NOT NULL, updated_at TEXT NOT NULL);",
         )
         .map_err(|e| e.to_string())?;
+        Self::ensure_send_log_indexes(&conn)?;
         Ok(Self {
             db: Mutex::new(conn),
         })
@@ -410,6 +491,106 @@ impl Store {
         Ok(())
     }
 
+    /// Durable template counters (idea #6: drip series). Stored in
+    /// `meta` as `counter:<name>` -> decimal. A counter's value IS
+    /// what `{{counter:name}}` renders; it increments by 1 after
+    /// each successful send that used it, and starts at 1. A
+    /// missing or unparseable row renders 1 (the series restarts).
+    fn counter_key(name: &str) -> String {
+        format!("counter:{name}")
+    }
+
+    pub fn get_counter(&self, name: &str) -> u64 {
+        self.get_meta(&Self::counter_key(name))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1)
+    }
+
+    /// Increment a counter by 1 (saturating) and return the new
+    /// value — the value the NEXT render shows. Read + write happen
+    /// under one lock, so concurrent sends cannot lose increments.
+    pub fn increment_counter(&self, name: &str) -> Result<u64, String> {
+        let key = Self::counter_key(name);
+        let db = self.db.lock().map_err(|e| e.to_string())?;
+        let current: Option<String> = db
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .ok();
+        let next = current
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(1)
+            .saturating_add(1);
+        db.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, next.to_string()],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(next)
+    }
+
+    /// Delete a counter: the next render starts at 1 again.
+    pub fn delete_counter(&self, name: &str) -> Result<(), String> {
+        self.db
+            .lock()
+            .map_err(|e| e.to_string())?
+            .execute(
+                "DELETE FROM meta WHERE key = ?1",
+                params![Self::counter_key(name)],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// All durable counters (for export). Unparseable rows are
+    /// skipped: a corrupt counter must not break the export.
+    pub fn load_counters(&self) -> HashMap<String, u64> {
+        let mut out = HashMap::new();
+        let Ok(db) = self.db.lock() else {
+            return out;
+        };
+        let mut stmt = match db.prepare("SELECT key, value FROM meta WHERE key LIKE 'counter:%'") {
+            Ok(s) => s,
+            Err(_) => return out,
+        };
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        });
+        if let Ok(rows) = rows {
+            for row in rows.flatten() {
+                if let (Some(name), Ok(value)) =
+                    (row.0.strip_prefix("counter:"), row.1.parse::<u64>())
+                {
+                    out.insert(name.to_string(), value);
+                }
+            }
+        }
+        out
+    }
+
+    /// Replace ALL durable counters (import replaces, never merges).
+    /// One transaction: the old set is deleted, then the new set is
+    /// written. Counters are not secrets and carry no validation
+    /// beyond the key prefix.
+    pub fn save_counters(&self, counters: &HashMap<String, u64>) -> Result<(), String> {
+        let mut db = self.db.lock().map_err(|e| e.to_string())?;
+        let tx = db.transaction().map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM meta WHERE key LIKE 'counter:%'", [])
+            .map_err(|e| e.to_string())?;
+        for (name, value) in counters {
+            tx.execute(
+                "INSERT INTO meta (key, value) VALUES (?1, ?2)",
+                params![Self::counter_key(name), value.to_string()],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     /// Days since the app first ran with any account (warm-up clock).
     /// Records today (UTC date) on first call and returns 0.
     pub fn account_age_days(&self) -> u32 {
@@ -430,14 +611,14 @@ impl Store {
     /// The bucket is the UTC date, never the local date: the cap resets at
     /// 00:00 UTC, so changing the machine timezone cannot grant extras.
     pub fn count_sends_today(&self) -> u32 {
-        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let (start, end) = utc_today_bounds();
         let conn = match self.db.lock() {
             Ok(c) => c,
             Err(_) => return 0,
         };
         conn.query_row(
-            "SELECT COUNT(*) FROM send_logs WHERE status = 'sent' AND substr(created_at, 1, 10) = ?1",
-            params![today],
+            "SELECT COUNT(*) FROM send_logs WHERE status = 'sent' AND created_at >= ?1 AND created_at < ?2",
+            params![start, end],
             |row| row.get::<_, i64>(0),
         )
         .unwrap_or(0)
@@ -547,39 +728,74 @@ impl Store {
         Ok((out, warnings))
     }
 
-    /// Delete every row of a table, including rows too corrupt to
-    /// parse. Import-replace uses these instead of load-then-delete:
-    /// deleting only the rows that parse would leave corrupt rows
-    /// behind after a "replace everything" import.
-    pub fn delete_all_scenarios(&self) -> Result<(), String> {
-        self.db
-            .lock()
-            .map_err(|e| e.to_string())?
-            .execute("DELETE FROM scenarios", [])
+    /// Replace ALL destinations, scenarios, and templates in a single
+    /// transaction: either the whole replacement lands or nothing
+    /// does. Used by config import, which replaces everything at
+    /// once. The SQL mirrors `save_destination` / `save_scenario` /
+    /// `save_template` (keep them in sync): upserts by id for
+    /// destinations/scenarios, fresh ids for templates. Deletion is
+    /// table-wide, so rows too corrupt to parse do not survive.
+    pub fn replace_all(
+        &self,
+        destinations: &[Destination],
+        scenarios: &[Scenario],
+        templates: &[crate::backup::TemplateEntry],
+    ) -> Result<(), String> {
+        let mut conn = self.db.lock().map_err(|e| e.to_string())?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM destinations", [])
             .map_err(|e| e.to_string())?;
-        Ok(())
-    }
-
-    pub fn delete_all_destinations(&self) -> Result<(), String> {
-        self.db
-            .lock()
-            .map_err(|e| e.to_string())?
-            .execute("DELETE FROM destinations", [])
+        tx.execute("DELETE FROM scenarios", [])
             .map_err(|e| e.to_string())?;
-        Ok(())
-    }
-
-    pub fn delete_all_templates(&self) -> Result<(), String> {
-        self.db
-            .lock()
-            .map_err(|e| e.to_string())?
-            .execute("DELETE FROM templates", [])
+        tx.execute("DELETE FROM templates", [])
             .map_err(|e| e.to_string())?;
+        let now = chrono::Utc::now().to_rfc3339();
+        for d in destinations {
+            let json = serde_json::to_string(d).map_err(|e| e.to_string())?;
+            tx.execute(
+                "INSERT INTO destinations (id, json, updated_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(id) DO UPDATE SET json = excluded.json, updated_at = excluded.updated_at",
+                params![d.id, json, now],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        for s in scenarios {
+            let json = serde_json::to_string(s).map_err(|e| e.to_string())?;
+            tx.execute(
+                "INSERT INTO scenarios (id, json, updated_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(id) DO UPDATE SET json = excluded.json, updated_at = excluded.updated_at",
+                params![s.id, json, now],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        for t in templates {
+            let id = uuid::Uuid::new_v4().to_string();
+            tx.execute(
+                "INSERT INTO templates (id, name, content, updated_at) VALUES (?1, ?2, ?3, ?4)",
+                params![id, t.name, t.content, now],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
         Ok(())
     }
 
     pub fn load_destination(&self, id: &str) -> Result<Option<Destination>, String> {
-        Ok(self.load_destinations()?.into_iter().find(|d| d.id == id))
+        // Direct lookup: the old load-all-then-filter read and
+        // parsed every destination row for one destination.
+        let conn = self.db.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare("SELECT json FROM destinations WHERE id = ?1")
+            .map_err(|e| e.to_string())?;
+        let mut rows = stmt.query(params![id]).map_err(|e| e.to_string())?;
+        match rows.next().map_err(|e| e.to_string())? {
+            Some(row) => {
+                let json: String = row.get(0).map_err(|e| e.to_string())?;
+                let dest: Destination = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+                Ok(Some(dest))
+            }
+            None => Ok(None),
+        }
     }
 
     pub fn delete_destination(&self, id: &str) -> Result<(), String> {
@@ -632,6 +848,14 @@ impl Store {
         }
         let existing = self.load_destinations()?;
         if !existing.is_empty() {
+            // Destinations already exist (created before this flag
+            // existed, or restored by an import): still assign any
+            // unassigned scenarios, or webhook mode can never enable
+            // them. The first destination (sorted by name) is the
+            // closest stand-in for the old single webhook.
+            if cfg.send_mode == SendMode::Webhook {
+                self.assign_unassigned_scenarios(&existing[0].id)?;
+            }
             cfg.destinations_migrated = true;
             return Ok(true);
         }
@@ -655,30 +879,41 @@ impl Store {
         // refreshes them; the destination works without them.
         self.save_destination(&dest)?;
         if cfg.send_mode == SendMode::Webhook {
-            let scenarios = self.load_scenarios()?;
-            for mut s in scenarios {
-                if s.destination_id.is_none() {
-                    s.destination_id = Some(dest.id.clone());
-                    self.save_scenario(&s)?;
-                }
-            }
+            self.assign_unassigned_scenarios(&dest.id)?;
         }
         cfg.destinations_migrated = true;
         Ok(true)
     }
 
-    /// Sends today (UTC date) to one channel, for per-destination caps.
-    /// In webhook mode the engine logs the destination's channel id,
-    /// so this is the destination's own count.
-    pub fn count_sends_today_for_channel(&self, channel_id: &str) -> u32 {
-        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    /// Point every scenario without a destination at `dest_id`.
+    /// Scenarios that already have one are untouched.
+    fn assign_unassigned_scenarios(&self, dest_id: &str) -> Result<(), String> {
+        let scenarios = self.load_scenarios()?;
+        for mut s in scenarios {
+            if s.destination_id.is_none() {
+                s.destination_id = Some(dest_id.to_string());
+                self.save_scenario(&s)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Sends today (UTC date) for one destination, counted by
+    /// `destination_id` — not by channel. Counting by channel
+    /// silently skipped the cap when `channel_id` was empty (a URL
+    /// saved without ever clicking "check"), misattributed caps
+    /// when the channel id was stale, and merged two destinations
+    /// sharing one channel into one bucket. Log rows carry
+    /// `destination_id` since Q13.
+    pub fn count_sends_today_for_destination(&self, destination_id: &str) -> u32 {
+        let (start, end) = utc_today_bounds();
         let conn = match self.db.lock() {
             Ok(c) => c,
             Err(_) => return 0,
         };
         conn.query_row(
-            "SELECT COUNT(*) FROM send_logs WHERE status = 'sent' AND channel_id = ?1 AND substr(created_at, 1, 10) = ?2",
-            params![channel_id, today],
+            "SELECT COUNT(*) FROM send_logs WHERE status = 'sent' AND destination_id = ?1 AND created_at >= ?2 AND created_at < ?3",
+            params![destination_id, start, end],
             |row| row.get::<_, i64>(0),
         )
         .unwrap_or(0)
@@ -788,38 +1023,50 @@ impl Store {
         channel_id: Option<&str>,
     ) -> Result<Vec<LogRow>, String> {
         let conn = self.db.lock().map_err(|e| e.to_string())?;
-        let like = format!("%{}%", escape_like(keyword));
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, created_at, scenario_id, scenario_name, channel_id, status, detail,
-                        COALESCE(message_id, ''), COALESCE(destination_id, '') FROM send_logs
-                 WHERE (?1 = '%%' OR scenario_name LIKE ?1 ESCAPE '\\' COLLATE NOCASE
+        // Two query shapes with identical result sets: when the
+        // keyword is empty the always-true `?1 = '%%' OR ...`
+        // clause is OMITTED, because with bound parameters it
+        // defeats index use and forces a full table scan on every
+        // Logs frame (measured 12.8 ms → 0.29 ms at 100k rows for
+        // a rare-scenario filter). The LIKE shape is kept verbatim
+        // for non-empty keywords.
+        const COLS: &str =
+            "SELECT id, created_at, scenario_id, scenario_name, channel_id, status, detail,
+                        COALESCE(message_id, ''), COALESCE(destination_id, '') FROM send_logs";
+        let mut stmt = if keyword.is_empty() {
+            conn.prepare(&format!(
+                "{COLS}
+                 WHERE (?1 IS NULL OR status = ?1)
+                   AND (?2 IS NULL OR scenario_id = ?2)
+                   AND (?3 IS NULL OR channel_id = ?3)
+                 ORDER BY id DESC LIMIT ?4"
+            ))
+        } else {
+            conn.prepare(&format!(
+                "{COLS}
+                 WHERE (scenario_name LIKE ?1 ESCAPE '\\' COLLATE NOCASE
                         OR status LIKE ?1 ESCAPE '\\' COLLATE NOCASE
                         OR detail LIKE ?1 ESCAPE '\\' COLLATE NOCASE)
                    AND (?2 IS NULL OR status = ?2)
                    AND (?3 IS NULL OR scenario_id = ?3)
                    AND (?4 IS NULL OR channel_id = ?4)
-                 ORDER BY id DESC LIMIT ?5",
+                 ORDER BY id DESC LIMIT ?5"
+            ))
+        }
+        .map_err(|e| e.to_string())?;
+        let rows = if keyword.is_empty() {
+            stmt.query_map(
+                params![status, scenario_id, channel_id, limit as i64],
+                log_row_from,
             )
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map(
+        } else {
+            let like = format!("%{}%", escape_like(keyword));
+            stmt.query_map(
                 params![like, status, scenario_id, channel_id, limit as i64],
-                |row| {
-                    Ok(LogRow {
-                        id: row.get(0)?,
-                        created_at: row.get(1)?,
-                        scenario_id: row.get(2)?,
-                        scenario_name: row.get(3)?,
-                        channel_id: row.get(4)?,
-                        status: row.get(5)?,
-                        detail: row.get(6)?,
-                        message_id: row.get(7)?,
-                        destination_id: row.get(8)?,
-                    })
-                },
+                log_row_from,
             )
-            .map_err(|e| e.to_string())?;
+        }
+        .map_err(|e| e.to_string())?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row.map_err(|e| e.to_string())?);
@@ -840,24 +1087,123 @@ impl Store {
         .flatten()
     }
 
+    /// (date `YYYY-MM-DD`, sent, failed) per day for the last
+    /// `days` days including today, oldest first. Days with no
+    /// sent/failed rows are omitted — the caller fills zeros. The
+    /// range bound keeps the scan to the requested window (the
+    /// index on `(status, created_at)` applies); other statuses
+    /// (e.g. the `deleted` audit rows) are excluded.
+    /// Delete send-log rows older than `days` days (Group 3).
+    /// Returns the number of rows deleted. `days == 0` deletes
+    /// nothing (retention disabled). The bound is the UTC date
+    /// `days` days ago: rows dated on that day are kept, rows
+    /// dated earlier are deleted. Deleted pages are reused by
+    /// SQLite; the file does not shrink (no VACUUM — a large
+    /// database would freeze the UI at startup).
+    pub fn prune_logs(&self, days: u32) -> Result<u64, String> {
+        if days == 0 {
+            return Ok(0);
+        }
+        let cutoff = (chrono::Utc::now().date_naive() - chrono::Duration::days(i64::from(days)))
+            .format("%Y-%m-%d")
+            .to_string();
+        let db = self.db.lock().map_err(|e| e.to_string())?;
+        let deleted = db
+            .execute("DELETE FROM send_logs WHERE created_at < ?1", [&cutoff])
+            .map_err(|e| e.to_string())?;
+        Ok(deleted as u64)
+    }
+
+    pub fn counts_by_day(&self, days: u32) -> Result<Vec<(String, u32, u32)>, String> {
+        let days = days.max(1);
+        let start = (chrono::Utc::now().date_naive() - chrono::Duration::days(i64::from(days) - 1))
+            .format("%Y-%m-%d")
+            .to_string();
+        let conn = self.db.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT substr(created_at, 1, 10), status, COUNT(*) FROM send_logs
+                 WHERE created_at >= ?1 AND status IN ('sent', 'failed')
+                 GROUP BY 1, 2 ORDER BY 1",
+            )
+            .map_err(|e| e.to_string())?;
+        let mut by_day: std::collections::BTreeMap<String, (u32, u32)> =
+            std::collections::BTreeMap::new();
+        let rows = stmt
+            .query_map(params![start], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        for row in rows {
+            let (date, status, count) = row.map_err(|e| e.to_string())?;
+            let entry = by_day.entry(date).or_default();
+            if status == "sent" {
+                entry.0 = count.max(0) as u32;
+            } else {
+                entry.1 = count.max(0) as u32;
+            }
+        }
+        Ok(by_day.into_iter().map(|(d, (s, f))| (d, s, f)).collect())
+    }
+
     /// Number of logs with the given status today (UTC date), from
     /// the persisted log. Used for persisted failure counts, so the
     /// Dashboard does not mix a persisted sent count with a
     /// session-only failed count.
     pub fn count_status_today(&self, status: &str) -> u32 {
-        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let (start, end) = utc_today_bounds();
         let conn = match self.db.lock() {
             Ok(c) => c,
             Err(_) => return 0,
         };
         conn.query_row(
-            "SELECT COUNT(*) FROM send_logs WHERE status = ?1 AND substr(created_at, 1, 10) = ?2",
-            params![status, today],
+            "SELECT COUNT(*) FROM send_logs WHERE status = ?1 AND created_at >= ?2 AND created_at < ?3",
+            params![status, start, end],
             |row| row.get::<_, i64>(0),
         )
         .unwrap_or(0)
         .max(0) as u32
     }
+}
+
+/// Today (UTC) as a half-open `[start, end)` pair of `YYYY-MM-DD`
+/// date strings, for range predicates on `created_at`.
+///
+/// Equivalent to the old `substr(created_at, 1, 10) = today` for
+/// every possible stored string: a value counts under the range
+/// exactly when it starts with today's date (any string starting
+/// with `YYYY-MM-DD` sorts before `YYYY-MM-DD+1`, and nothing else
+/// falls in the range) — regardless of whether the timestamp uses
+/// `+00:00`, `Z`, fractional seconds, or another offset. The range
+/// form lets SQLite seek the `send_logs` indexes instead of
+/// scanning the whole table on every Dashboard frame.
+fn utc_today_bounds() -> (String, String) {
+    let today = chrono::Utc::now().date_naive();
+    let tomorrow = today + chrono::Duration::days(1);
+    (
+        today.format("%Y-%m-%d").to_string(),
+        tomorrow.format("%Y-%m-%d").to_string(),
+    )
+}
+
+/// Map one `send_logs` row to a `LogRow`. Shared by both
+/// `query_logs` shapes so they cannot drift apart.
+fn log_row_from(row: &rusqlite::Row) -> rusqlite::Result<LogRow> {
+    Ok(LogRow {
+        id: row.get(0)?,
+        created_at: row.get(1)?,
+        scenario_id: row.get(2)?,
+        scenario_name: row.get(3)?,
+        channel_id: row.get(4)?,
+        status: row.get(5)?,
+        detail: row.get(6)?,
+        message_id: row.get(7)?,
+        destination_id: row.get(8)?,
+    })
 }
 
 /// Escape a user-typed keyword for use inside a SQL LIKE pattern:
@@ -932,12 +1278,55 @@ pub fn scrub_secrets(text: &str) -> String {
     out
 }
 
+/// Restrict a file to owner-only access (0600) on Unix; a no-op on
+/// other platforms, where the app directory already has user-private
+/// ACLs. Best-effort: failures are ignored — the file remains usable,
+/// and a permission error must never break startup or an export.
+/// Used for the database and for exported files, which can hold
+/// encrypted secrets or (for log rows written before the scrub
+/// boundary) URLs.
+pub(crate) fn restrict_permissions(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+/// How the config file was found by `load_config_status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigLoad {
+    /// No config file exists yet (first run): defaults are correct
+    /// and saving them later is safe.
+    Fresh,
+    /// The file was read and parsed.
+    Loaded,
+    /// The file exists but could not be read or parsed: defaults are
+    /// in use as a fallback, and the file must NOT be overwritten —
+    /// a transient read failure must not destroy a good config.
+    Unreadable,
+}
+
 pub fn load_config() -> AppConfig {
+    load_config_status().0
+}
+
+/// Load the config and report how the file was found. Startup uses
+/// the status to decide whether saving back is safe (see L7).
+pub fn load_config_status() -> (AppConfig, ConfigLoad) {
     let path = config_path();
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<AppConfig>(&s).ok())
-        .unwrap_or_default()
+    match std::fs::read_to_string(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            (AppConfig::default(), ConfigLoad::Fresh)
+        }
+        Err(_) => (AppConfig::default(), ConfigLoad::Unreadable),
+        Ok(s) => match serde_json::from_str::<AppConfig>(&s) {
+            Ok(cfg) => (cfg, ConfigLoad::Loaded),
+            Err(_) => (AppConfig::default(), ConfigLoad::Unreadable),
+        },
+    }
 }
 
 pub fn save_config(cfg: &AppConfig) -> Result<(), String> {
@@ -1043,6 +1432,269 @@ mod tests {
     }
 
     #[test]
+    fn send_log_indexes_exist() {
+        let store = Store::open_memory().unwrap();
+        let conn = store.db.lock().unwrap();
+        let mut stmt = conn.prepare("PRAGMA index_list('send_logs')").unwrap();
+        let names: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        for want in [
+            "idx_send_logs_status_created",
+            "idx_send_logs_dest_status_created",
+            "idx_send_logs_scenario_id",
+        ] {
+            assert!(
+                names.contains(&want.to_string()),
+                "missing {want}: {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn file_database_uses_wal_with_full_synchronous() {
+        let path = std::env::temp_dir().join(format!("nicord-wal-test-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = Store::open_at(&path).unwrap();
+        let (mode, sync): (String, i64) = {
+            let conn = store.db.lock().unwrap();
+            let mode: String = conn
+                .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+                .unwrap();
+            let sync: i64 = conn
+                .query_row("PRAGMA synchronous", [], |r| r.get(0))
+                .unwrap();
+            (mode, sync)
+        };
+        assert_eq!(mode, "wal");
+        assert_eq!(sync, 2); // FULL
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn today_counts_use_range_bounds_for_all_timestamp_forms() {
+        let store = Store::open_memory().unwrap();
+        let today = chrono::Utc::now().date_naive();
+        let yesterday = today - chrono::Duration::days(1);
+        let tomorrow = today + chrono::Duration::days(1);
+        let rows = [
+            // (created_at, status, destination_id, counts_today)
+            (format!("{today}T00:00:00+00:00"), "sent", "d1"),
+            (format!("{today}T12:00:00.123456789+00:00"), "sent", "d1"),
+            (format!("{today}T23:59:59Z"), "sent", "d1"),
+            (format!("{yesterday}T12:00:00+00:00"), "sent", "d1"),
+            (format!("{tomorrow}T00:00:00+00:00"), "sent", "d1"),
+            (format!("{today}T10:00:00+00:00"), "failed", "d1"),
+            (format!("{today}T10:00:00+00:00"), "sent", "d2"),
+        ];
+        {
+            let conn = store.db.lock().unwrap();
+            for (at, status, dest) in &rows {
+                conn.execute(
+                    "INSERT INTO send_logs (scenario_id, scenario_name, channel_id, status, detail, created_at, destination_id)
+                     VALUES ('s', 'n', 'c', ?1, 'd', ?2, ?3)",
+                    params![status, at, dest],
+                )
+                .unwrap();
+            }
+        }
+        assert_eq!(store.count_sends_today(), 4);
+        assert_eq!(store.count_status_today("failed"), 1);
+        assert_eq!(store.count_status_today("sent"), 4);
+        assert_eq!(store.count_sends_today_for_destination("d1"), 3);
+        assert_eq!(store.count_sends_today_for_destination("d2"), 1);
+        assert_eq!(store.count_sends_today_for_destination("nope"), 0);
+    }
+
+    #[test]
+    fn counters_start_at_one_increment_and_reset() {
+        let store = Store::open_memory().unwrap();
+        assert_eq!(store.get_counter("day"), 1);
+        assert_eq!(store.increment_counter("day").unwrap(), 2);
+        assert_eq!(store.get_counter("day"), 2);
+        assert_eq!(store.increment_counter("day").unwrap(), 3);
+        store.delete_counter("day").unwrap();
+        assert_eq!(store.get_counter("day"), 1);
+        // Saturating: the max value never wraps.
+        store
+            .set_meta("counter:big", &u64::MAX.to_string())
+            .unwrap();
+        assert_eq!(store.increment_counter("big").unwrap(), u64::MAX);
+    }
+
+    #[test]
+    fn counters_save_and_load_roundtrip() {
+        let store = Store::open_memory().unwrap();
+        let mut counters = HashMap::new();
+        counters.insert("a".to_string(), 5);
+        counters.insert("b".to_string(), 1);
+        store.save_counters(&counters).unwrap();
+        assert_eq!(store.load_counters(), counters);
+        assert_eq!(store.get_counter("a"), 5);
+        // Replace, not merge: saving an empty set clears all.
+        store.save_counters(&HashMap::new()).unwrap();
+        assert!(store.load_counters().is_empty());
+        assert_eq!(store.get_counter("a"), 1);
+    }
+
+    #[test]
+    fn prune_logs_removes_only_rows_older_than_retention() {
+        let store = Store::open_memory().unwrap();
+        let today = chrono::Utc::now().date_naive();
+        let boundary = today - chrono::Duration::days(30);
+        let old = today - chrono::Duration::days(31);
+        let rows = [
+            format!("{today}T08:00:00+00:00"),
+            format!("{boundary}T08:00:00+00:00"),
+            format!("{old}T08:00:00+00:00"),
+            format!("{old}T23:59:59+00:00"),
+        ];
+        {
+            let conn = store.db.lock().unwrap();
+            for at in &rows {
+                conn.execute(
+                    "INSERT INTO send_logs (scenario_id, scenario_name, channel_id, status, detail, created_at)
+                     VALUES ('s', 'n', 'c', 'sent', 'd', ?1)",
+                    params![at],
+                )
+                .unwrap();
+            }
+        }
+        assert_eq!(store.prune_logs(30).unwrap(), 2);
+        let remaining: i64 = store
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM send_logs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, 2);
+        // Retention disabled deletes nothing.
+        assert_eq!(store.prune_logs(0).unwrap(), 0);
+    }
+
+    #[test]
+    fn counts_by_day_groups_sent_and_failed_per_utc_date() {
+        let store = Store::open_memory().unwrap();
+        let today = chrono::Utc::now().date_naive();
+        let yesterday = today - chrono::Duration::days(1);
+        let old = today - chrono::Duration::days(10);
+        let rows = [
+            (format!("{today}T08:00:00+00:00"), "sent"),
+            (format!("{today}T09:00:00+00:00"), "sent"),
+            (format!("{today}T10:00:00+00:00"), "failed"),
+            (format!("{yesterday}T08:00:00+00:00"), "sent"),
+            (format!("{old}T08:00:00+00:00"), "sent"),
+            (format!("{today}T11:00:00+00:00"), "deleted"),
+        ];
+        {
+            let conn = store.db.lock().unwrap();
+            for (at, status) in &rows {
+                conn.execute(
+                    "INSERT INTO send_logs (scenario_id, scenario_name, channel_id, status, detail, created_at)
+                     VALUES ('s', 'n', 'c', ?1, 'd', ?2)",
+                    params![status, at],
+                )
+                .unwrap();
+            }
+        }
+        let counts = store.counts_by_day(7).unwrap();
+        // Only days with sent/failed rows, oldest first; the
+        // 10-day-old row and the `deleted` audit row are excluded.
+        assert_eq!(counts.len(), 2);
+        assert_eq!(counts[0].0, yesterday.format("%Y-%m-%d").to_string());
+        assert_eq!((counts[0].1, counts[0].2), (1, 0));
+        assert_eq!(counts[1].0, today.format("%Y-%m-%d").to_string());
+        assert_eq!((counts[1].1, counts[1].2), (2, 1));
+    }
+
+    #[test]
+    fn query_logs_empty_keyword_matches_all_filter_combinations() {
+        let store = Store::open_memory().unwrap();
+        let log = |id: &str, name: &str, status: &str, channel: &str| {
+            store
+                .log_send(&SendLogEntry {
+                    scenario_id: id.to_string(),
+                    scenario_name: name.to_string(),
+                    channel_id: channel.to_string(),
+                    status: status.to_string(),
+                    detail: format!("detail {name}"),
+                    message_id: String::new(),
+                    destination_id: String::new(),
+                })
+                .unwrap();
+        };
+        log("s1", "alpha", "sent", "c1");
+        log("s1", "beta", "failed", "c1");
+        log("s2", "gamma", "sent", "c2");
+        // Empty keyword + each filter dimension, alone and combined.
+        assert_eq!(store.query_logs(10, "", None, None, None).unwrap().len(), 3);
+        assert_eq!(
+            store
+                .query_logs(10, "", None, Some("s1"), None)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            store
+                .query_logs(10, "", Some("sent"), None, None)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            store
+                .query_logs(10, "", None, None, Some("c2"))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .query_logs(10, "", Some("sent"), Some("s1"), Some("c1"))
+                .unwrap()
+                .len(),
+            1
+        );
+        // Newest first.
+        let rows = store.query_logs(10, "", None, None, None).unwrap();
+        assert_eq!(rows[0].scenario_name, "gamma");
+        // The LIKE shape still combines with the other filters.
+        let rows = store
+            .query_logs(10, "ALPHA", None, Some("s1"), None)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].scenario_name, "alpha");
+    }
+
+    #[test]
+    fn load_destination_reads_one_row_directly() {
+        let store = Store::open_memory().unwrap();
+        let a = Destination::new("A");
+        let b = Destination::new("B");
+        store.save_destination(&a).unwrap();
+        store.save_destination(&b).unwrap();
+        assert_eq!(store.load_destination(&a.id).unwrap().unwrap().name, "A");
+        assert!(store.load_destination("missing").unwrap().is_none());
+        // A corrupt row errors instead of silently vanishing.
+        store
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO destinations (id, json, updated_at) VALUES ('bad', 'not-json{', 'x')",
+                [],
+            )
+            .unwrap();
+        assert!(store.load_destination("bad").is_err());
+    }
+
+    #[test]
     fn log_send_roundtrips_message_and_destination_ids() {
         let store = Store::open_memory().unwrap();
         store
@@ -1123,7 +1775,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_all_removes_corrupt_rows_too() {
+    fn replace_all_removes_corrupt_rows_too() {
         let store = Store::open_memory().unwrap();
         store.save_scenario(&Scenario::new("good")).unwrap();
         store
@@ -1135,7 +1787,12 @@ mod tests {
                 [],
             )
             .unwrap();
-        store.delete_all_scenarios().unwrap();
+        store.save_destination(&Destination::new("d")).unwrap();
+        store.save_template("t", "c").unwrap();
+        // An empty replacement removes everything, including rows too
+        // corrupt to parse (the deletion is table-wide, not
+        // load-then-delete).
+        store.replace_all(&[], &[], &[]).unwrap();
         let count: i64 = store
             .db
             .lock()
@@ -1143,12 +1800,24 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM scenarios", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0);
-        store.save_destination(&Destination::new("d")).unwrap();
-        store.delete_all_destinations().unwrap();
         assert!(store.load_destinations().unwrap().is_empty());
-        store.save_template("t", "c").unwrap();
-        store.delete_all_templates().unwrap();
         assert!(store.load_templates().unwrap().is_empty());
+        // And a non-empty replacement lands all three tables.
+        let dest = Destination::new("d2");
+        let scenario = Scenario::new("s2");
+        store
+            .replace_all(
+                &[dest],
+                &[scenario],
+                &[crate::backup::TemplateEntry {
+                    name: "t2".to_string(),
+                    content: "c2".to_string(),
+                }],
+            )
+            .unwrap();
+        assert_eq!(store.load_destinations().unwrap().len(), 1);
+        assert_eq!(store.load_scenarios().unwrap().len(), 1);
+        assert_eq!(store.load_templates().unwrap().len(), 1);
     }
 
     #[test]
@@ -1207,6 +1876,20 @@ mod tests {
             .unwrap();
         assert_eq!(timeout, 5000);
         drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restrict_permissions_sets_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let path =
+            std::env::temp_dir().join(format!("nicord-perm-test-{}.txt", std::process::id()));
+        std::fs::write(&path, "x").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        restrict_permissions(&path);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1272,6 +1955,26 @@ mod tests {
         assert_eq!(store.load_destinations().unwrap().len(), 1);
         // Legacy fields are kept, not deleted.
         assert_eq!(cfg.encrypted_webhook_url, "ENC");
+    }
+
+    #[test]
+    fn migration_assigns_scenarios_when_destinations_already_exist() {
+        let store = Store::open_memory().unwrap();
+        let mut s = Scenario::new("unassigned");
+        s.destination_id = None;
+        store.save_scenario(&s).unwrap();
+        let dest = Destination::new("Existing");
+        store.save_destination(&dest).unwrap();
+        let mut cfg = AppConfig {
+            send_mode: SendMode::Webhook,
+            ..AppConfig::default()
+        };
+        assert!(store.ensure_destinations_migrated(&mut cfg).unwrap());
+        assert!(cfg.destinations_migrated);
+        let scenarios = store.load_scenarios().unwrap();
+        assert_eq!(scenarios[0].destination_id, Some(dest.id.clone()));
+        // No duplicate destination was created.
+        assert_eq!(store.load_destinations().unwrap().len(), 1);
     }
 
     #[test]

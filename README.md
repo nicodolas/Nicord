@@ -57,11 +57,20 @@ Bạn chỉ cần mở app, soạn nội dung, đặt lịch, rồi để app ch
 ### Lịch gửi linh hoạt
 
 - Lặp mỗi 30 phút, mỗi giờ, mỗi ngày, mỗi tuần, giờ tự chọn, hoặc lịch nâng cao (cron) — mỗi lịch có múi giờ riêng.
+- Xem trước 10 lần chạy tới của một lịch ngay khi đang sửa, kèm cảnh báo nếu lần chạy đó sẽ bị bỏ qua.
 - Khung giờ im lặng riêng cho từng kênh, kể cả qua đêm.
 
 ### Theo dõi và kiểm soát
 
 - Dashboard tổng quan và trạng thái từng kênh, kèm báo cáo tình trạng khi mở app, chỉ ra lỗi cần sửa và chỗ sửa.
+- Lịch gửi sắp tới trong 7 ngày: gửi cái gì, đi kênh nào, lúc nào — và lần nào sẽ bị bỏ qua, vì sao.
+- Biểu đồ 7 ngày qua: mỗi ngày đã gửi bao nhiêu, lỗi bao nhiêu.
+- Tự động sao lưu cấu hình mỗi ngày, giữ lại 7 bản gần nhất — mất máy vẫn còn cấu hình để khôi phục trên máy đó.
+- Lịch sử gửi tự dọn dẹp theo số ngày bạn chọn, bấm vào một dòng để xem đầy đủ chi tiết.
+- Chặn ping hàng loạt (@everyone, @here) theo mặc định để không vô tình làm phiền cả kênh; gửi im lặng khi bạn chỉ muốn để lại tin nhắn.
+- Biến trong tin nhắn: ngày, giờ, thứ, tuần, đếm ngược tới một ngày, và bộ đếm tự tăng sau mỗi lần gửi thành công — viết loạt tin theo kỳ mà không cần sửa tay từng tin.
+- Tối đa 10 embed cho mỗi tin nhắn, kèm link tiêu đề, ảnh lớn và ảnh nhỏ — soạn ngay trong app, giới hạn ký tự của Discord được kiểm tra trước khi gửi.
+- Bình chọn theo lịch: đặt câu hỏi và đáp án, mỗi lần gửi là một bình chọn mới — kết quả xem trực tiếp trên Discord.
 - Lịch sử gửi đầy đủ, lọc theo từ khóa, trạng thái, kịch bản và kênh; xuất ra file CSV.
 - Xóa một tin đã gửi ngay từ lịch sử — chỉ khi bạn bấm và xác nhận.
 - Âm báo khi gửi lỗi hoặc kênh bị tạm dừng, bật/tắt tùy ý.

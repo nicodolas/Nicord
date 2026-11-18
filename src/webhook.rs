@@ -12,7 +12,10 @@
 //! messages, or picking a channel at send time. The engine rejects
 //! command nodes in webhook mode instead of pretending they work.
 
-use crate::discord::{discord_error_from_status, DiscordClient, DiscordError, SentMessage};
+use crate::discord::{
+    discord_error_from_status, reqwest_error, AllowedMentions, DiscordClient, DiscordError,
+    SendOptions, SentMessage,
+};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 
@@ -81,8 +84,12 @@ pub fn parse_webhook_url(raw: &str) -> Result<WebhookUrl, String> {
         );
     }
     // Scheme: "https://" (case-insensitive for the scheme only; the
-    // token keeps its original case).
-    if s.len() < 8 || !s[..8].eq_ignore_ascii_case("https://") {
+    // token keeps its original case). Compare bytes, not a str slice:
+    // `s[..8]` panics when byte 8 falls inside a multi-byte char
+    // (e.g. pasted "€€€€..."). The prefix is pure ASCII, so byte
+    // comparison is exact, and slicing at 8 is safe once it matched.
+    let prefix_ok = s.len() >= 8 && s.as_bytes()[..8].eq_ignore_ascii_case(b"https://");
+    if !prefix_ok {
         return Err("webhook URL must start with https://discord.com/api/webhooks/".into());
     }
     let rest = &s[8..];
@@ -183,18 +190,23 @@ pub struct WebhookClient {
 }
 
 impl WebhookClient {
-    pub fn new(url: WebhookUrl, username_override: &str) -> Self {
-        Self {
+    /// None when the HTTP client cannot be built (TLS backend or
+    /// resolver init failure) — the caller treats the destination
+    /// as unusable instead of crashing. The build used to `expect`,
+    /// which panicked on the engine thread.
+    pub fn new(url: WebhookUrl, username_override: &str) -> Option<Self> {
+        let http = Client::builder()
+            .user_agent("Nicord/0.1.0 (personal use)")
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .ok()?;
+        Some(Self {
             url,
-            http: Client::builder()
-                .user_agent("Nicord/0.1.0 (personal use)")
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .expect("reqwest client builds"),
+            http,
             username_override: username_override.trim().to_string(),
             avatar_url_override: String::new(),
             thread_id: String::new(),
-        }
+        })
     }
 
     pub fn with_avatar_url(mut self, url: &str) -> Self {
@@ -207,12 +219,24 @@ impl WebhookClient {
         self
     }
 
+    /// Thread id safe to put in a URL: digits-only. Anything else is
+    /// ignored (defense in depth — save-time validation already
+    /// requires digits-only, but a crafted local database or import
+    /// could bypass it and inject extra query parameters).
+    fn safe_thread_id(&self) -> Option<&str> {
+        if !self.thread_id.is_empty() && self.thread_id.bytes().all(|b| b.is_ascii_digit()) {
+            Some(self.thread_id.as_str())
+        } else {
+            None
+        }
+    }
+
     /// Execute URL with the optional thread param appended.
     fn execute_url(&self) -> String {
-        if self.thread_id.is_empty() {
-            self.url.execute_url.clone()
+        if let Some(thread_id) = self.safe_thread_id() {
+            format!("{}&thread_id={thread_id}", self.url.execute_url)
         } else {
-            format!("{}&thread_id={}", self.url.execute_url, self.thread_id)
+            self.url.execute_url.clone()
         }
     }
 
@@ -222,23 +246,15 @@ impl WebhookClient {
         &self,
         content: &str,
         embeds: &[crate::embed::Embed],
+        opts: &SendOptions,
+        poll: Option<&crate::poll::Poll>,
     ) -> Result<SentMessage, DiscordError> {
         if content.chars().count() > 2000 {
             return Err(DiscordError::Other(
                 "message is longer than Discord's 2000-character limit".into(),
             ));
         }
-        #[derive(Serialize)]
-        struct Body<'a> {
-            content: &'a str,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            username: Option<&'a str>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            avatar_url: Option<&'a str>,
-            #[serde(skip_serializing_if = "Vec::is_empty")]
-            embeds: Vec<serde_json::Value>,
-        }
-        let body = Body {
+        let body = ExecuteBody {
             content,
             username: if self.username_override.is_empty() {
                 None
@@ -251,6 +267,9 @@ impl WebhookClient {
                 Some(&self.avatar_url_override)
             },
             embeds: embeds.iter().map(|e| e.to_json()).collect(),
+            allowed_mentions: opts.allowed_mentions(),
+            flags: opts.flags(),
+            poll: poll.map(|p| p.to_json()),
         };
         let resp = self
             .http
@@ -258,12 +277,12 @@ impl WebhookClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| DiscordError::Other(format!("network error: {e}")))?;
+            .map_err(|e| reqwest_error("network error", e))?;
         match resp.status() {
             StatusCode::OK | StatusCode::CREATED => resp
                 .json()
                 .await
-                .map_err(|e| DiscordError::Other(format!("bad webhook send response: {e}"))),
+                .map_err(|e| reqwest_error("bad webhook send response", e)),
             // 204 should not happen with ?wait=true, but handle it:
             // sent, no message id to report.
             StatusCode::NO_CONTENT => Ok(SentMessage {
@@ -293,15 +312,15 @@ impl WebhookClient {
             ));
         }
         let mut url = format!("{}/messages/{id}", self.url.base_url);
-        if !self.thread_id.is_empty() {
-            url.push_str(&format!("?thread_id={}", self.thread_id));
+        if let Some(thread_id) = self.safe_thread_id() {
+            url.push_str(&format!("?thread_id={thread_id}"));
         }
         let resp = self
             .http
             .delete(url)
             .send()
             .await
-            .map_err(|e| DiscordError::Other(format!("network error: {e}")))?;
+            .map_err(|e| reqwest_error("network error", e))?;
         match resp.status() {
             StatusCode::NO_CONTENT | StatusCode::OK => Ok(()),
             s => Err(discord_error_from_status(
@@ -318,12 +337,12 @@ impl WebhookClient {
             .get(&self.url.base_url)
             .send()
             .await
-            .map_err(|e| DiscordError::Other(format!("network error: {e}")))?;
+            .map_err(|e| reqwest_error("network error", e))?;
         match resp.status() {
             StatusCode::OK => resp
                 .json()
                 .await
-                .map_err(|e| DiscordError::Other(format!("bad webhook response: {e}"))),
+                .map_err(|e| reqwest_error("bad webhook response", e)),
             s => Err(discord_error_from_status(
                 s,
                 &resp.text().await.unwrap_or_default(),
@@ -334,6 +353,25 @@ impl WebhookClient {
 
 /// The engine's send transport: either a user-token client or a
 /// webhook client. The engine calls `send_text` and never knows
+/// Execute-webhook request body. Module-level (not local to the
+/// send fn) so its serialization is unit-testable without a network.
+#[derive(Serialize)]
+struct ExecuteBody<'a> {
+    content: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    username: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    avatar_url: Option<&'a str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    embeds: Vec<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allowed_mentions: Option<AllowedMentions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    flags: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    poll: Option<serde_json::Value>,
+}
+
 /// which one it is — except for features webhooks cannot do
 /// (commands, typing, delete), which check `is_webhook()`.
 #[derive(Debug, Clone)]
@@ -348,19 +386,25 @@ impl MessageSender {
     }
 
     /// Send text with optional embeds (Q8). Empty content is allowed
-    /// when at least one embed is present.
+    /// when at least one embed is present. `opts` carries the
+    /// scenario's mention/silent settings (idea #7).
     pub async fn send_with_embeds(
         &self,
         channel_id: &str,
         content: &str,
         embeds: &[crate::embed::Embed],
+        opts: &SendOptions,
+        poll: Option<&crate::poll::Poll>,
     ) -> Result<SentMessage, DiscordError> {
         match self {
             MessageSender::User(c) => {
-                c.send_message_with_embeds(channel_id, content, embeds)
+                c.send_message_with_embeds(channel_id, content, embeds, opts, poll)
                     .await
             }
-            MessageSender::Webhook(c) => c.send_message_with_embeds(content, embeds).await,
+            MessageSender::Webhook(c) => {
+                c.send_message_with_embeds(content, embeds, opts, poll)
+                    .await
+            }
         }
     }
 }
@@ -435,5 +479,111 @@ mod tests {
         assert_eq!(v.channel_id.as_deref(), Some("9"));
         let empty: WebhookInfo = serde_json::from_str(r#"{"id":"1"}"#).unwrap();
         assert_eq!(empty.display_name(), "Webhook");
+    }
+
+    #[tokio::test]
+    async fn reqwest_error_strips_the_url() {
+        // A request to a closed localhost port fails with an error
+        // that carries the URL (reqwest appends it in Display). The
+        // formatted error must not contain it: webhook URLs hold the
+        // token. The first assertion pins the premise — if reqwest
+        // ever stops attaching URLs, this test says so loudly
+        // instead of passing vacuously.
+        let err = Client::new()
+            .get("http://127.0.0.1:9/nicord-test")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("127.0.0.1"));
+        let msg = reqwest_error("network error", err).to_string();
+        assert!(msg.contains("network error"));
+        assert!(!msg.contains("127.0.0.1"));
+        assert!(!msg.contains("nicord-test"));
+    }
+
+    #[test]
+    fn parse_rejects_multibyte_prefix_without_panicking() {
+        // Byte 8 falls inside a multi-byte char: the old str slice
+        // panicked here instead of returning an error.
+        assert!(parse_webhook_url("€€€€xhttps://discord.com/api/webhooks/1/abc").is_err());
+        assert!(parse_webhook_url("€€€€€€€€").is_err());
+        // Multi-byte chars later in the string must not panic either.
+        let _ = parse_webhook_url("https://discord.com/api/webhooks/123/€€€");
+    }
+
+    #[test]
+    fn thread_id_must_be_digits_to_reach_the_url() {
+        let url = parse_webhook_url(GOOD).unwrap();
+        let client = WebhookClient::new(url.clone(), "")
+            .unwrap()
+            .with_thread_id("12&evil=1");
+        assert!(!client.execute_url().contains("thread_id"));
+        let client = WebhookClient::new(url, "")
+            .unwrap()
+            .with_thread_id("987654321");
+        assert!(client.execute_url().ends_with("&thread_id=987654321"));
+    }
+
+    #[test]
+    fn execute_body_carries_mention_and_silent_options() {
+        let opts = SendOptions {
+            allow_mass_mentions: false,
+            silent: true,
+        };
+        let body = ExecuteBody {
+            content: "hi @everyone",
+            username: None,
+            avatar_url: None,
+            embeds: vec![],
+            allowed_mentions: opts.allowed_mentions(),
+            flags: opts.flags(),
+            poll: None,
+        };
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(
+            json["allowed_mentions"]["parse"],
+            serde_json::json!(["users"])
+        );
+        assert_eq!(json["flags"], 4096);
+        assert!(json.get("embeds").is_none());
+        let opts = SendOptions {
+            allow_mass_mentions: true,
+            silent: false,
+        };
+        let body = ExecuteBody {
+            content: "hi",
+            username: None,
+            avatar_url: None,
+            embeds: vec![],
+            allowed_mentions: opts.allowed_mentions(),
+            flags: opts.flags(),
+            poll: None,
+        };
+        let json = serde_json::to_value(&body).unwrap();
+        assert!(json.get("allowed_mentions").is_none());
+        assert!(json.get("flags").is_none());
+    }
+
+    #[test]
+    fn execute_body_carries_poll_when_present() {
+        let poll = crate::poll::Poll {
+            question: "Q?".to_string(),
+            answers: vec!["A".to_string(), "B".to_string()],
+            duration_hours: 48,
+            allow_multiselect: false,
+        };
+        let body = ExecuteBody {
+            content: "",
+            username: None,
+            avatar_url: None,
+            embeds: vec![],
+            allowed_mentions: None,
+            flags: None,
+            poll: Some(poll.to_json()),
+        };
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["poll"]["question"]["text"], "Q?");
+        assert_eq!(json["poll"]["answers"].as_array().unwrap().len(), 2);
+        assert_eq!(json["poll"]["duration"], 48);
     }
 }

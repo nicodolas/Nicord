@@ -7,8 +7,16 @@
 //! author name 256, total across all embeds ≤ 6000 characters
 //! (content not counted), at most 10 embeds per message. Violations
 //! return 400. The color range 0..=0xFFFFFF is an APP decision —
-//! the docs only say "integer". Nicord sends at most ONE embed per
-//! message in v1 (the composer edits one embed per scenario).
+//! the docs only say "integer". URLs (title link, image,
+//! thumbnail) must be https — an APP rule, matching the avatar
+//! rule: Discord fetches these server-side, and plain-http or
+//! relative URLs would fail silently or leak the request.
+//!
+//! A scenario may carry up to 10 embeds (idea #8); the 6000-char
+//! total is enforced ACROSS all of them by `validate_embeds`.
+//! There is deliberately no `timestamp` field: a fixed timestamp
+//! on a recurring message would go stale, and a send-time stamp
+//! belongs in the send layer, not the stored model.
 
 use serde::{Deserialize, Serialize};
 
@@ -20,6 +28,7 @@ pub const EMBED_FIELD_VALUE_LIMIT: usize = 1024;
 pub const EMBED_FOOTER_LIMIT: usize = 2048;
 pub const EMBED_AUTHOR_LIMIT: usize = 256;
 pub const EMBED_TOTAL_LIMIT: usize = 6000;
+pub const EMBED_MAX_COUNT: usize = 10;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EmbedField {
@@ -46,16 +55,29 @@ pub struct Embed {
     pub fields: Vec<EmbedField>,
     #[serde(default)]
     pub footer_text: String,
+    /// Title link (https only, empty = no link). Clicking the
+    /// title opens this URL.
+    #[serde(default)]
+    pub url: String,
+    /// Large image shown at the bottom (https only, empty = none).
+    #[serde(default)]
+    pub image_url: String,
+    /// Small image shown at the top-right (https only, empty = none).
+    #[serde(default)]
+    pub thumbnail_url: String,
 }
 
 impl Embed {
     /// True when nothing would be visible (no title, description,
-    /// fields, footer, or author). An all-empty embed is invalid.
+    /// fields, footer, author, or image). An all-empty embed is
+    /// invalid — except that an image-only embed DOES render.
     pub fn is_empty(&self) -> bool {
         self.title.trim().is_empty()
             && self.description.trim().is_empty()
             && self.author_name.trim().is_empty()
             && self.footer_text.trim().is_empty()
+            && self.image_url.trim().is_empty()
+            && self.thumbnail_url.trim().is_empty()
             && self.fields.is_empty()
     }
 
@@ -121,6 +143,20 @@ impl Embed {
                 return Err("embed color must be 0x000000..0xFFFFFF".into());
             }
         }
+        // URLs: https only, and more than the bare scheme (the
+        // same rule as destination avatar URLs).
+        for (what, url) in [
+            ("link", &self.url),
+            ("image", &self.image_url),
+            ("thumbnail", &self.thumbnail_url),
+        ] {
+            let trimmed = url.trim();
+            if !trimmed.is_empty()
+                && (!trimmed.starts_with("https://") || trimmed.len() <= "https://".len())
+            {
+                return Err(format!("embed {what} URL must start with https://"));
+            }
+        }
         if self.total_chars() > EMBED_TOTAL_LIMIT {
             return Err(format!(
                 "embed total is {} characters, over Discord's {EMBED_TOTAL_LIMIT}-character limit",
@@ -148,6 +184,12 @@ impl Embed {
             obj.insert(
                 "description".to_string(),
                 serde_json::Value::String(self.description.clone()),
+            );
+        }
+        if !self.url.trim().is_empty() {
+            obj.insert(
+                "url".to_string(),
+                serde_json::Value::String(self.url.clone()),
             );
         }
         if let Some(color) = self.color {
@@ -179,8 +221,45 @@ impl Embed {
                 serde_json::json!({ "text": self.footer_text }),
             );
         }
+        if !self.thumbnail_url.trim().is_empty() {
+            obj.insert(
+                "thumbnail".to_string(),
+                serde_json::json!({ "url": self.thumbnail_url }),
+            );
+        }
+        if !self.image_url.trim().is_empty() {
+            obj.insert(
+                "image".to_string(),
+                serde_json::json!({ "url": self.image_url }),
+            );
+        }
         serde_json::Value::Object(obj)
     }
+}
+
+/// Validate a whole message's embeds: at most 10, each embed
+/// valid on its own, and the 6000-character total enforced
+/// ACROSS all of them (Discord counts the sum, not each embed).
+pub fn validate_embeds(embeds: &[Embed]) -> Result<(), String> {
+    if embeds.len() > EMBED_MAX_COUNT {
+        return Err(format!(
+            "message has {} embeds, over Discord's {EMBED_MAX_COUNT}-embed limit",
+            embeds.len()
+        ));
+    }
+    let mut total = 0;
+    for (idx, embed) in embeds.iter().enumerate() {
+        embed
+            .validate()
+            .map_err(|e| format!("embed {}: {e}", idx + 1))?;
+        total += embed.total_chars();
+    }
+    if total > EMBED_TOTAL_LIMIT {
+        return Err(format!(
+            "embeds total {total} characters, over Discord's {EMBED_TOTAL_LIMIT}-character limit"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -243,5 +322,49 @@ mod tests {
         assert_eq!(v["color"], 0xFF_0000);
         assert!(v.get("description").is_none());
         assert!(v.get("fields").is_none());
+    }
+
+    #[test]
+    fn urls_must_be_https_and_appear_in_payload() {
+        let mut e = Embed {
+            title: "T".to_string(),
+            ..Embed::default()
+        };
+        e.url = "http://example.com".to_string();
+        assert!(e.validate().is_err());
+        e.url = "https://".to_string();
+        assert!(e.validate().is_err());
+        e.url = "https://example.com/page".to_string();
+        e.image_url = "https://cdn.example.com/a.png".to_string();
+        e.thumbnail_url = "https://cdn.example.com/t.png".to_string();
+        assert!(e.validate().is_ok());
+        let v = e.to_json();
+        assert_eq!(v["url"], "https://example.com/page");
+        assert_eq!(v["image"]["url"], "https://cdn.example.com/a.png");
+        assert_eq!(v["thumbnail"]["url"], "https://cdn.example.com/t.png");
+        // An image-only embed is not empty: it renders.
+        let img_only = Embed {
+            image_url: "https://cdn.example.com/a.png".to_string(),
+            ..Embed::default()
+        };
+        assert!(!img_only.is_empty());
+        assert!(img_only.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_embeds_enforces_count_and_shared_total() {
+        let one = |len: usize| Embed {
+            description: "a".repeat(len),
+            ..Embed::default()
+        };
+        assert!(validate_embeds(&[one(10), one(20)]).is_ok());
+        // Each under 6000, but the sum is over: rejected.
+        assert!(validate_embeds(&[one(4000), one(3000)]).is_err());
+        // 11 embeds: rejected even when tiny.
+        let many = vec![one(1); 11];
+        assert!(validate_embeds(&many).is_err());
+        // An empty embed inside the list is rejected with its index.
+        let err = validate_embeds(&[one(1), Embed::default()]).unwrap_err();
+        assert!(err.contains("embed 2"), "{err}");
     }
 }

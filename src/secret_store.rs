@@ -84,6 +84,17 @@ pub struct OsKeyring;
 /// infrequent enough that serializing costs nothing measurable.
 static KEYRING_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Maximum time to wait for one OS-keyring operation. A hung
+/// platform store (a stalled D-Bus daemon, a keychain prompt the
+/// user never answers) must not freeze Nicord: on timeout the
+/// operation fails and callers degrade (reads fail closed, writes
+/// fall back to a blob, availability probes report false). The
+/// abandoned worker thread keeps running — it cannot be killed
+/// safely — and its late result is discarded; the mutex is
+/// released, so a later operation may run concurrently with the
+/// hung one, which is the lesser evil versus freezing forever.
+const KEYRING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Run `f` on a fresh plain thread, serialized behind
 /// `KEYRING_MUTEX`, and return its result. A panic on the worker
 /// thread becomes an error instead of crashing the caller: secret
@@ -91,10 +102,28 @@ static KEYRING_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 fn on_keyring_thread<T: Send + 'static>(
     f: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, String> {
+    on_keyring_thread_with_timeout(f, KEYRING_TIMEOUT)
+}
+
+fn on_keyring_thread_with_timeout<T: Send + 'static>(
+    f: impl FnOnce() -> T + Send + 'static,
+    timeout: std::time::Duration,
+) -> Result<T, String> {
     let _guard = KEYRING_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-    std::thread::spawn(f)
-        .join()
-        .map_err(|_| "OS keyring operation failed (worker thread panicked)".to_string())
+    let (tx, rx) = std::sync::mpsc::channel();
+    // A spawn failure drops `tx` immediately: `recv_timeout` then
+    // reports Disconnected, the same error path as a worker panic.
+    let _ = std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(timeout).map_err(|e| match e {
+        std::sync::mpsc::RecvTimeoutError::Timeout => {
+            "OS keyring operation timed out (the platform store did not respond)".to_string()
+        }
+        std::sync::mpsc::RecvTimeoutError::Disconnected => {
+            "OS keyring operation failed (worker thread panicked)".to_string()
+        }
+    })
 }
 
 impl Keyring for OsKeyring {
@@ -159,6 +188,13 @@ pub fn store_secret(entry: &str, plaintext: &str) -> Result<String, String> {
 }
 
 pub fn store_secret_with(entry: &str, plaintext: &str, kr: &dyn Keyring) -> Result<String, String> {
+    // An empty secret means "no secret": never write an empty entry
+    // into the platform store (and never return a `kr:` ref for
+    // nothing). The blob form of "" round-trips through
+    // `load_secret` as "", and callers treat "" as unset.
+    if plaintext.is_empty() {
+        return encrypt_token(plaintext);
+    }
     if kr.available() {
         match kr.set(entry, plaintext) {
             Ok(()) => return Ok(format!("{KEYRING_PREFIX}{entry}")),
@@ -280,12 +316,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn keyring_thread_returns_the_result() {
+        let r = on_keyring_thread_with_timeout(|| 42, std::time::Duration::from_secs(5));
+        assert_eq!(r.unwrap(), 42);
+    }
+
+    #[test]
+    fn keyring_thread_times_out_instead_of_hanging() {
+        let r = on_keyring_thread_with_timeout(
+            || {
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                1
+            },
+            std::time::Duration::from_millis(50),
+        );
+        let err = r.unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+    }
+
+    #[test]
+    fn keyring_thread_turns_a_panic_into_an_error() {
+        let r =
+            on_keyring_thread_with_timeout(|| panic!("boom"), std::time::Duration::from_secs(5));
+        let err = r.unwrap_err();
+        assert!(err.contains("panicked"), "{err}");
+    }
+
+    #[test]
     fn blob_fallback_roundtrip_when_keyring_unavailable() {
         let kr = MockKeyring::new(false);
         let stored = store_secret_with(ENTRY_ACCOUNT_TOKEN, "tok-123", &kr).unwrap();
         assert!(!stored.starts_with(KEYRING_PREFIX));
         assert!(!kr.contains(ENTRY_ACCOUNT_TOKEN));
         assert_eq!(load_secret_with(&stored, &kr).unwrap(), "tok-123");
+    }
+
+    #[test]
+    fn empty_secret_never_touches_the_keyring() {
+        let kr = MockKeyring::new(true);
+        let stored = store_secret_with(ENTRY_ACCOUNT_TOKEN, "", &kr).unwrap();
+        assert!(!stored.starts_with(KEYRING_PREFIX));
+        assert!(!kr.contains(ENTRY_ACCOUNT_TOKEN));
+        assert_eq!(load_secret_with(&stored, &kr).unwrap(), "");
     }
 
     #[test]

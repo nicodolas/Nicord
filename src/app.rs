@@ -26,8 +26,8 @@ use crate::{
         ENTRY_ACCOUNT_TOKEN, ENTRY_LEGACY_WEBHOOK,
     },
     store::{
-        config_dir, csv_escape, load_config, save_config, scrub_secrets, AppConfig, SendMode,
-        Store, WebhookHealth,
+        config_dir, csv_escape, load_config, load_config_status, restrict_permissions, save_config,
+        scrub_secrets, AppConfig, ConfigLoad, SendMode, Store, WebhookHealth,
     },
     theme,
     updater::{self, CheckResult, UpdateState},
@@ -83,6 +83,17 @@ pub struct NicordApp {
     /// the query costs ~3.3 ms over 10k rows, and running it every
     /// frame at 60 fps was pure waste.
     pub sent_today_updated: std::time::Instant,
+    /// Display-only cache of next-run times (see `NextRunCache`).
+    /// Session-only: recomputed from the schedules, never saved.
+    pub next_run_cache: NextRunCache,
+    /// Dashboard timeline (see `timeline::upcoming_runs`), refreshed
+    /// at most every 30 s. Session-only: recomputed, never saved.
+    pub timeline_cache: Vec<crate::timeline::UpcomingRun>,
+    pub timeline_updated: std::time::Instant,
+    /// Builder schedule simulation, keyed by the draft schedule +
+    /// timezone + destination so it recomputes only when the draft
+    /// changes. Session-only.
+    pub sim_cache: Option<(String, Vec<crate::timeline::SimulatedRun>)>,
     pub guilds: Arc<Mutex<Vec<Guild>>>,
     pub channels: Arc<Mutex<Vec<Channel>>>,
     pub picker_guild_id: String,
@@ -95,6 +106,14 @@ pub struct NicordApp {
     pub log_channel_filter: String,
     /// Log row awaiting delete confirmation (Q13). Session-only.
     pub pending_delete_log: Option<i64>,
+    /// Log row shown in the detail view (Group 3). Session-only.
+    pub selected_log: Option<i64>,
+    /// When the scheduled auto-backup was last checked (Group 3).
+    /// Checked at most every 60 s from `update()`; the check
+    /// itself is a timestamp comparison, the backup is a small
+    /// local export. Initialized in the past so the first frame
+    /// checks (and backs up on first run, when no backup exists).
+    pub auto_backup_checked: std::time::Instant,
     pub import_path: String,
     /// Warnings from the last import analysis (QoL, shown in Builder).
     pub import_warnings: Vec<String>,
@@ -161,6 +180,68 @@ fn scenario_matches_query(s: &Scenario, query: &str) -> bool {
     s.name.to_lowercase().contains(&q) || s.channel_id.to_lowercase().contains(&q)
 }
 
+/// Display-only cache of next-run times. Cron `next_after` walks
+/// forward minute-by-minute and costs ~38 ms per call for sparse
+/// schedules (measured; `0 0 29 2 *`), and the UI asks up to 4×
+/// per scenario per frame (sidebar, next-run line, destination
+/// cards, scenario rows) — one sparse cron could eat ~153 ms per
+/// frame. Results are minute-granular, so a 60 s TTL is exact to
+/// the displayed precision, and a cached value that already passed
+/// is recomputed immediately (the UI never shows a stale past
+/// time). Keyed by scenario id + the schedule's Debug form +
+/// timezone, so any schedule or timezone edit invalidates
+/// automatically. Display ONLY: the engine fires via `due_time`
+/// and never reads this cache, so caching cannot affect sending.
+#[derive(Default)]
+pub struct NextRunCache {
+    entries: std::collections::HashMap<
+        String,
+        (String, chrono::DateTime<chrono::Local>, std::time::Instant),
+    >,
+}
+
+impl NextRunCache {
+    /// Next run for one scenario, cached. `None` when the scenario
+    /// has no schedule.
+    pub fn next_run(
+        &mut self,
+        scenario: &Scenario,
+        now: chrono::DateTime<chrono::Local>,
+    ) -> Option<chrono::DateTime<chrono::Local>> {
+        let sched = scenario.schedule.as_ref()?;
+        let key = format!("{:?}|{}", sched, scenario.timezone);
+        if let Some((k, v, at)) = self.entries.get(&scenario.id) {
+            if k == &key && at.elapsed() < std::time::Duration::from_secs(60) && *v > now {
+                return Some(*v);
+            }
+        }
+        let v = sched.next_after(now, &scenario.timezone);
+        self.entries
+            .insert(scenario.id.clone(), (key, v, std::time::Instant::now()));
+        // Deleted scenarios leave one stale entry each; prune when
+        // the map grows past what the live list can justify.
+        if self.entries.len() > 512 {
+            self.entries
+                .retain(|_, (_, _, at)| at.elapsed() < std::time::Duration::from_secs(60));
+        }
+        Some(v)
+    }
+
+    /// Next runs for a whole scenario list, in one pass: the
+    /// per-screen call sites build this map once per frame and
+    /// look up from it, instead of calling `next_after` per row.
+    pub fn next_runs(
+        &mut self,
+        scenarios: &[Scenario],
+        now: chrono::DateTime<chrono::Local>,
+    ) -> std::collections::HashMap<String, chrono::DateTime<chrono::Local>> {
+        scenarios
+            .iter()
+            .filter_map(|s| self.next_run(s, now).map(|v| (s.id.clone(), v)))
+            .collect()
+    }
+}
+
 /// Enable one scenario with the same validation the Builder's
 /// Enable button applies. Returns an error message when the
 /// scenario must stay disabled (invalid, or — user-token mode
@@ -193,6 +274,14 @@ fn try_enable_scenario(list: &mut [Scenario], i: usize, is_webhook: bool) -> Opt
     }
     if let Some(s) = list.get_mut(i) {
         s.enabled = true;
+        // A fired `Once` scenario keeps its last_run_at, so due_time
+        // would never fire it again — re-enabling would silently do
+        // nothing. Re-enabling is the user's explicit "run it
+        // again": clear the anchor so the Once fires (immediately
+        // when its time already passed).
+        if matches!(s.schedule, Some(Schedule::Once { .. })) {
+            s.last_run_at = None;
+        }
     }
     None
 }
@@ -205,14 +294,11 @@ fn sender_for_config(config: &AppConfig) -> Option<MessageSender> {
     match config.send_mode {
         SendMode::UserToken => load_secret(&config.encrypted_token)
             .ok()
-            .map(|t| MessageSender::User(DiscordClient::new(&t))),
+            .and_then(|t| DiscordClient::new(&t).map(MessageSender::User)),
         SendMode::Webhook => {
             let url = load_secret(&config.encrypted_webhook_url).ok()?;
             let parsed = parse_webhook_url(&url).ok()?;
-            Some(MessageSender::Webhook(WebhookClient::new(
-                parsed,
-                &config.webhook_username,
-            )))
+            WebhookClient::new(parsed, &config.webhook_username).map(MessageSender::Webhook)
         }
     }
 }
@@ -237,7 +323,7 @@ fn resolve_sender_for_scenario(
             let dest = store.load_destination(dest_id).ok()??;
             let url = load_secret(&dest.encrypted_url).ok()?;
             let parsed = parse_webhook_url(&url).ok()?;
-            let client = WebhookClient::new(parsed, &dest.username_override)
+            let client = WebhookClient::new(parsed, &dest.username_override)?
                 .with_avatar_url(&dest.avatar_url_override)
                 .with_thread_id(&dest.thread_id);
             Some((MessageSender::Webhook(client), Some(dest)))
@@ -250,16 +336,20 @@ fn resolve_sender_for_scenario(
 fn sender_for_destination(dest: &Destination) -> Option<MessageSender> {
     let url = load_secret(&dest.encrypted_url).ok()?;
     let parsed = parse_webhook_url(&url).ok()?;
-    Some(MessageSender::Webhook(
-        WebhookClient::new(parsed, &dest.username_override)
-            .with_avatar_url(&dest.avatar_url_override)
-            .with_thread_id(&dest.thread_id),
-    ))
+    let client = WebhookClient::new(parsed, &dest.username_override)?
+        .with_avatar_url(&dest.avatar_url_override)
+        .with_thread_id(&dest.thread_id);
+    Some(MessageSender::Webhook(client))
 }
 
 impl NicordApp {
     pub fn new(store: Arc<Store>) -> Self {
-        let mut config = load_config();
+        let (mut config, config_load) = load_config_status();
+        // An unreadable config must never be overwritten by startup
+        // saves: a transient read failure would destroy the user's
+        // real settings. Defaults run in memory; the file on disk
+        // is left alone and the health report warns about it.
+        let config_unreadable = config_load == ConfigLoad::Unreadable;
         // The autostart toggle shows the real OS state, not just the
         // last saved flag (the user may have changed it outside Nicord).
         config.autostart = crate::autostart::is_enabled();
@@ -268,7 +358,7 @@ impl NicordApp {
         let migrated = store
             .ensure_destinations_migrated(&mut config)
             .unwrap_or(false);
-        if migrated {
+        if migrated && !config_unreadable {
             let _ = save_config(&config);
         }
         // One-time secret migration: move machine-encrypted blobs
@@ -284,7 +374,7 @@ impl NicordApp {
             config.encrypted_webhook_url = m;
             secrets_migrated = true;
         }
-        if secrets_migrated {
+        if secrets_migrated && !config_unreadable {
             let _ = save_config(&config);
         }
         if let Ok(dests) = store.load_destinations() {
@@ -303,8 +393,27 @@ impl NicordApp {
             store.load_scenarios_with_warnings().unwrap_or_default();
         let (_, dest_warnings) = store.load_destinations_with_warnings().unwrap_or_default();
         load_warnings.extend(dest_warnings);
+        if config_unreadable {
+            load_warnings.push(
+                "Không đọc được file cấu hình (config.json) — đang dùng cấu hình mặc định. File gốc được giữ nguyên; hãy kiểm tra ổ đĩa và quyền truy cập trước khi lưu cài đặt."
+                    .to_string(),
+            );
+        }
         for w in &load_warnings {
             tracing::warn!("{w}");
+        }
+        // Log retention (Group 3): prune once at startup.
+        // Best-effort — a failure must never block startup; it
+        // is logged and the manual button in Settings stays
+        // available. Retention 0 means "keep forever".
+        if config.log_retention_days > 0 {
+            match store.prune_logs(config.log_retention_days) {
+                Ok(n) if n > 0 => {
+                    tracing::info!("pruned {n} old send-log rows at startup");
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!("startup log prune failed: {e}"),
+            }
         }
         // Read before the struct literal below moves `config`.
         let webhook_health_init = config.webhook_health;
@@ -349,6 +458,11 @@ impl NicordApp {
             selected_node: None,
             sent_today: sent_today_init,
             sent_today_updated: std::time::Instant::now(),
+            next_run_cache: NextRunCache::default(),
+            timeline_cache: Vec::new(),
+            // Ancient: the first Dashboard frame computes it.
+            timeline_updated: std::time::Instant::now() - std::time::Duration::from_secs(3600),
+            sim_cache: None,
             guilds: Arc::new(Mutex::new(Vec::new())),
             channels: Arc::new(Mutex::new(Vec::new())),
             picker_guild_id: String::new(),
@@ -357,6 +471,8 @@ impl NicordApp {
             log_scenario_filter: String::new(),
             log_channel_filter: String::new(),
             pending_delete_log: None,
+            selected_log: None,
+            auto_backup_checked: std::time::Instant::now() - std::time::Duration::from_secs(3600),
             import_path: String::new(),
             import_warnings: Vec::new(),
             webhook_health_shared: Arc::new(Mutex::new(webhook_health_init)),
@@ -625,7 +741,12 @@ impl NicordApp {
                     return;
                 }
             };
-            let client = DiscordClient::new(&token);
+            let Some(client) = DiscordClient::new(&token) else {
+                if let Ok(mut s) = status.lock() {
+                    *s = "Cannot build the HTTP client (TLS/resolver init failed).".to_string();
+                }
+                return;
+            };
             match rt.block_on(client.get_me_typed()) {
                 Ok(me) => {
                     if let Ok(mut i) = info.lock() {
@@ -682,7 +803,12 @@ impl NicordApp {
                     return;
                 }
             };
-            let client = WebhookClient::new(parsed, "");
+            let Some(client) = WebhookClient::new(parsed, "") else {
+                if let Ok(mut s) = status.lock() {
+                    *s = "Cannot build the HTTP client (TLS/resolver init failed).".to_string();
+                }
+                return;
+            };
             let now = chrono::Utc::now().to_rfc3339();
             match rt.block_on(client.get_webhook()) {
                 Ok(w) => {
@@ -795,13 +921,17 @@ impl NicordApp {
             if let Ok(plain) = load_secret(&self.config.encrypted_webhook_url) {
                 if let Ok(stored) = store_secret(&destination_entry(&existing.id), &plain) {
                     existing.encrypted_url = stored;
+                    // Only a successfully resolved + re-stored URL
+                    // clears a persisted pause: clearing it when the
+                    // URL could not be resolved would un-pause a
+                    // destination whose URL is still broken.
+                    existing.failure_state = crate::destination::FailureState::Ok;
+                    existing.last_error.clear();
+                    existing.paused_at = None;
                 }
             }
             existing.webhook_name = self.config.webhook_name.clone();
             existing.username_override = self.config.webhook_username.clone();
-            existing.failure_state = crate::destination::FailureState::Ok;
-            existing.last_error.clear();
-            existing.paused_at = None;
             let _ = self.store.save_destination(existing);
         } else {
             let mut dest = Destination::new(&name);
@@ -886,7 +1016,9 @@ impl NicordApp {
                     return;
                 }
             };
-            let client = DiscordClient::new(&token);
+            let Some(client) = DiscordClient::new(&token) else {
+                return;
+            };
             let (username, server_name) = rt.block_on(async {
                 let u = client
                     .get_me_typed()
@@ -1153,7 +1285,14 @@ impl NicordApp {
             // for this PID to disappear before touching any file.
             engine.stop_all();
             std::thread::sleep(std::time::Duration::from_millis(500));
-            updater::launch_helper_and_exit(&helper);
+            if let Err(e) = updater::launch_helper_and_exit(&helper) {
+                // The helper never started: report it and keep
+                // running instead of quitting with no update.
+                if let Ok(mut u) = shared.lock() {
+                    u.state = UpdateState::Failed(e);
+                    u.dialog = true;
+                }
+            }
         });
     }
 
@@ -1226,7 +1365,9 @@ impl NicordApp {
                 Ok(rt) => rt,
                 Err(_) => return,
             };
-            let client = DiscordClient::new(&token);
+            let Some(client) = DiscordClient::new(&token) else {
+                return;
+            };
             match rt.block_on(client.list_guilds()) {
                 Ok(list) => {
                     let n = list.len();
@@ -1262,7 +1403,9 @@ impl NicordApp {
                 Ok(rt) => rt,
                 Err(_) => return,
             };
-            let client = DiscordClient::new(&token);
+            let Some(client) = DiscordClient::new(&token) else {
+                return;
+            };
             match rt.block_on(client.list_channels(&guild_id)) {
                 Ok(list) => {
                     let text: Vec<Channel> = list.into_iter().filter(|c| c.is_text()).collect();
@@ -1330,6 +1473,7 @@ impl NicordApp {
         }
         if dismiss {
             self.pending_delete_log = None;
+            self.selected_log = None;
             self.dest_delete_confirm = None;
             self.show_emoji_picker = false;
         }
@@ -1399,6 +1543,13 @@ impl eframe::App for NicordApp {
         if self.sent_today_updated.elapsed() >= std::time::Duration::from_secs(5) {
             self.sent_today = self.store.count_sends_today();
             self.sent_today_updated = std::time::Instant::now();
+        }
+        // Scheduled automatic backups (Group 3): the due check
+        // runs at most every 60 s; the backup itself is a small
+        // local export (milliseconds) and runs inline.
+        if self.auto_backup_checked.elapsed() >= std::time::Duration::from_secs(60) {
+            self.auto_backup_checked = std::time::Instant::now();
+            self.maybe_auto_backup();
         }
         // Sync webhook health from the check thread into the config
         // (persisted). Runs at most once per change: after syncing,
@@ -1583,7 +1734,153 @@ impl eframe::App for NicordApp {
 
 impl NicordApp {
     /// Left sidebar: brand, nav, today status card, Emergency Stop.
+    /// Next-run times for all scenarios, via the display cache.
+    /// Each screen calls this once per frame and looks up from the
+    /// map, instead of running the (potentially ~38 ms) cron scan
+    /// once per row per call site.
+    fn cached_next_runs(
+        &mut self,
+    ) -> std::collections::HashMap<String, chrono::DateTime<chrono::Local>> {
+        let scenarios = self
+            .scenarios
+            .lock()
+            .map(|l| l.to_vec())
+            .unwrap_or_default();
+        self.next_run_cache
+            .next_runs(&scenarios, chrono::Local::now())
+    }
+
+    /// Recompute the Dashboard timeline at most every 30 s. The
+    /// computation walks each enabled scenario's schedule forward
+    /// (a sparse cron costs ~38 ms per step), so it must not run
+    /// every frame; 30 s staleness is invisible on a 7-day view.
+    fn refresh_timeline(&mut self) {
+        if self.timeline_updated.elapsed() < std::time::Duration::from_secs(30) {
+            return;
+        }
+        let scenarios = self
+            .scenarios
+            .lock()
+            .map(|l| l.to_vec())
+            .unwrap_or_default();
+        let destinations = self.store.load_destinations().unwrap_or_default();
+        let mut sent_by_dest = std::collections::HashMap::new();
+        for d in &destinations {
+            sent_by_dest.insert(
+                d.id.clone(),
+                self.store.count_sends_today_for_destination(&d.id),
+            );
+        }
+        let is_webhook = self.config.send_mode == SendMode::Webhook;
+        let global_cap = self.config.global_daily_cap;
+        self.timeline_cache = crate::timeline::upcoming_runs(
+            &scenarios,
+            &destinations,
+            is_webhook,
+            &sent_by_dest,
+            global_cap,
+            chrono::Local::now(),
+            7,
+            10,
+            20,
+        );
+        self.timeline_updated = std::time::Instant::now();
+    }
+
+    /// 7-day sent/failed bar chart, hand-drawn with the egui
+    /// painter (no chart dependency). Days with no history show
+    /// no bars; the value labels show exact counts.
+    fn show_week_chart(&self, ui: &mut egui::Ui) {
+        let counts = self.store.counts_by_day(7).unwrap_or_default();
+        let today = chrono::Utc::now().date_naive();
+        let mut days: Vec<(String, u32, u32)> = Vec::new();
+        for back in (0..7).rev() {
+            let d = today - chrono::Duration::days(back);
+            let key = d.format("%Y-%m-%d").to_string();
+            let (s, f) = counts
+                .iter()
+                .find(|(k, _, _)| *k == key)
+                .map(|(_, s, f)| (*s, *f))
+                .unwrap_or((0, 0));
+            days.push((d.format("%d/%m").to_string(), s, f));
+        }
+        let max = days.iter().map(|(_, s, f)| (*s).max(*f)).max().unwrap_or(0);
+        if max == 0 {
+            theme::muted(ui, "Chưa có lịch sử gửi trong 7 ngày qua.");
+            return;
+        }
+        let height = 110.0;
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), height),
+            egui::Sense::hover(),
+        );
+        let painter = ui.painter_at(rect);
+        let palette = theme::palette();
+        let small = egui::TextStyle::Small.resolve(ui.style());
+        let slot = rect.width() / 7.0;
+        let label_h = 16.0;
+        let top_pad = 14.0;
+        let plot_h = height - label_h - top_pad;
+        let base = rect.top() + top_pad + plot_h;
+        for (i, (label, sent, failed)) in days.iter().enumerate() {
+            let cx = rect.left() + (i as f32 + 0.5) * slot;
+            let bar_w = (slot * 0.32).min(22.0);
+            let gap = 3.0;
+            let sent_h = plot_h * (*sent as f32 / max as f32);
+            let failed_h = plot_h * (*failed as f32 / max as f32);
+            painter.rect_filled(
+                egui::Rect::from_min_size(
+                    egui::pos2(cx - bar_w - gap / 2.0, base - sent_h),
+                    egui::vec2(bar_w, sent_h),
+                ),
+                2.0,
+                palette.success,
+            );
+            painter.rect_filled(
+                egui::Rect::from_min_size(
+                    egui::pos2(cx + gap / 2.0, base - failed_h),
+                    egui::vec2(bar_w, failed_h),
+                ),
+                2.0,
+                palette.danger,
+            );
+            if *sent > 0 {
+                painter.text(
+                    egui::pos2(cx - bar_w / 2.0 - gap / 2.0, base - sent_h - 2.0),
+                    egui::Align2::CENTER_BOTTOM,
+                    sent.to_string(),
+                    small.clone(),
+                    palette.text,
+                );
+            }
+            if *failed > 0 {
+                painter.text(
+                    egui::pos2(cx + bar_w / 2.0 + gap / 2.0, base - failed_h - 2.0),
+                    egui::Align2::CENTER_BOTTOM,
+                    failed.to_string(),
+                    small.clone(),
+                    palette.text,
+                );
+            }
+            painter.text(
+                egui::pos2(cx, rect.bottom() - 2.0),
+                egui::Align2::CENTER_BOTTOM,
+                label,
+                small.clone(),
+                palette.text_muted,
+            );
+        }
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("■").color(palette.success));
+            ui.label("Đã gửi");
+            ui.add_space(12.0);
+            ui.label(RichText::new("■").color(palette.danger));
+            ui.label("Thất bại");
+        });
+    }
+
     fn show_sidebar(&mut self, ui: &mut egui::Ui) {
+        let next_runs = self.cached_next_runs();
         ui.horizontal(|ui| {
             ui.label(theme::semibold("Nicord", 22.0).color(theme::palette().text));
             ui.label(RichText::new("•").size(22.0).color(theme::ACCENT_LIGHT));
@@ -1673,11 +1970,7 @@ impl NicordApp {
                     let next = self.scenarios.lock().map(|l| {
                         l.iter()
                             .filter(|s| s.enabled)
-                            .filter_map(|s| {
-                                s.schedule
-                                    .as_ref()
-                                    .map(|sc| sc.next_after(chrono::Local::now()))
-                            })
+                            .filter_map(|s| next_runs.get(&s.id).copied())
                             .min()
                     });
                     if let Ok(Some(t)) = next {
@@ -1886,7 +2179,12 @@ impl NicordApp {
     /// Destination card (QoL Q2/Q4): one card for the active
     /// destination — health + last check (webhook mode), last send,
     /// persisted failures today, and the next scheduled run.
-    fn show_destination_card(&self, ui: &mut egui::Ui, next_text: &str) {
+    fn show_destination_card(
+        &self,
+        ui: &mut egui::Ui,
+        next_text: &str,
+        next_runs: &std::collections::HashMap<String, chrono::DateTime<chrono::Local>>,
+    ) {
         let is_webhook = self.config.send_mode == SendMode::Webhook;
         let failed_today = self.store.count_status_today("failed");
         let last_send = self
@@ -1915,11 +2213,7 @@ impl NicordApp {
                     );
                 }
                 for dest in &dests {
-                    let sent = if dest.channel_id.is_empty() {
-                        0
-                    } else {
-                        self.store.count_sends_today_for_channel(&dest.channel_id)
-                    };
+                    let sent = self.store.count_sends_today_for_destination(&dest.id);
                     let state_color = if !dest.enabled {
                         theme::palette().text_secondary
                     } else if dest.failure_state.is_paused() {
@@ -1944,11 +2238,7 @@ impl NicordApp {
                             .filter(|s| {
                                 s.enabled && s.destination_id.as_deref() == Some(dest.id.as_str())
                             })
-                            .filter_map(|s| {
-                                s.schedule.as_ref().map(|sc| {
-                                    (sc.next_after(chrono::Local::now()), s.timezone.clone())
-                                })
-                            })
+                            .filter_map(|s| next_runs.get(&s.id).map(|t| (*t, s.timezone.clone())))
                             .min_by_key(|(t, _)| *t)
                     });
                     if let Ok(Some((t, tz))) = next_for_dest {
@@ -1974,14 +2264,29 @@ impl NicordApp {
     }
 
     fn show_dashboard(&mut self, ui: &mut egui::Ui) {
+        let next_runs = self.cached_next_runs();
+        // M2: a failed last-run save is surfaced live — the
+        // engine remembers the last persistence error, and it
+        // joins the startup issues in this card until a save
+        // succeeds. (Startup issues refresh only on events;
+        // this one must appear within a frame of the failure.)
+        let persist_issue = self.engine.last_persist_error().map(|e| {
+            crate::health::HealthIssue {
+                severity: crate::health::Severity::Warning,
+                message: format!(
+                    "Không lưu được trạng thái gửi ({e}) — nếu app tắt đột ngột, một lịch có thể gửi lặp lại. Kiểm tra ổ đĩa và quyền ghi."
+                ),
+                target: None,
+            }
+        });
         // Startup health report (Q15): shown until dismissed.
-        if !self.health_dismissed && !self.health_issues.is_empty() {
+        if !self.health_dismissed && (!self.health_issues.is_empty() || persist_issue.is_some()) {
             let mut jump_to: Option<Screen> = None;
             let mut dismiss = false;
             let mut recheck = false;
             theme::card(ui, |ui| {
                 theme::section_title(ui, "Tình trạng khởi động");
-                for issue in &self.health_issues {
+                for issue in self.health_issues.iter().chain(persist_issue.iter()) {
                     let (dot, label) = match issue.severity {
                         crate::health::Severity::Error => {
                             (theme::dot(theme::palette().danger), "Lỗi")
@@ -2038,19 +2343,18 @@ impl NicordApp {
             .engine
             .running
             .load(std::sync::atomic::Ordering::SeqCst);
-        let next_run = self.scenarios.lock().map(|l| {
-            l.iter()
-                .filter_map(|s| {
-                    s.schedule
-                        .as_ref()
-                        .map(|sc| sc.next_after(chrono::Local::now()))
-                })
-                .min()
-        });
-        let next_text = match next_run {
-            Ok(Some(t)) => t.format("%d/%m %H:%M").to_string(),
-            _ => "—".to_string(),
-        };
+        // `.ok().flatten()` drops the lock guard (and the
+        // poison-error carrier) immediately: holding the `Result`
+        // would keep `self.scenarios` borrowed until the end of
+        // this function and block later `&mut self` calls.
+        let next_text = self
+            .scenarios
+            .lock()
+            .map(|l| l.iter().filter_map(|s| next_runs.get(&s.id).copied()).min())
+            .ok()
+            .flatten()
+            .map(|t| t.format("%d/%m %H:%M").to_string())
+            .unwrap_or_else(|| "—".to_string());
         // Success rate uses persisted counts for both sides: sent
         // today AND failed today come from the log, so restarting the
         // app cannot reset the rate to 100%. (The session-only
@@ -2133,7 +2437,7 @@ impl NicordApp {
         ui.add_space(12.0);
         // Destination card (QoL Q2/Q4): health, last check, last send,
         // and persisted failure count for the active destination.
-        self.show_destination_card(ui, &next_text);
+        self.show_destination_card(ui, &next_text, &next_runs);
         ui.add_space(12.0);
         // Actions.
         theme::card(ui, |ui| {
@@ -2178,7 +2482,10 @@ impl NicordApp {
                         .map_err(|e| e.to_string())
                         .and_then(|j| std::fs::write(&path, j).map_err(|e| e.to_string()));
                     match result {
-                        Ok(()) => self.set_status(&format!("Stats exported to {}", path.display())),
+                        Ok(()) => {
+                            restrict_permissions(&path);
+                            self.set_status(&format!("Stats exported to {}", path.display()))
+                        }
                         Err(e) => self.set_status(&format!("Export failed: {e}")),
                     }
                 }
@@ -2195,6 +2502,56 @@ impl NicordApp {
             theme::muted(ui, tray_note);
         });
         ui.add_space(12.0);
+        // Upcoming-sends timeline (Group 1): the next 20 runs
+        // across enabled scenarios, with blocked-run warnings.
+        self.refresh_timeline();
+        let timeline = self.timeline_cache.clone();
+        let mut jump_to: Option<String> = None;
+        theme::card(ui, |ui| {
+            theme::section_title(ui, t(self.lang(), "dash.timeline"));
+            if timeline.is_empty() {
+                theme::muted(
+                    ui,
+                    "Không có lịch gửi nào trong 7 ngày tới — bật một kịch bản để xem tại đây.",
+                );
+            } else {
+                for run in &timeline {
+                    ui.horizontal(|ui| {
+                        ui.label(run.at.format("%d/%m %H:%M").to_string());
+                        ui.label(&run.scenario_name);
+                        if !run.destination_name.is_empty() {
+                            theme::muted(ui, &format!("→ {}", run.destination_name));
+                        }
+                        if let Some(reason) = &run.blocked {
+                            ui.label(
+                                RichText::new(format!("sẽ bỏ qua: {reason}"))
+                                    .color(theme::palette().warning)
+                                    .small(),
+                            );
+                        }
+                        if ui
+                            .small_button(t(self.lang(), "dash.timeline_edit"))
+                            .clicked()
+                        {
+                            jump_to = Some(run.scenario_id.clone());
+                        }
+                    });
+                }
+                theme::muted(
+                    ui,
+                    "Dự đoán từ lịch và cài đặt hiện tại; giới hạn ngày chỉ tính cho hôm nay, cooldown 429 và giờ ngủ đêm không được tính.",
+                );
+            }
+        });
+        if let Some(id) = jump_to {
+            if let Ok(list) = self.scenarios.lock() {
+                if let Some(i) = list.iter().position(|s| s.id == id) {
+                    self.selected = Some(i);
+                    self.screen = Screen::Builder;
+                }
+            }
+        }
+        ui.add_space(12.0);
         // Scenario list.
         theme::card(ui, |ui| {
             theme::section_title(ui, "Scenarios");
@@ -2205,16 +2562,9 @@ impl NicordApp {
                     l.iter()
                         .enumerate()
                         .map(|(i, s)| {
-                            let next = s
-                                .schedule
-                                .as_ref()
-                                .map(|sc| {
-                                    format!(
-                                        "next {}",
-                                        sc.next_after(chrono::Local::now())
-                                            .format("%Y-%m-%d %H:%M")
-                                    )
-                                })
+                            let next = next_runs
+                                .get(&s.id)
+                                .map(|t| format!("next {}", t.format("%Y-%m-%d %H:%M")))
                                 .unwrap_or_default();
                             (
                                 i,
@@ -2270,6 +2620,12 @@ impl NicordApp {
                     self.screen = Screen::Builder;
                 }
             }
+        });
+        ui.add_space(12.0);
+        // 7-day sent/failed chart (Group 1).
+        theme::card(ui, |ui| {
+            theme::section_title(ui, t(self.lang(), "dash.week_chart"));
+            self.show_week_chart(ui);
         });
     }
 
@@ -2759,6 +3115,8 @@ impl NicordApp {
             ui.add_space(6.0);
             self.show_embed_composer(ui, i);
             ui.add_space(6.0);
+            self.show_poll_composer(ui, i);
+            ui.add_space(6.0);
             // Import warnings from the last import (Q3), if any.
             if !self.import_warnings.is_empty() {
                 theme::card(ui, |ui| {
@@ -2844,6 +3202,83 @@ impl NicordApp {
                 let _ = d;
             }
         }
+        // Mention control + silent send (idea #7). Same
+        // lock-edit-save pattern as the checkbox above.
+        let mut allow_mass = scenario.allow_mass_mentions;
+        if ui
+            .checkbox(
+                &mut allow_mass,
+                "Cho phép ping hàng loạt (@everyone, @here, vai trò)",
+            )
+            .changed()
+        {
+            if let Ok(mut list) = self.scenarios.lock() {
+                if let Some(s) = list.get_mut(i) {
+                    s.allow_mass_mentions = allow_mass;
+                    let _ = self.store.save_scenario(s);
+                }
+            }
+        }
+        let mut silent = scenario.silent_send;
+        if ui
+            .checkbox(&mut silent, "Gửi im lặng (không tạo thông báo)")
+            .changed()
+        {
+            if let Ok(mut list) = self.scenarios.lock() {
+                if let Some(s) = list.get_mut(i) {
+                    s.silent_send = silent;
+                    let _ = self.store.save_scenario(s);
+                }
+            }
+        }
+        if !scenario.allow_mass_mentions {
+            let has_mass_ping = scenario
+                .messages
+                .iter()
+                .any(|m| m.contains("@everyone") || m.contains("@here"))
+                || scenario
+                    .node_message()
+                    .is_some_and(|m| m.contains("@everyone") || m.contains("@here"));
+            if has_mass_ping {
+                ui.label(
+                    RichText::new(
+                        "Tin nhắn chứa @everyone/@here nhưng ping hàng loạt đang bị chặn — Discord sẽ hiển thị chữ, không ping ai. Bật ô trên nếu bạn thật sự muốn ping.",
+                    )
+                    .color(theme::palette().warning),
+                );
+            }
+        }
+        // Durable counters (idea #6): the counters this scenario's
+        // messages reference, with their current values and a
+        // reset. Values come from the store (durable), not from
+        // the scenario clone.
+        let mut counter_text = scenario.messages.join("\n");
+        if let Some(m) = scenario.node_message() {
+            counter_text.push('\n');
+            counter_text.push_str(&m);
+        }
+        let counter_list = crate::scenario::counter_names(&counter_text);
+        if !counter_list.is_empty() {
+            for name in &counter_list {
+                ui.horizontal(|ui| {
+                    ui.label(format!(
+                        "Bộ đếm '{name}': hiện tại {}",
+                        self.store.get_counter(name)
+                    ));
+                    if theme::ghost_button(ui, "Đặt lại").clicked() {
+                        let _ = self.store.delete_counter(name);
+                    }
+                });
+            }
+            theme::muted(
+                ui,
+                "Bộ đếm tăng 1 sau mỗi lần gửi thành công dùng tới nó; lần gửi đầu tiên hiển thị 1.",
+            );
+        }
+        theme::muted(
+            ui,
+            "Biến dùng được trong tin nhắn: {{username}} {{server}} {{channel}} {{date}} {{time}} {{weekday}} {{week_number}} {{days_until:YYYY-MM-DD}} {{counter:tên}}.",
+        );
         // Source line.
         if let Some(node_msg) = scenario.node_message() {
             theme::muted(ui, &format!("Tin tiếp theo (từ node): {node_msg}"));
@@ -3111,13 +3546,80 @@ impl NicordApp {
                     }
                 }
             });
-            // Next run with timezone shown.
+            // Next run with timezone shown. Direct call, deliberately
+            // not cached: this is the DRAFT schedule being edited
+            // (one call per frame for one scenario), and every
+            // keystroke changes the schedule anyway.
             if let Some(sc) = &schedule {
-                let next = sc.next_after(chrono::Local::now());
+                let next = sc.next_after(chrono::Local::now(), &timezone);
                 theme::muted(
                     ui,
                     &format!("Lịch tới: {} ({})", next.format("%d/%m/%Y %H:%M"), timezone),
                 );
+            }
+            // Simulation (Group 1): the next 10 runs of the DRAFT
+            // schedule with blocked-run warnings. Cached by draft
+            // key so a sparse cron is not re-walked every frame.
+            ui.separator();
+            ui.label(RichText::new(t(self.lang(), "builder.simulation")).strong());
+            let key = format!("{i}|{schedule:?}|{timezone}");
+            let cached =
+                self.sim_cache
+                    .as_ref()
+                    .and_then(|(k, v)| if *k == key { Some(v.clone()) } else { None });
+            let sim_runs = match cached {
+                Some(v) => v,
+                None => {
+                    let draft = self
+                        .scenarios
+                        .lock()
+                        .map(|l| l.get(i).cloned())
+                        .unwrap_or_default();
+                    let runs = match draft {
+                        Some(mut sc) => {
+                            sc.schedule = schedule.clone();
+                            sc.timezone = timezone.clone();
+                            let dest = sc
+                                .destination_id
+                                .as_deref()
+                                .and_then(|id| self.store.load_destination(id).ok().flatten());
+                            let sent = dest
+                                .as_ref()
+                                .map(|d| self.store.count_sends_today_for_destination(&d.id))
+                                .unwrap_or(0);
+                            let is_webhook = self.config.send_mode == SendMode::Webhook;
+                            let cap = self.config.global_daily_cap;
+                            crate::timeline::simulate_scenario(
+                                &sc,
+                                dest.as_ref(),
+                                is_webhook,
+                                sent,
+                                cap,
+                                chrono::Local::now(),
+                                10,
+                            )
+                        }
+                        None => Vec::new(),
+                    };
+                    self.sim_cache = Some((key, runs.clone()));
+                    runs
+                }
+            };
+            if sim_runs.is_empty() {
+                theme::muted(ui, "Không có lần chạy nào trong 30 ngày tới.");
+            } else {
+                for run in &sim_runs {
+                    ui.horizontal(|ui| {
+                        ui.label(run.at.format("%d/%m/%Y %H:%M").to_string());
+                        if let Some(reason) = &run.blocked {
+                            ui.label(
+                                RichText::new(format!("sẽ bỏ qua: {reason}"))
+                                    .color(theme::palette().warning)
+                                    .small(),
+                            );
+                        }
+                    });
+                }
             }
             if let Some(e) = &error {
                 ui.label(RichText::new(e).color(theme::palette().danger));
@@ -3242,163 +3744,326 @@ impl NicordApp {
         });
     }
 
-    /// Embed composer (Q8): one rich embed per scenario, sent with
-    /// every message. Limits are enforced live; an invalid embed
-    /// blocks saving with the reason shown.
+    /// Embed composer (Q8, extended by idea #8): up to 10 rich
+    /// embeds per scenario, sent with every message. Limits are
+    /// shown live (per embed AND the 6000-char total across all
+    /// of them); drafts save as edited, and validation gates
+    /// enabling/sending instead of the editor.
     fn show_embed_composer(&mut self, ui: &mut egui::Ui, i: usize) {
-        let mut embed = self
+        let mut embeds = self
             .scenarios
             .lock()
-            .map(|l| l.get(i).and_then(|s| s.embed.clone()))
-            .unwrap_or(None);
+            .map(|l| l.get(i).map(|s| s.embeds.clone()).unwrap_or_default())
+            .unwrap_or_default();
         let mut changed = false;
         let mut error: Option<String> = None;
         theme::card(ui, |ui| {
             theme::section_title(ui, t(self.lang(), "builder.embed"));
-            let mut enabled = embed.is_some();
+            let mut enabled = !embeds.is_empty();
             if ui.checkbox(&mut enabled, "Gửi kèm embed").changed() {
-                embed = if enabled {
-                    Some(crate::embed::Embed::default())
+                if enabled {
+                    if embeds.is_empty() {
+                        embeds.push(crate::embed::Embed::default());
+                    }
                 } else {
-                    None
-                };
+                    embeds.clear();
+                }
                 changed = true;
             }
-            if let Some(e) = &mut embed {
-                ui.horizontal(|ui| {
-                    ui.label("Tiêu đề (tối đa 256):");
-                    if ui.text_edit_singleline(&mut e.title).changed() {
-                        changed = true;
-                    }
-                });
-                ui.label("Mô tả (tối đa 4096):");
-                if ui
-                    .add(
-                        egui::TextEdit::multiline(&mut e.description)
-                            .desired_rows(3)
-                            .desired_width(f32::INFINITY),
-                    )
-                    .changed()
-                {
-                    changed = true;
-                }
-                ui.horizontal(|ui| {
-                    ui.label("Tác giả (tối đa 256):");
-                    if ui.text_edit_singleline(&mut e.author_name).changed() {
-                        changed = true;
-                    }
-                });
-                // Color: hex field + presets.
-                let mut hex = e.color.map(|c| format!("{c:06X}")).unwrap_or_default();
-                ui.horizontal(|ui| {
-                    ui.label("Màu (hex RRGGBB, để trống = mặc định):");
-                    if ui.text_edit_singleline(&mut hex).changed() {
-                        let hex_trim = hex.trim().trim_start_matches('#');
-                        if hex_trim.is_empty() {
-                            e.color = None;
-                            changed = true;
-                        } else if hex_trim.len() == 6 && u32::from_str_radix(hex_trim, 16).is_ok() {
-                            e.color = u32::from_str_radix(hex_trim, 16).ok();
-                            changed = true;
-                        } else {
-                            error = Some("Màu phải là 6 ký tự hex (vd: 5865F2).".to_string());
-                        }
-                    }
-                    for (label, value) in [
-                        ("Blurple", 0x5865F2u32),
-                        ("Xanh", 0x57F287),
-                        ("Đỏ", 0xED4245),
-                        ("Vàng", 0xFEE75C),
-                        ("Tím", 0x9B59B6),
-                    ] {
-                        if ui.small_button(label).clicked() {
-                            e.color = Some(value);
-                            changed = true;
-                        }
-                    }
-                });
-                ui.label("Fields (tối đa 25, tên 256 / giá trị 1024):");
+            if enabled {
                 let mut to_remove: Option<usize> = None;
-                for (idx, field) in e.fields.iter_mut().enumerate() {
+                for (idx, embed) in embeds.iter_mut().enumerate() {
                     ui.horizontal(|ui| {
-                        ui.add(egui::TextEdit::singleline(&mut field.name).hint_text("Tên field"));
-                        ui.add(egui::TextEdit::singleline(&mut field.value).hint_text("Giá trị"));
-                        ui.checkbox(&mut field.inline, "inline");
-                        if ui.button("Xóa").clicked() {
+                        ui.label(theme::semibold(&format!("Embed {}", idx + 1), 15.0));
+                        if ui.button("Xóa embed này").clicked() {
                             to_remove = Some(idx);
                         }
                     });
+                    Self::show_embed_editor(ui, embed, &mut changed, &mut error);
+                    ui.separator();
                 }
                 if let Some(idx) = to_remove {
-                    e.fields.remove(idx);
+                    embeds.remove(idx);
                     changed = true;
                 }
-                if e.fields.len() < crate::embed::EMBED_MAX_FIELDS
-                    && ui.button("+ Thêm field").clicked()
+                if embeds.len() < crate::embed::EMBED_MAX_COUNT
+                    && ui.button("+ Thêm embed").clicked()
                 {
-                    e.fields.push(crate::embed::EmbedField::default());
+                    embeds.push(crate::embed::Embed::default());
                     changed = true;
                 }
-                ui.horizontal(|ui| {
-                    ui.label("Chân trang (tối đa 2048):");
-                    if ui.text_edit_singleline(&mut e.footer_text).changed() {
-                        changed = true;
-                    }
-                });
+                let total: usize = embeds.iter().map(|e| e.total_chars()).sum();
                 theme::muted(
                     ui,
                     &format!(
-                        "Tổng embed: {}/6000 ký tự (giới hạn của Discord).",
-                        e.total_chars()
+                        "Tổng tất cả embed: {total}/6000 ký tự (giới hạn của Discord, tính chung).",
                     ),
                 );
-                if let Err(validation) = e.validate() {
+                if let Err(validation) = crate::embed::validate_embeds(&embeds) {
                     ui.label(RichText::new(validation).color(theme::palette().danger));
                 }
-                // Preview card.
-                ui.add_space(4.0);
-                theme::card(ui, |ui| {
-                    if let Some(color) = e.color {
-                        ui.label(
-                            RichText::new(format!("■ Màu #{color:06X}"))
-                                .color(theme::palette().text_secondary),
-                        );
-                    }
-                    if !e.author_name.trim().is_empty() {
-                        theme::muted(ui, &e.author_name);
-                    }
-                    if !e.title.trim().is_empty() {
-                        ui.label(theme::semibold(&e.title, 16.0));
-                    }
-                    if !e.description.trim().is_empty() {
-                        ui.label(&e.description);
-                    }
-                    for field in &e.fields {
-                        ui.horizontal(|ui| {
-                            ui.label(theme::semibold(&field.name, 14.0));
-                            ui.label(&field.value);
-                        });
-                    }
-                    if !e.footer_text.trim().is_empty() {
-                        theme::muted(ui, &e.footer_text);
-                    }
-                });
             }
             if let Some(e) = &error {
                 ui.label(RichText::new(e).color(theme::palette().danger));
             }
         });
         if changed && error.is_none() {
-            // Validate before writing (fail-closed).
-            if let Some(e) = &embed {
-                if let Err(validation) = e.validate() {
-                    self.set_status(&format!("Invalid embed — not saved: {validation}"));
-                    return;
-                }
-            }
+            // Drafts save unconditionally: the composer is an
+            // editor, not a gate. An invalid embed set cannot be
+            // ENABLED or SENT (validate_inner rejects it), but
+            // the draft must persist across frames — otherwise
+            // the enable checkbox unchecks itself on the next
+            // frame and the composer can never be filled in.
+            // (This was a latent Q8 bug: the old fail-closed
+            // save made the composer un-enterable.)
             if let Ok(mut list) = self.scenarios.lock() {
                 if let Some(s) = list.get_mut(i) {
-                    s.embed = embed;
+                    s.embeds = embeds;
+                    let _ = self.store.save_scenario(s);
+                }
+            }
+        }
+    }
+
+    /// The field editor + preview for ONE embed. Shared by every
+    /// embed in the composer; touches no app state.
+    fn show_embed_editor(
+        ui: &mut egui::Ui,
+        e: &mut crate::embed::Embed,
+        changed: &mut bool,
+        error: &mut Option<String>,
+    ) {
+        ui.horizontal(|ui| {
+            ui.label("Tiêu đề (tối đa 256):");
+            if ui.text_edit_singleline(&mut e.title).changed() {
+                *changed = true;
+            }
+        });
+        ui.label("Mô tả (tối đa 4096):");
+        if ui
+            .add(
+                egui::TextEdit::multiline(&mut e.description)
+                    .desired_rows(3)
+                    .desired_width(f32::INFINITY),
+            )
+            .changed()
+        {
+            *changed = true;
+        }
+        ui.horizontal(|ui| {
+            ui.label("Tác giả (tối đa 256):");
+            if ui.text_edit_singleline(&mut e.author_name).changed() {
+                *changed = true;
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Link tiêu đề (https, để trống = không link):");
+            if ui.text_edit_singleline(&mut e.url).changed() {
+                *changed = true;
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Ảnh lớn (URL https, để trống = không ảnh):");
+            if ui.text_edit_singleline(&mut e.image_url).changed() {
+                *changed = true;
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Ảnh nhỏ góc phải (URL https):");
+            if ui.text_edit_singleline(&mut e.thumbnail_url).changed() {
+                *changed = true;
+            }
+        });
+        // Color: hex field + presets.
+        let mut hex = e.color.map(|c| format!("{c:06X}")).unwrap_or_default();
+        ui.horizontal(|ui| {
+            ui.label("Màu (hex RRGGBB, để trống = mặc định):");
+            if ui.text_edit_singleline(&mut hex).changed() {
+                let hex_trim = hex.trim().trim_start_matches('#');
+                if hex_trim.is_empty() {
+                    e.color = None;
+                    *changed = true;
+                } else if hex_trim.len() == 6 && u32::from_str_radix(hex_trim, 16).is_ok() {
+                    e.color = u32::from_str_radix(hex_trim, 16).ok();
+                    *changed = true;
+                } else {
+                    *error = Some("Màu phải là 6 ký tự hex (vd: 5865F2).".to_string());
+                }
+            }
+            for (label, value) in [
+                ("Blurple", 0x5865F2u32),
+                ("Xanh", 0x57F287),
+                ("Đỏ", 0xED4245),
+                ("Vàng", 0xFEE75C),
+                ("Tím", 0x9B59B6),
+            ] {
+                if ui.small_button(label).clicked() {
+                    e.color = Some(value);
+                    *changed = true;
+                }
+            }
+        });
+        ui.label("Fields (tối đa 25, tên 256 / giá trị 1024):");
+        let mut to_remove: Option<usize> = None;
+        for (idx, field) in e.fields.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut field.name).hint_text("Tên field"));
+                ui.add(egui::TextEdit::singleline(&mut field.value).hint_text("Giá trị"));
+                ui.checkbox(&mut field.inline, "inline");
+                if ui.button("Xóa").clicked() {
+                    to_remove = Some(idx);
+                }
+            });
+        }
+        if let Some(idx) = to_remove {
+            e.fields.remove(idx);
+            *changed = true;
+        }
+        if e.fields.len() < crate::embed::EMBED_MAX_FIELDS && ui.button("+ Thêm field").clicked() {
+            e.fields.push(crate::embed::EmbedField::default());
+            *changed = true;
+        }
+        ui.horizontal(|ui| {
+            ui.label("Chân trang (tối đa 2048):");
+            if ui.text_edit_singleline(&mut e.footer_text).changed() {
+                *changed = true;
+            }
+        });
+        theme::muted(ui, &format!("Embed này: {}/6000 ký tự.", e.total_chars()));
+        if let Err(validation) = e.validate() {
+            ui.label(RichText::new(validation).color(theme::palette().danger));
+        }
+        // Preview card.
+        ui.add_space(4.0);
+        theme::card(ui, |ui| {
+            if let Some(color) = e.color {
+                ui.label(
+                    RichText::new(format!("■ Màu #{color:06X}"))
+                        .color(theme::palette().text_secondary),
+                );
+            }
+            if !e.author_name.trim().is_empty() {
+                theme::muted(ui, &e.author_name);
+            }
+            if !e.title.trim().is_empty() {
+                ui.label(theme::semibold(&e.title, 16.0));
+            }
+            if !e.url.trim().is_empty() {
+                theme::muted(ui, &format!("Link: {}", e.url));
+            }
+            if !e.description.trim().is_empty() {
+                ui.label(&e.description);
+            }
+            for field in &e.fields {
+                ui.horizontal(|ui| {
+                    ui.label(theme::semibold(&field.name, 14.0));
+                    ui.label(&field.value);
+                });
+            }
+            if !e.footer_text.trim().is_empty() {
+                theme::muted(ui, &e.footer_text);
+            }
+            if !e.thumbnail_url.trim().is_empty() {
+                theme::muted(ui, &format!("Ảnh nhỏ: {}", e.thumbnail_url));
+            }
+            if !e.image_url.trim().is_empty() {
+                theme::muted(ui, &format!("Ảnh lớn: {}", e.image_url));
+            }
+        });
+    }
+
+    /// Poll composer (idea #3): one poll per scenario, sent with
+    /// every message. Limits are shown live; drafts save as
+    /// edited, and validation gates enabling/sending instead of
+    /// the editor. Results are NOT readable via webhook — the
+    /// note says so.
+    fn show_poll_composer(&mut self, ui: &mut egui::Ui, i: usize) {
+        let mut poll = self
+            .scenarios
+            .lock()
+            .map(|l| l.get(i).and_then(|s| s.poll.clone()))
+            .unwrap_or(None);
+        let mut changed = false;
+        theme::card(ui, |ui| {
+            theme::section_title(ui, t(self.lang(), "builder.poll"));
+            let mut enabled = poll.is_some();
+            if ui.checkbox(&mut enabled, "Gửi kèm bình chọn").changed() {
+                poll = if enabled {
+                    Some(crate::poll::Poll::default())
+                } else {
+                    None
+                };
+                changed = true;
+            }
+            if let Some(p) = &mut poll {
+                ui.horizontal(|ui| {
+                    ui.label("Câu hỏi (tối đa 300):");
+                    if ui.text_edit_singleline(&mut p.question).changed() {
+                        changed = true;
+                    }
+                });
+                ui.label("Đáp án (2–10, mỗi đáp án tối đa 55 ký tự):");
+                let mut to_remove: Option<usize> = None;
+                // Length read before the mutable iteration: the
+                // remove button must not borrow `p.answers` again.
+                let n_answers = p.answers.len();
+                for (idx, answer) in p.answers.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{}.", idx + 1));
+                        if ui.text_edit_singleline(answer).changed() {
+                            changed = true;
+                        }
+                        if n_answers > crate::poll::POLL_MIN_ANSWERS && ui.button("Xóa").clicked()
+                        {
+                            to_remove = Some(idx);
+                        }
+                    });
+                }
+                if let Some(idx) = to_remove {
+                    p.answers.remove(idx);
+                    changed = true;
+                }
+                if p.answers.len() < crate::poll::POLL_MAX_ANSWERS
+                    && ui.button("+ Thêm đáp án").clicked()
+                {
+                    p.answers.push(String::new());
+                    changed = true;
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Hết hạn sau:");
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut p.duration_hours)
+                                .range(1..=168)
+                                .suffix(" giờ"),
+                        )
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                    if ui
+                        .checkbox(&mut p.allow_multiselect, "Cho chọn nhiều đáp án")
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                });
+                if let Err(validation) = p.validate() {
+                    ui.label(RichText::new(validation).color(theme::palette().danger));
+                }
+                theme::muted(
+                    ui,
+                    "Kết quả bình chọn không đọc được qua webhook — xem trực tiếp trên Discord. Bình chọn có thể gửi kèm tin nhắn trống.",
+                );
+            }
+        });
+        if changed {
+            // Drafts save unconditionally (same reason as the
+            // embed composer): an invalid poll cannot be enabled
+            // or sent, but the draft must persist across frames.
+            if let Ok(mut list) = self.scenarios.lock() {
+                if let Some(s) = list.get_mut(i) {
+                    s.poll = poll;
                     let _ = self.store.save_scenario(s);
                 }
             }
@@ -3686,14 +4351,17 @@ impl NicordApp {
                         })
                     });
                     match result {
-                        Some(Ok(())) => self.set_status(&format!("Exported to {}", path.display())),
+                        Some(Ok(())) => {
+                            restrict_permissions(&path);
+                            self.set_status(&format!("Exported to {}", path.display()))
+                        }
                         Some(Err(e)) => self.set_status(&format!("Export failed: {e}")),
                         None => self.set_status("No scenario selected."),
                     }
                 }
                 if ui.button("Import scenario").clicked() {
                     let path = self.import_path.trim().to_string();
-                    match std::fs::read_to_string(&path) {
+                    match crate::backup::read_import_file(std::path::Path::new(&path)) {
                         Ok(text) => {
                             // QoL Q3: analyse first (warnings + validation),
                             // import only when the file is usable.
@@ -4316,6 +4984,14 @@ impl NicordApp {
                     .collect()
             })
             .unwrap_or_default();
+        // Destinations, loaded ONCE per frame for both the filter
+        // dropdown and the manual-delete check below (two loads
+        // per frame before; each parses every destination row).
+        let log_dests = if self.config.send_mode == SendMode::Webhook {
+            self.store.load_destinations().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         theme::card(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label("Filter:");
@@ -4375,8 +5051,7 @@ impl NicordApp {
                 // Two webhooks in one channel share a filter entry;
                 // the scenario filter narrows further when needed.
                 if self.config.send_mode == SendMode::Webhook {
-                    let dests = self.store.load_destinations().unwrap_or_default();
-                    let dest_label = dests
+                    let dest_label = log_dests
                         .iter()
                         .find(|d| d.channel_id == self.log_channel_filter)
                         .map(|d| d.display_name())
@@ -4389,7 +5064,7 @@ impl NicordApp {
                                 String::new(),
                                 "All destinations",
                             );
-                            for d in &dests {
+                            for d in &log_dests {
                                 if !d.channel_id.is_empty() {
                                     ui.selectable_value(
                                         &mut self.log_channel_filter,
@@ -4447,6 +5122,7 @@ impl NicordApp {
                         });
                     match result {
                         Ok(Ok(())) => {
+                            restrict_permissions(&path);
                             self.set_status(&format!("Logs exported to {}", path.display()))
                         }
                         Ok(Err(e)) => self.set_status(&format!("Export failed: {e}")),
@@ -4482,6 +5158,42 @@ impl NicordApp {
             log_channel.as_deref(),
         ) {
             Ok(rows) => {
+                // Detail view (Group 3): the full detail text is
+                // selectable (copyable), plus the metadata the rows
+                // do not show (message id, destination id, channel).
+                // Scrubbed on display like the rows, for the same
+                // reason: rows written before the scheduler scrub
+                // boundary may hold a leaked URL.
+                if let Some(selected) = self.selected_log {
+                    if let Some(row) = rows.iter().find(|r| r.id == selected) {
+                        // Labels resolved before the card: the card
+                        // closure mutates `self.selected_log`.
+                        let detail_title = t(self.lang(), "logs.detail_title");
+                        let close_label = t(self.lang(), "logs.close");
+                        theme::card(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                theme::section_title(ui, detail_title);
+                                if theme::ghost_button(ui, close_label).clicked() {
+                                    self.selected_log = None;
+                                }
+                            });
+                            ui.label(format!("Thời gian: {}", row.created_at));
+                            ui.label(format!("Kịch bản: {}", row.scenario_name));
+                            ui.label(format!("Trạng thái: {}", row.status));
+                            if !row.channel_id.is_empty() {
+                                ui.label(format!("Kênh: {}", row.channel_id));
+                            }
+                            if !row.message_id.is_empty() {
+                                ui.label(format!("Message ID: {}", row.message_id));
+                            }
+                            if !row.destination_id.is_empty() {
+                                ui.label(format!("Đích đến: {}", row.destination_id));
+                            }
+                            ui.add(egui::Label::new(scrub_secrets(&row.detail)).selectable(true));
+                        });
+                        ui.add_space(12.0);
+                    }
+                }
                 if rows.is_empty() {
                     theme::card(ui, |ui| {
                         theme::muted(ui, "No logs yet — send history will appear here.");
@@ -4491,18 +5203,11 @@ impl NicordApp {
                     // deletable only when its destination still exists
                     // with a URL, so the delete goes to the exact
                     // webhook that sent it.
-                    let deletable: std::collections::HashSet<String> =
-                        if self.config.send_mode == SendMode::Webhook {
-                            self.store
-                                .load_destinations()
-                                .unwrap_or_default()
-                                .into_iter()
-                                .filter(|d| !d.encrypted_url.trim().is_empty())
-                                .map(|d| d.id)
-                                .collect()
-                        } else {
-                            std::collections::HashSet::new()
-                        };
+                    let deletable: std::collections::HashSet<String> = log_dests
+                        .iter()
+                        .filter(|d| !d.encrypted_url.trim().is_empty())
+                        .map(|d| d.id.clone())
+                        .collect();
                     theme::card(ui, |ui| {
                         egui::ScrollArea::vertical().show(ui, |ui| {
                             for row in rows {
@@ -4525,6 +5230,11 @@ impl NicordApp {
                                     ui.label(
                                         RichText::new(&row.status).color(status_color),
                                     );
+                                    if theme::ghost_button(ui, t(self.lang(), "logs.detail_btn"))
+                                        .clicked()
+                                    {
+                                        self.selected_log = Some(row.id);
+                                    }
                                     // Manual delete (Q13): webhook mode
                                     // only, one message at a time, with
                                     // confirmation. Never automatic.
@@ -4550,7 +5260,10 @@ impl NicordApp {
                                         }
                                     }
                                 });
-                                theme::muted(ui, &row.detail);
+                                // Scrub on display: rows written before
+                                // the scheduler scrub boundary may still
+                                // hold a leaked URL.
+                                theme::muted(ui, &scrub_secrets(&row.detail));
                                 ui.separator();
                             }
                         });
@@ -4596,8 +5309,11 @@ impl NicordApp {
                     return;
                 }
             };
-            let client =
-                crate::webhook::WebhookClient::new(url, "").with_thread_id(&dest.thread_id);
+            let Some(client) = crate::webhook::WebhookClient::new(url, "") else {
+                fail("Cannot delete: the HTTP client could not be built.".to_string());
+                return;
+            };
+            let client = client.with_thread_id(&dest.thread_id);
             let rt = match shared_runtime() {
                 Ok(rt) => rt,
                 Err(e) => {
@@ -4719,6 +5435,7 @@ impl NicordApp {
                             };
                             match std::fs::write(&path, json) {
                                 Ok(()) => {
+                                    restrict_permissions(&path);
                                     // Record the export for the startup
                                     // health report's backup reminder.
                                     self.config.last_export_at = chrono::Utc::now().to_rfc3339();
@@ -4806,6 +5523,131 @@ impl NicordApp {
     /// Run an import: read + parse the file, take an automatic local
     /// backup, apply the replacement, reload UI state. Errors leave
     /// the current config untouched (the backup is written first,
+    /// Run a scheduled automatic backup when one is due (Group 3).
+    /// Failures are logged, not shown in the status line: a backup
+    /// that fails every 60 s must not spam the user. The Settings
+    /// card shows the last successful backup time, so a stale
+    /// timestamp is the visible signal.
+    fn maybe_auto_backup(&mut self) {
+        if !self.config.auto_backup_enabled {
+            return;
+        }
+        let now = chrono::Utc::now();
+        if !crate::backup::auto_backup_due(
+            &self.config.last_auto_backup_at,
+            self.config.auto_backup_interval_days,
+            now,
+        ) {
+            return;
+        }
+        match crate::backup::run_auto_backup(
+            &self.store,
+            &self.config,
+            self.config.auto_backup_keep,
+        ) {
+            Ok(path) => {
+                self.config.last_auto_backup_at = now.to_rfc3339();
+                let _ = save_config(&self.config);
+                tracing::info!("automatic backup written to {}", path.display());
+            }
+            Err(e) => tracing::warn!("automatic backup failed: {e}"),
+        }
+    }
+
+    /// Scheduled backups + log retention (Group 3). The settings
+    /// are saved via Save settings, like the limits card; the two
+    /// action buttons run immediately and report in the status line.
+    fn show_maintenance_card(&mut self, ui: &mut egui::Ui) {
+        // Labels resolved before the card: the card closure
+        // mutates `self.config` (checkbox, drag values, combo).
+        let maintenance_title = t(self.lang(), "settings.maintenance");
+        let auto_backup_label = t(self.lang(), "settings.auto_backup");
+        let every_label = t(self.lang(), "settings.every");
+        let days_label = t(self.lang(), "settings.days");
+        let keep_label = t(self.lang(), "settings.keep");
+        let copies_label = t(self.lang(), "settings.copies");
+        let backup_now_label = t(self.lang(), "settings.backup_now");
+        let retention_label = t(self.lang(), "settings.retention");
+        let forever_label = t(self.lang(), "settings.forever");
+        let prune_now_label = t(self.lang(), "settings.prune_now");
+        theme::card(ui, |ui| {
+            theme::section_title(ui, maintenance_title);
+            ui.checkbox(&mut self.config.auto_backup_enabled, auto_backup_label);
+            ui.horizontal(|ui| {
+                ui.label(every_label);
+                ui.add(
+                    egui::DragValue::new(&mut self.config.auto_backup_interval_days)
+                        .range(1..=30)
+                        .suffix(format!(" {days_label}")),
+                );
+                ui.label(keep_label);
+                ui.add(
+                    egui::DragValue::new(&mut self.config.auto_backup_keep)
+                        .range(1..=30)
+                        .suffix(format!(" {copies_label}")),
+                );
+            });
+            if self.config.last_auto_backup_at.is_empty() {
+                theme::muted(ui, "Chưa từng sao lưu tự động.");
+            } else {
+                theme::muted(
+                    ui,
+                    &format!("Sao lưu gần nhất: {}", self.config.last_auto_backup_at),
+                );
+            }
+            theme::muted(
+                ui,
+                "Bản sao lưu nằm trong thư mục backups cạnh config.json và chỉ khôi phục được trên máy này (giống bản sao lưu trước khi import). Lưu cùng Save settings ở dưới.",
+            );
+            if theme::primary_button(ui, backup_now_label).clicked() {
+                match crate::backup::run_auto_backup(
+                    &self.store,
+                    &self.config,
+                    self.config.auto_backup_keep,
+                ) {
+                    Ok(path) => {
+                        self.config.last_auto_backup_at = chrono::Utc::now().to_rfc3339();
+                        let _ = save_config(&self.config);
+                        self.set_status(&format!("Đã sao lưu: {}", path.display()));
+                    }
+                    Err(e) => self.set_status(&format!("Sao lưu thất bại: {e}")),
+                }
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(retention_label);
+                let selected = match self.config.log_retention_days {
+                    0 => forever_label.to_string(),
+                    d => format!("{d} {days_label}"),
+                };
+                egui::ComboBox::from_id_salt("log_retention")
+                    .selected_text(selected)
+                    .show_ui(ui, |ui| {
+                        for (value, label) in [
+                            (7u32, format!("7 {days_label}")),
+                            (30, format!("30 {days_label}")),
+                            (90, format!("90 {days_label}")),
+                            (365, format!("365 {days_label}")),
+                            (0, forever_label.to_string()),
+                        ] {
+                            ui.selectable_value(&mut self.config.log_retention_days, value, label);
+                        }
+                    });
+            });
+            theme::muted(
+                ui,
+                "Log cũ hơn số ngày này sẽ bị xóa khi mở app. Xóa log không ảnh hưởng lịch gửi hay thống kê hôm nay.",
+            );
+            if theme::ghost_button(ui, prune_now_label).clicked() {
+                match self.store.prune_logs(self.config.log_retention_days) {
+                    Ok(0) => self.set_status("Không có log cũ cần xóa."),
+                    Ok(n) => self.set_status(&format!("Đã xóa {n} dòng log cũ.")),
+                    Err(e) => self.set_status(&format!("Dọn dẹp thất bại: {e}")),
+                }
+            }
+        });
+    }
+
     /// and `apply_import` validates before deleting anything it
     /// cannot replace — a failure after deletion is reported with
     /// the backup path so the user can restore manually).
@@ -4815,7 +5657,7 @@ impl NicordApp {
             self.set_status("Enter the import file path first.");
             return;
         }
-        let text = match std::fs::read_to_string(&path) {
+        let text = match crate::backup::read_import_file(std::path::Path::new(&path)) {
             Ok(t) => t,
             Err(e) => {
                 self.set_status(&format!("Cannot read import file: {e}"));
@@ -4834,18 +5676,11 @@ impl NicordApp {
             let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
             config_dir().join(format!("nicord-backup-{ts}.json"))
         };
-        let backup_note = match crate::backup::build_export(
+        let backup_note = match crate::backup::write_local_backup(
             &self.store,
             &self.config,
-            crate::backup::ExportMode::Local,
-            "",
-        )
-        .and_then(|(f, warnings)| crate::backup::export_to_json(&f).map(|json| (json, warnings)))
-        .and_then(|(json, warnings)| {
-            std::fs::write(&backup_path, json)
-                .map_err(|e| e.to_string())
-                .map(|()| warnings)
-        }) {
+            &backup_path,
+        ) {
             Ok(warnings) => {
                 if warnings.is_empty() {
                     format!("Backup saved to {}.", backup_path.display())
@@ -5427,6 +6262,8 @@ impl NicordApp {
         ui.add_space(12.0);
         self.show_backup_card(ui);
         ui.add_space(12.0);
+        self.show_maintenance_card(ui);
+        ui.add_space(12.0);
         theme::danger_frame().show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.label(
@@ -5602,6 +6439,77 @@ mod tests {
         let msg = try_enable_scenario(&mut list, 0, true);
         assert_eq!(msg, None);
         assert!(list[0].enabled);
+    }
+
+    #[test]
+    fn next_run_cache_reuses_invalidates_and_recomputes_past_values() {
+        use chrono::TimeZone;
+        let mut cache = NextRunCache::default();
+        let mut s = Scenario::new("t");
+        s.schedule = Some(Schedule::Daily {
+            time: chrono::NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
+        });
+        s.timezone = "UTC".to_string();
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 11, 17, 8, 0, 0)
+            .unwrap()
+            .with_timezone(&chrono::Local);
+        let v1 = cache.next_run(&s, now).unwrap();
+        // Second call reuses the cached value.
+        assert_eq!(cache.next_run(&s, now).unwrap(), v1);
+        // Schedule edit invalidates via the cache key.
+        s.schedule = Some(Schedule::Daily {
+            time: chrono::NaiveTime::from_hms_opt(10, 0, 0).unwrap(),
+        });
+        let v3 = cache.next_run(&s, now).unwrap();
+        assert_ne!(v3, v1);
+        // A cached value that already passed is recomputed at once.
+        let later = chrono::Utc
+            .with_ymd_and_hms(2026, 11, 17, 11, 0, 0)
+            .unwrap()
+            .with_timezone(&chrono::Local);
+        let v4 = cache.next_run(&s, later).unwrap();
+        assert!(v4 > v3);
+        // Timezone edit invalidates too.
+        s.timezone = "America/New_York".to_string();
+        let v5 = cache.next_run(&s, later).unwrap();
+        assert_ne!(v5, v4);
+        // No schedule → None; the batch helper covers the list.
+        s.schedule = None;
+        assert!(cache.next_run(&s, now).is_none());
+        let mut s2 = Scenario::new("u");
+        s2.schedule = Some(Schedule::Daily {
+            time: chrono::NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
+        });
+        s2.timezone = "UTC".to_string();
+        let map = cache.next_runs(&[s, s2.clone()], now);
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key(&s2.id));
+    }
+
+    #[test]
+    fn try_enable_clears_last_run_for_once_scenarios() {
+        use chrono::TimeZone;
+        let mut s = Scenario::new("Once fired");
+        s.destination_id = Some("dest-1".to_string());
+        s.schedule = Some(Schedule::Once {
+            at: chrono::Utc.with_ymd_and_hms(2026, 11, 17, 9, 0, 0).unwrap(),
+        });
+        s.last_run_at = Some(chrono::Utc.with_ymd_and_hms(2026, 11, 17, 9, 0, 5).unwrap());
+        let mut list = vec![s];
+        assert_eq!(try_enable_scenario(&mut list, 0, true), None);
+        assert!(list[0].enabled);
+        assert_eq!(list[0].last_run_at, None);
+
+        // Recurring schedules keep their anchor: re-enabling must
+        // not replay already-fired runs.
+        let mut s = Scenario::new("Daily");
+        s.destination_id = Some("dest-1".to_string());
+        let fired = chrono::Utc.with_ymd_and_hms(2026, 11, 17, 9, 0, 5).unwrap();
+        s.last_run_at = Some(fired);
+        let mut list = vec![s];
+        assert_eq!(try_enable_scenario(&mut list, 0, true), None);
+        assert_eq!(list[0].last_run_at, Some(fired));
     }
 
     #[test]

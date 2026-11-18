@@ -113,22 +113,28 @@ pub struct ReleaseInfo {
 }
 
 /// The release-zip name the release workflow produces, for this
-/// platform. Windows is the release target today; Linux looks for a
-/// Linux asset the same way, so the flow works when one exists.
+/// platform. Windows is the release target today; Linux and macOS
+/// look for their own asset names, so the flow works when one
+/// exists — and a macOS install never picks up a Linux binary.
 pub fn expected_asset_name(version: &Version) -> String {
     #[cfg(target_os = "windows")]
     {
         format!("Nicord-v{version}-windows-x64.zip")
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        format!("Nicord-v{version}-macos-arm64.zip")
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     {
         format!("Nicord-v{version}-linux-x64.zip")
     }
 }
 
 /// Pick the downloadable asset for `version`: the exact expected name
-/// first, then any `.zip` for this platform ("windows"/"linux" in the
-/// name), otherwise nothing — never a wrong-platform file.
+/// first, then any `.zip` for this platform carrying this version in
+/// its name, otherwise nothing — never a wrong-platform file, and
+/// never a stale asset for a different version (a silent downgrade).
 pub fn pick_asset(assets: &[ReleaseAsset], version: &Version) -> Option<ReleaseAsset> {
     let expected = expected_asset_name(version);
     if let Some(a) = assets.iter().find(|a| a.name == expected) {
@@ -136,12 +142,17 @@ pub fn pick_asset(assets: &[ReleaseAsset], version: &Version) -> Option<ReleaseA
     }
     let marker = if cfg!(target_os = "windows") {
         "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
     } else {
         "linux"
     };
+    let version_tag = format!("v{version}");
     assets
         .iter()
-        .find(|a| a.name.ends_with(".zip") && a.name.contains(marker))
+        .find(|a| {
+            a.name.ends_with(".zip") && a.name.contains(marker) && a.name.contains(&version_tag)
+        })
         .cloned()
 }
 
@@ -212,6 +223,16 @@ pub async fn check_for_update() -> CheckResult {
     }
     if !resp.status().is_success() {
         return CheckResult::Failed(format!("GitHub trả về HTTP {}", resp.status()));
+    }
+    // Bound the release JSON before parsing it: a huge body must not
+    // spike memory. GitHub release payloads are tens of KiB; 1 MiB
+    // is generous. (A chunked response without a length still reads
+    // unbounded — accepted: trusted GitHub host, 20s timeout.)
+    const MAX_RELEASE_JSON_BYTES: u64 = 1024 * 1024;
+    if let Some(len) = resp.content_length() {
+        if len > MAX_RELEASE_JSON_BYTES {
+            return CheckResult::Failed("GitHub trả về phản hồi quá lớn".to_string());
+        }
     }
     let json: serde_json::Value = match resp.json().await {
         Ok(j) => j,
@@ -391,7 +412,8 @@ pub fn verify_download(
 
 /// Download the release's checksum file and verify `zip_path`
 /// against it. A release without a checksum asset fails closed:
-/// unverified code is never installed.
+/// unverified code is never installed. Caller must create
+/// `stage_dir` first (the checksum file is written into it).
 pub async fn download_and_verify_checksums(
     info: &ReleaseInfo,
     zip_path: &Path,
@@ -551,6 +573,14 @@ pub fn prepare_install(zip_path: &Path) -> Result<InstallPlan, String> {
     let stage_dir = std::env::temp_dir().join(format!("nicord-update-{}", uuid::Uuid::new_v4()));
     let files = extract_zip(zip_path, &stage_dir)?;
     let staged_exe = find_staged_exe(&files).ok_or("không tìm thấy file thực thi trong bản mới")?;
+    // The helper copies the exe from the stage ROOT by name: an exe
+    // in a subdirectory would silently no-op the swap. Refuse such
+    // zips instead — the release workflow zips the exe at the root.
+    if staged_exe.parent() != Some(stage_dir.as_path()) {
+        return Err(
+            "bản mới chứa file thực thi trong thư mục con, không phải ở gốc file zip".to_string(),
+        );
+    }
     let staged_exe_name = staged_exe
         .file_name()
         .ok_or("không tìm thấy file thực thi trong bản mới")?
@@ -603,63 +633,90 @@ fn validate_bat_value(value: &str) -> Result<(), String> {
 /// Paths are baked in quoted, so folders with spaces work — and
 /// escaped/validated, so a hostile path cannot inject commands
 /// (see `sh_quote` / `validate_bat_value`).
+///
+/// The swap is failure-safe: the staged exe is copied to a TEMP name
+/// first and renamed over the old exe, so an I/O failure mid-copy
+/// cannot leave a truncated exe (the old `copy`-over-the-exe did
+/// exactly that). Every critical step is checked: on failure the
+/// script exits WITHOUT relaunching and WITHOUT deleting the staging
+/// dir, so the old version (plus `.bak`) stays recoverable. Each
+/// generator is compiled on its own platform and in tests, so the
+/// Windows script is verified by tests on Linux too.
 pub fn helper_script_text(plan: &InstallPlan) -> Result<String, String> {
+    #[cfg(target_os = "windows")]
+    {
+        helper_script_bat(plan)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        helper_script_sh(plan)
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn helper_script_bat(plan: &InstallPlan) -> Result<String, String> {
     let stage = plan.stage_dir.display().to_string();
     let dir = plan.install_dir.display().to_string();
     let exe = plan.exe_path.display().to_string();
     let staged = plan.staged_exe_name.clone();
-    #[cfg(target_os = "windows")]
-    {
-        for value in [&stage, &dir, &exe, &staged] {
-            validate_bat_value(value)?;
-        }
-        Ok(format!(
-            "@echo off\r\n\
-             set \"PID=%1\"\r\n\
-             set \"STAGE={stage}\"\r\n\
-             set \"DIR={dir}\"\r\n\
-             set \"EXE={exe}\"\r\n\
-             :waitloop\r\n\
-             tasklist /FI \"PID eq %PID%\" 2>nul | find /I \"%PID%\" >nul\r\n\
-             if not errorlevel 1 (\r\n\
-             \x20 timeout /t 1 /nobreak >nul\r\n\
-             \x20 goto waitloop\r\n\
-             )\r\n\
-             if exist \"%EXE%.bak\" del /F /Q \"%EXE%.bak\"\r\n\
-             copy /Y \"%EXE%\" \"%EXE%.bak\" >nul\r\n\
-             copy /Y \"%STAGE%\\{staged}\" \"%EXE%\" >nul\r\n\
-             copy /Y \"%STAGE%\\README.txt\" \"%DIR%\\README.txt\" >nul\r\n\
-             copy /Y \"%STAGE%\\LICENSE\" \"%DIR%\\LICENSE\" >nul\r\n\
-             copy /Y \"%STAGE%\\icon.ico\" \"%DIR%\\icon.ico\" >nul\r\n\
-             rmdir /S /Q \"%STAGE%\"\r\n\
-             start \"\" \"%EXE%\"\r\n\
-             del \"%~f0\"\r\n"
-        ))
+    for value in [&stage, &dir, &exe, &staged] {
+        validate_bat_value(value)?;
     }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let stage = sh_quote(&stage);
-        let dir = sh_quote(&dir);
-        let exe = sh_quote(&exe);
-        let staged = sh_quote(&staged);
-        Ok(format!(
-            "#!/bin/sh\n\
-             PID=\"$1\"\n\
-             STAGE={stage}\n\
-             DIR={dir}\n\
-             EXE={exe}\n\
-             STAGED={staged}\n\
-             while kill -0 \"$PID\" 2>/dev/null; do sleep 1; done\n\
-             cp -f \"$EXE\" \"$EXE.bak\"\n\
-             cp -f \"$STAGE/$STAGED\" \"$EXE\"\n\
-             cp -f \"$STAGE/README.txt\" \"$DIR/README.txt\"\n\
-             cp -f \"$STAGE/LICENSE\" \"$DIR/LICENSE\"\n\
-             cp -f \"$STAGE/icon.ico\" \"$DIR/icon.ico\"\n\
-             rm -rf \"$STAGE\"\n\
-             nohup \"$EXE\" >/dev/null 2>&1 &\n\
-             rm -- \"$0\"\n"
-        ))
-    }
+    Ok(format!(
+        "@echo off\r\n\
+         set \"PID=%1\"\r\n\
+         set \"STAGE={stage}\"\r\n\
+         set \"DIR={dir}\"\r\n\
+         set \"EXE={exe}\"\r\n\
+         :waitloop\r\n\
+         tasklist /FI \"PID eq %PID%\" 2>nul | find /I \"%PID%\" >nul\r\n\
+         if not errorlevel 1 (\r\n\
+         \x20 timeout /t 1 /nobreak >nul\r\n\
+         \x20 goto waitloop\r\n\
+         )\r\n\
+         if exist \"%EXE%.bak\" del /F /Q \"%EXE%.bak\"\r\n\
+         copy /Y \"%EXE%\" \"%EXE%.bak\" >nul\r\n\
+         if errorlevel 1 goto fail\r\n\
+         copy /Y \"%STAGE%\\{staged}\" \"%EXE%.new\" >nul\r\n\
+         if errorlevel 1 goto fail\r\n\
+         move /Y \"%EXE%.new\" \"%EXE%\" >nul\r\n\
+         if errorlevel 1 goto fail\r\n\
+         copy /Y \"%STAGE%\\README.txt\" \"%DIR%\\README.txt\" >nul\r\n\
+         copy /Y \"%STAGE%\\LICENSE\" \"%DIR%\\LICENSE\" >nul\r\n\
+         copy /Y \"%STAGE%\\icon.ico\" \"%DIR%\\icon.ico\" >nul\r\n\
+         rmdir /S /Q \"%STAGE%\"\r\n\
+         start \"\" \"%EXE%\"\r\n\
+         del \"%~f0\"\r\n\
+         exit /b 0\r\n\
+         :fail\r\n\
+         exit /b 1\r\n"
+    ))
+}
+
+#[cfg(any(not(target_os = "windows"), test))]
+fn helper_script_sh(plan: &InstallPlan) -> Result<String, String> {
+    let stage = sh_quote(&plan.stage_dir.display().to_string());
+    let dir = sh_quote(&plan.install_dir.display().to_string());
+    let exe = sh_quote(&plan.exe_path.display().to_string());
+    let staged = sh_quote(&plan.staged_exe_name);
+    Ok(format!(
+        "#!/bin/sh\n\
+         PID=\"$1\"\n\
+         STAGE={stage}\n\
+         DIR={dir}\n\
+         EXE={exe}\n\
+         STAGED={staged}\n\
+         while kill -0 \"$PID\" 2>/dev/null; do sleep 1; done\n\
+         cp -f \"$EXE\" \"$EXE.bak\" || exit 1\n\
+         cp -f \"$STAGE/$STAGED\" \"$EXE.new\" || exit 1\n\
+         mv -f \"$EXE.new\" \"$EXE\" || exit 1\n\
+         cp -f \"$STAGE/README.txt\" \"$DIR/README.txt\" 2>/dev/null || true\n\
+         cp -f \"$STAGE/LICENSE\" \"$DIR/LICENSE\" 2>/dev/null || true\n\
+         cp -f \"$STAGE/icon.ico\" \"$DIR/icon.ico\" 2>/dev/null || true\n\
+         rm -rf \"$STAGE\"\n\
+         nohup \"$EXE\" >/dev/null 2>&1 &\n\
+         rm -- \"$0\"\n"
+    ))
 }
 
 /// Write the helper script into the staging dir and return its path.
@@ -682,30 +739,37 @@ pub fn write_helper(plan: &InstallPlan) -> Result<PathBuf, String> {
 /// Launch the helper detached (it survives Nicord exiting) and quit.
 /// The helper does the swap + relaunch; this process must be gone
 /// before the swap, which is why the helper waits on our PID.
-pub fn launch_helper_and_exit(helper: &Path) -> ! {
+///
+/// On spawn failure this returns `Err` WITHOUT exiting — the caller
+/// reports the failure and Nicord keeps running (the old code
+/// swallowed the spawn result and exited anyway, so a blocked
+/// helper looked like a quit with no update). On success the
+/// process exits and this function never returns.
+pub fn launch_helper_and_exit(helper: &Path) -> Result<(), String> {
     let pid = std::process::id().to_string();
     #[cfg(target_os = "windows")]
-    {
+    let spawned = {
         use std::os::windows::process::CommandExt;
         // DETACHED_PROCESS (0x8) + CREATE_NO_WINDOW (0x8000000): no
         // console window flashes, and the helper outlives this process.
-        let _ = std::process::Command::new(helper)
+        std::process::Command::new(helper)
             .arg(&pid)
             .creation_flags(0x0000_0008 | 0x0800_0000)
-            .spawn();
-    }
+            .spawn()
+    };
     #[cfg(not(target_os = "windows"))]
-    {
+    let spawned = {
         use std::os::unix::process::CommandExt;
-        let _ = std::process::Command::new("sh")
+        std::process::Command::new("sh")
             .arg(helper)
             .arg(&pid)
             .process_group(0)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .spawn();
-    }
+            .spawn()
+    };
+    spawned.map_err(|e| format!("không khởi động được script cập nhật: {e}"))?;
     std::process::exit(0);
 }
 
@@ -885,24 +949,37 @@ mod tests {
             },
         ];
         assert_eq!(pick_asset(&assets, &v).unwrap().url, "u1");
-        // No exact name → first .zip for this platform.
+        let marker = if cfg!(target_os = "windows") {
+            "windows"
+        } else if cfg!(target_os = "macos") {
+            "macos"
+        } else {
+            "linux"
+        };
+        // No exact name → a differently-named .zip for this platform
+        // carrying this version is accepted as a fallback.
         let assets = vec![ReleaseAsset {
-            name: if cfg!(target_os = "windows") {
-                "Nicord-v0.1.1-windows-x64.zip".into()
-            } else {
-                "Nicord-v0.1.1-linux-x64.zip".into()
-            },
+            name: format!("Nicord-v0.1.1-{marker}-portable.zip"),
             url: "u2".into(),
             size: None,
         }];
         assert_eq!(pick_asset(&assets, &v).unwrap().url, "u2");
-        // Wrong-platform zip only → no asset.
+        // Same platform marker but a DIFFERENT version → no asset:
+        // the fallback must never install a stale release.
         let assets = vec![ReleaseAsset {
-            name: if cfg!(target_os = "windows") {
-                "Nicord-v0.1.1-linux-x64.zip".into()
-            } else {
-                "Nicord-v0.1.1-windows-x64.zip".into()
-            },
+            name: format!("Nicord-v0.1.0-{marker}-x64.zip"),
+            url: "u3".into(),
+            size: None,
+        }];
+        assert!(pick_asset(&assets, &v).is_none());
+        // Wrong-platform zip only → no asset.
+        let other = if cfg!(target_os = "windows") {
+            "linux"
+        } else {
+            "windows"
+        };
+        let assets = vec![ReleaseAsset {
+            name: format!("Nicord-v0.1.1-{other}-x64.zip"),
             url: "u3".into(),
             size: None,
         }];
@@ -1239,19 +1316,88 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(target_os = "windows"))]
-    fn helper_script_quotes_hostile_paths() {
+    fn helper_script_sh_quotes_hostile_paths() {
         let plan = InstallPlan {
             stage_dir: PathBuf::from("/tmp/$(touch /tmp/pwned)"),
             staged_exe_name: "Nicord.exe".to_string(),
             install_dir: PathBuf::from("/home/u/`id`"),
             exe_path: PathBuf::from("/home/u/`id`/Nicord"),
         };
-        let script = helper_script_text(&plan).unwrap();
+        let script = helper_script_sh(&plan).unwrap();
         // The metacharacters survive only inside single quotes, where
         // the shell treats them as literal text.
         assert!(script.contains("STAGE='/tmp/$(touch /tmp/pwned)'"));
         assert!(script.contains("DIR='/home/u/`id`'"));
+    }
+
+    #[test]
+    fn helper_script_bat_rejects_hostile_values() {
+        let plan = InstallPlan {
+            stage_dir: PathBuf::from(r"C:\Nicord\%PATH%"),
+            staged_exe_name: "Nicord.exe".to_string(),
+            install_dir: PathBuf::from(r"C:\Nicord"),
+            exe_path: PathBuf::from(r"C:\Nicord\Nicord.exe"),
+        };
+        assert!(helper_script_bat(&plan).is_err());
+    }
+
+    #[test]
+    fn helper_scripts_swap_via_temp_name_and_check_failures() {
+        let plan = InstallPlan {
+            stage_dir: PathBuf::from("/tmp/nicord-update-1"),
+            staged_exe_name: "Nicord.exe".to_string(),
+            install_dir: PathBuf::from("C:/Nicord"),
+            exe_path: PathBuf::from("C:/Nicord/Nicord.exe"),
+        };
+        // Batch: copy to .new, rename over the exe, every critical
+        // step checked, failure skips relaunch + cleanup.
+        let bat = helper_script_bat(&plan).unwrap();
+        assert!(bat.contains("\"%EXE%.new\""));
+        assert!(bat.contains("move /Y \"%EXE%.new\" \"%EXE%\""));
+        assert!(bat.contains("if errorlevel 1 goto fail"));
+        assert!(bat.contains(":fail"));
+        assert!(!bat.contains("copy /Y \"%STAGE%\\Nicord.exe\" \"%EXE%\""));
+        // POSIX: same shape with cp + mv + `|| exit 1`.
+        let sh = helper_script_sh(&plan).unwrap();
+        assert!(sh.contains("\"$EXE.new\""));
+        assert!(sh.contains("mv -f \"$EXE.new\" \"$EXE\""));
+        assert!(sh.contains("|| exit 1"));
+        assert!(!sh.contains("cp -f \"$STAGE/$STAGED\" \"$EXE\""));
+    }
+
+    #[test]
+    fn expected_asset_name_is_per_platform() {
+        let v = Version {
+            major: 0,
+            minor: 1,
+            patch: 1,
+        };
+        let name = expected_asset_name(&v);
+        if cfg!(target_os = "windows") {
+            assert_eq!(name, "Nicord-v0.1.1-windows-x64.zip");
+        } else if cfg!(target_os = "macos") {
+            assert_eq!(name, "Nicord-v0.1.1-macos-arm64.zip");
+        } else {
+            assert_eq!(name, "Nicord-v0.1.1-linux-x64.zip");
+        }
+    }
+
+    #[test]
+    fn prepare_install_rejects_exe_in_subdirectory() {
+        let dir = std::env::temp_dir().join(format!("nicord-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let zip_path = dir.join("sub.zip");
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut w = zip::ZipWriter::new(&mut buf);
+            let opts = zip::write::SimpleFileOptions::default();
+            w.start_file("bin/Nicord.exe", opts).unwrap();
+            w.write_all(b"fake-exe-bytes").unwrap();
+            w.finish().unwrap();
+        }
+        std::fs::write(&zip_path, buf.into_inner()).unwrap();
+        let err = prepare_install(&zip_path).unwrap_err();
+        assert!(err.contains("thư mục con"), "{err}");
     }
 
     #[test]

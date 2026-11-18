@@ -217,7 +217,12 @@ impl Destination {
         }
         if !self.avatar_url_override.trim().is_empty() {
             let url = self.avatar_url_override.trim();
-            if !url.starts_with("https://") || url.contains(char::is_whitespace) || url.len() > 2048
+            // Length > 8: "https://" alone must name a host (it 400s
+            // at send time).
+            if !url.starts_with("https://")
+                || url.len() <= "https://".len()
+                || url.contains(char::is_whitespace)
+                || url.len() > 2048
             {
                 return Err("avatar URL must be an https URL without spaces".into());
             }
@@ -246,6 +251,9 @@ impl Destination {
             }
         }
         for (idx, msg) in self.default_messages.iter().enumerate() {
+            if msg.trim().is_empty() {
+                return Err(format!("default message {} is empty", idx + 1));
+            }
             if crate::preview::over_limit(msg) {
                 return Err(format!(
                     "default message {} is over Discord's 2000-character limit",
@@ -256,6 +264,38 @@ impl Destination {
         Ok(())
     }
 
+    /// Pick the next default message, rotating without repeating the
+    /// last one. Returns (index, message). Empty/whitespace-only
+    /// entries are never picked (same rule as the scenario picker):
+    /// the returned index is the ORIGINAL position. None when no
+    /// usable default message exists.
+    pub fn pick_default_message(
+        &self,
+        last_index: Option<usize>,
+        rng: &mut impl rand::Rng,
+    ) -> Option<(usize, String)> {
+        let candidates: Vec<usize> = self
+            .default_messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| !m.trim().is_empty())
+            .map(|(i, _)| i)
+            .collect();
+        if candidates.is_empty() {
+            return None;
+        }
+        if candidates.len() == 1 {
+            let idx = candidates[0];
+            return Some((idx, self.default_messages[idx].clone()));
+        }
+        let mut idx = candidates[rng.random_range(0..candidates.len())];
+        if Some(idx) == last_index {
+            let pos = candidates.iter().position(|&c| c == idx).unwrap_or(0);
+            idx = candidates[(pos + 1) % candidates.len()];
+        }
+        Some((idx, self.default_messages[idx].clone()))
+    }
+
     /// True when the destination can send right now: enabled, has a
     /// URL, and is not paused. Validation is separate (see `validate`).
     pub fn is_sendable(&self) -> bool {
@@ -264,21 +304,27 @@ impl Destination {
 
     /// True when `local_minutes` (minutes since local midnight) falls
     /// inside the quiet window. No window = never quiet. Overnight
-    /// windows (start > end) are supported. An unparseable window is
+    /// windows (start > end) are supported. Semantics match
+    /// `Scenario::check_time_windows` exactly: end-EXCLUSIVE (quiet
+    /// up to but not including the end minute) and start==end means
+    /// never quiet. A one-sided or unparseable window is
     /// fail-closed: treated as quiet, so nothing is sent on a broken
     /// configuration.
     pub fn is_quiet_at(&self, local_minutes: u32) -> bool {
-        let (Some(start), Some(end)) = (&self.quiet_start, &self.quiet_end) else {
-            return false;
+        let (start, end) = match (&self.quiet_start, &self.quiet_end) {
+            (None, None) => return false,
+            (Some(s), Some(e)) => (s, e),
+            // One-sided: fail closed, like an unparseable window.
+            _ => return true,
         };
         let (Some(s), Some(e)) = (parse_hhmm(start), parse_hhmm(end)) else {
             // Fail-closed: a broken window blocks sends.
             return true;
         };
-        if s > e {
-            local_minutes >= s || local_minutes <= e
+        if s <= e {
+            local_minutes >= s && local_minutes < e
         } else {
-            s <= local_minutes && local_minutes <= e
+            local_minutes >= s || local_minutes < e
         }
     }
 }
@@ -349,8 +395,46 @@ mod tests {
         assert!(d.is_quiet_at(23 * 60));
         assert!(d.is_quiet_at(3 * 60));
         assert!(!d.is_quiet_at(12 * 60));
+        // End-exclusive: 06:00 itself is no longer quiet.
+        assert!(!d.is_quiet_at(6 * 60));
+        assert!(d.is_quiet_at(6 * 60 - 1));
+        // start == end: never quiet (matches Time Window nodes).
+        d.quiet_start = Some("08:00".to_string());
+        d.quiet_end = Some("08:00".to_string());
+        assert!(!d.is_quiet_at(8 * 60));
+        // One-sided: fail closed.
+        d.quiet_end = None;
+        assert!(d.is_quiet_at(12 * 60));
         d.quiet_start = Some("bad".to_string());
+        d.quiet_end = Some("06:00".to_string());
         assert!(d.is_quiet_at(12 * 60)); // fail-closed
+    }
+
+    #[test]
+    fn validate_rejects_empty_default_messages_and_bare_avatar_scheme() {
+        let mut d = Destination::new("q");
+        d.default_messages = vec!["hi".to_string(), "  ".to_string()];
+        assert!(d.validate().is_err());
+        d.default_messages = vec!["hi".to_string()];
+        d.avatar_url_override = "https://".to_string();
+        assert!(d.validate().is_err());
+        d.avatar_url_override = "https://cdn.example.com/a.png".to_string();
+        assert!(d.validate().is_ok());
+    }
+
+    #[test]
+    fn default_picker_never_returns_empty_messages() {
+        use rand::{rngs::StdRng, SeedableRng};
+        let mut d = Destination::new("q");
+        d.default_messages = vec!["".to_string(), "hey".to_string(), " ".to_string()];
+        let mut rng = StdRng::seed_from_u64(2);
+        for _ in 0..20 {
+            let (idx, msg) = d.pick_default_message(None, &mut rng).unwrap();
+            assert_eq!(idx, 1);
+            assert_eq!(msg, "hey");
+        }
+        d.default_messages = vec!["".to_string()];
+        assert!(d.pick_default_message(None, &mut rng).is_none());
     }
 
     #[test]

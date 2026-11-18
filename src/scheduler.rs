@@ -20,7 +20,7 @@ use crate::{
     webhook::MessageSender,
 };
 use chrono::{DateTime, Local, NaiveDate, Timelike, Utc};
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{rngs::StdRng, SeedableRng};
 use std::{
     collections::HashMap,
     sync::{
@@ -134,6 +134,11 @@ pub struct Engine {
     deleted_today: std::sync::Mutex<u32>,
     /// When this engine was created (dashboard send rate / uptime).
     pub started_at: Instant,
+    /// Last run-state persistence failure (M2): a failed
+    /// last-run save means a restart re-fires the run, so the
+    /// error is remembered for the Dashboard health card until a
+    /// later save succeeds. None = no failure recorded.
+    last_persist_error: std::sync::Mutex<Option<String>>,
 }
 
 impl Engine {
@@ -168,6 +173,52 @@ impl Engine {
             gateway: Arc::new(Gateway::new()),
             deleted_today: std::sync::Mutex::new(0),
             started_at: Instant::now(),
+            last_persist_error: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Remember a persistence failure (M2): logged loudly and
+    /// surfaced in the Dashboard health card until a later save
+    /// succeeds. The last error wins.
+    fn record_persist_error(&self, what: &str, err: &str) {
+        tracing::error!("persistence failure ({what}): {err}");
+        if let Ok(mut slot) = self.last_persist_error.lock() {
+            *slot = Some(format!("{what}: {err}"));
+        }
+    }
+
+    fn clear_persist_error(&self) {
+        if let Ok(mut slot) = self.last_persist_error.lock() {
+            *slot = None;
+        }
+    }
+
+    /// The last recorded persistence failure, if any (M2). Read
+    /// by the Dashboard health card. Cleared by the next
+    /// successful run-state save.
+    pub fn last_persist_error(&self) -> Option<String> {
+        self.last_persist_error.lock().ok().and_then(|s| s.clone())
+    }
+
+    /// Save a scenario's run state, recording failures (M2)
+    /// instead of ignoring them: a failed save means a restart
+    /// re-fires the run (a duplicate send), so it must be
+    /// visible — in the logs immediately, and in the Dashboard
+    /// health card until a save succeeds.
+    fn save_run_state(&self, scenario: &Scenario, what: &str) {
+        match self.store.save_scenario(scenario) {
+            Ok(()) => self.clear_persist_error(),
+            Err(e) => self.record_persist_error(what, &e),
+        }
+    }
+
+    /// Write a send-log row, logging failures instead of
+    /// ignoring them (M2's sibling: a lost log row hides
+    /// history, though it cannot cause a duplicate send, so it
+    /// is not surfaced in the health card).
+    fn write_log(&self, entry: &SendLogEntry) {
+        if let Err(e) = self.store.log_send(entry) {
+            tracing::error!("could not write send log: {e}");
         }
     }
 
@@ -428,20 +479,21 @@ impl Engine {
                     remaining.as_secs()
                 ));
             }
-            // Per-destination daily cap (DB count, UTC date).
+            // Per-destination daily cap (DB count, UTC date), counted
+            // by destination id: unconditional — the old channel-id
+            // count silently skipped the cap when the channel id was
+            // empty or stale.
             let effective_cap = if dest.daily_cap == 0 {
                 self.global_daily_cap.load(Ordering::SeqCst)
             } else {
                 dest.daily_cap
             };
-            if !dest.channel_id.is_empty() {
-                let sent = self.store.count_sends_today_for_channel(&dest.channel_id);
-                if sent >= effective_cap {
-                    return Err(format!(
-                        "skip: destination '{}' daily cap reached ({sent}/{effective_cap})",
-                        dest.display_name()
-                    ));
-                }
+            let sent = self.store.count_sends_today_for_destination(&dest.id);
+            if sent >= effective_cap {
+                return Err(format!(
+                    "skip: destination '{}' daily cap reached ({sent}/{effective_cap})",
+                    dest.display_name()
+                ));
             }
         }
         // Live anti-ban config for this send (Settings edits apply
@@ -549,30 +601,31 @@ impl Engine {
                 .insert(scenario.id.clone(), idx);
             msg
         } else if let Some(dest) = destination {
-            if dest.default_messages.is_empty() {
-                return Err(
-                    "scenario has no messages and the destination has no default messages".into(),
-                );
-            }
             // Rotate through the destination defaults without
-            // repeating the last pick (same rule as scenarios).
+            // repeating the last pick (same rule as scenarios;
+            // empty entries are never picked). When the
+            // destination has no usable messages but the
+            // scenario carries a poll, the content is empty —
+            // Discord accepts a poll-only message.
             let last_idx = self.last_msg_index.lock().await.get(&scenario.id).copied();
-            let n = dest.default_messages.len();
-            let idx = if n == 1 {
-                0
-            } else {
-                loop {
-                    let candidate = rng.random_range(0..n);
-                    if Some(candidate) != last_idx {
-                        break candidate;
-                    }
+            match dest.pick_default_message(last_idx, &mut rng) {
+                Some((idx, msg)) => {
+                    self.last_msg_index
+                        .lock()
+                        .await
+                        .insert(scenario.id.clone(), idx);
+                    msg
                 }
-            };
-            self.last_msg_index
-                .lock()
-                .await
-                .insert(scenario.id.clone(), idx);
-            dest.default_messages[idx].clone()
+                None if scenario.poll.is_some() => String::new(),
+                None => {
+                    return Err(
+                            "scenario has no messages and the destination has no usable default messages"
+                                .to_string(),
+                        );
+                }
+            }
+        } else if scenario.poll.is_some() {
+            String::new()
         } else {
             return Err("scenario has no messages".to_string());
         };
@@ -582,8 +635,22 @@ impl Engine {
             .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
             .collect();
         vars.extend(scenario.set_variable_overrides());
-        let rendered =
-            render_template_with_vars(&raw, username, server_name, &scenario.channel_id, &vars);
+        // Durable counters (idea #6): resolve the values the
+        // template references BEFORE rendering; the increment
+        // happens after a successful send, at the end of this fn.
+        let counter_list = crate::scenario::counter_names(&raw);
+        let counters: HashMap<String, u64> = counter_list
+            .iter()
+            .map(|n| (n.clone(), self.store.get_counter(n)))
+            .collect();
+        let rendered = render_template_with_vars(
+            &raw,
+            username,
+            server_name,
+            &scenario.channel_id,
+            &vars,
+            &counters,
+        );
         // Smart Templates (Discord-BLUE): Spintax + variation are applied
         // AFTER template vars are resolved — so `{{username}}` is never
         // mangled — and only when the toggle is on. Webhook mode never
@@ -599,12 +666,8 @@ impl Engine {
         for w in &warnings {
             tracing::warn!("anti-ban: {w}");
         }
-        let has_embed = scenario
-            .embed
-            .as_ref()
-            .map(|e| !e.is_empty())
-            .unwrap_or(false);
-        if clean.trim().is_empty() && !has_embed {
+        let has_embed = scenario.embeds.iter().any(|e| !e.is_empty());
+        if clean.trim().is_empty() && !has_embed && scenario.poll.is_none() {
             return Err("message is empty after sanitising".into());
         }
 
@@ -656,22 +719,29 @@ impl Engine {
 
         // Retry: network errors up to 3x with backoff; 429 waits retry_after;
         // 401/403/404 stop immediately (Spec §6).
-        let embeds: Vec<crate::embed::Embed> = scenario
-            .embed
-            .clone()
-            .filter(|e| !e.is_empty())
-            .into_iter()
-            .collect();
-        self.send_message_with_retry(
-            scenario,
-            sender,
-            destination,
-            &clean,
-            &embeds,
-            &antiban,
-            &mut rng,
-        )
-        .await
+        let embeds: Vec<crate::embed::Embed> = scenario.active_embeds();
+        let result = self
+            .send_message_with_retry(
+                scenario,
+                sender,
+                destination,
+                &clean,
+                &embeds,
+                &antiban,
+                &mut rng,
+            )
+            .await;
+        // Counters increment ONLY on a successful send: a failed
+        // or deferred run must not advance the series. A failed
+        // increment is logged, never fatal — the message went out.
+        if result.is_ok() {
+            for name in &counter_list {
+                if let Err(e) = self.store.increment_counter(name) {
+                    tracing::warn!("could not increment counter '{name}': {e}");
+                }
+            }
+        }
+        result
     }
 
     /// Send one message with the retry policy, then run the post-send
@@ -697,11 +767,23 @@ impl Engine {
             .map(|d| d.channel_id.clone())
             .filter(|c| !c.is_empty())
             .unwrap_or_else(|| scenario.channel_id.clone());
+        // Mention control + silent send (idea #7): the scenario's
+        // settings ride on every attempt, including retries.
+        let opts = crate::discord::SendOptions {
+            allow_mass_mentions: scenario.allow_mass_mentions,
+            silent: scenario.silent_send,
+        };
         let mut attempt = 0;
         loop {
             attempt += 1;
             match sender
-                .send_with_embeds(&scenario.channel_id, clean, embeds)
+                .send_with_embeds(
+                    &scenario.channel_id,
+                    clean,
+                    embeds,
+                    &opts,
+                    scenario.poll.as_ref(),
+                )
                 .await
             {
                 Ok(sent) => {
@@ -730,7 +812,7 @@ impl Engine {
                         message_id: sent.id.clone(),
                         destination_id: destination.map(|d| d.id.clone()).unwrap_or_default(),
                     };
-                    let _ = self.store.log_send(&entry);
+                    self.write_log(&entry);
                     crate::notify::play(crate::notify::SoundEvent::SendSuccess);
                     self.maybe_auto_delete(scenario, sender, &sent.id, antiban)
                         .await?;
@@ -848,7 +930,7 @@ impl Engine {
                 if let Ok(mut d) = self.deleted_today.lock() {
                     *d += 1;
                 }
-                let _ = self.store.log_send(&SendLogEntry {
+                self.write_log(&SendLogEntry {
                     scenario_id: scenario.id.clone(),
                     scenario_name: scenario.name.clone(),
                     channel_id: scenario.channel_id.clone(),
@@ -935,12 +1017,15 @@ impl Engine {
             .collect();
         vars.extend(scenario.set_variable_overrides());
         let composed = cfg.compose_prefix();
+        // Commands do not use durable counters: the empty map
+        // leaves any `{{counter:...}}` tag literal.
         let rendered = render_template_with_vars(
             &composed,
             username,
             server_name,
             &scenario.channel_id,
             &vars,
+            &HashMap::new(),
         );
         let (clean, warnings) = sanitize_content(&rendered, antiban);
         for w in &warnings {
@@ -1083,7 +1168,7 @@ impl Engine {
             match client.invoke_interaction(payload.clone()).await {
                 Ok(()) => {
                     *self.sent_today.lock().await += 1;
-                    let _ = self.store.log_send(&SendLogEntry {
+                    self.write_log(&SendLogEntry {
                         scenario_id: scenario.id.clone(),
                         scenario_name: scenario.name.clone(),
                         channel_id: scenario.channel_id.clone(),
@@ -1175,11 +1260,25 @@ impl Engine {
             tracing::warn!("engine loop already active; refusing a second loop");
             return;
         }
+        // Held for the whole loop body: `Drop` releases the claim and
+        // clears `running` on every exit path, including a panic. A
+        // panic used to wedge the engine until app restart — the claim
+        // stayed held while no loop ran, so Start refused forever.
+        // Deliberately fail-stop, not fail-continue: after a panic the
+        // loop is dead and the user restarts it, rather than the loop
+        // silently resuming with possibly partial send state.
+        let _loop_guard = LoopGuard {
+            engine: self.clone(),
+        };
         self.running.store(true, Ordering::SeqCst);
-        // Authoritative last-run state: scenario id -> (schedule label,
-        // last scheduled time that fired). Persisted to SQLite on every
-        // fire, so a restart resumes exactly where it left off.
-        let mut last_runs: HashMap<String, (String, Option<DateTime<Utc>>)> = HashMap::new();
+        // Authoritative last-run state: scenario id -> (normalized
+        // schedule, last scheduled time that fired). Persisted to
+        // SQLite on every fire, so a restart resumes exactly where it
+        // left off. The schedule is compared NORMALIZED, not by its
+        // display label: reordering weekdays or retyping a cron
+        // expression must not reset the anchor (duplicate send).
+        let mut last_runs: HashMap<String, (Option<Schedule>, Option<DateTime<Utc>>)> =
+            HashMap::new();
         let mut consecutive_errors: u32 = 0;
         // No startup identity fetch: user-mode identity is refreshed
         // per scenario below (throttled), and webhook-mode identity
@@ -1198,21 +1297,17 @@ impl Engine {
                 // the schedule itself was edited.
                 if scenario.created_at.is_none() {
                     scenario.created_at = Some(Utc::now());
-                    let _ = self.store.save_scenario(&scenario);
+                    self.save_run_state(&scenario, "save scenario creation time");
                 }
-                let label = scenario
-                    .schedule
-                    .as_ref()
-                    .map(|s| s.label())
-                    .unwrap_or_default();
+                let sched = scenario.schedule.as_ref().map(|s| s.normalized());
                 let entry = last_runs
                     .entry(scenario.id.clone())
-                    .or_insert_with(|| (label.clone(), scenario.last_run_at));
-                if entry.0 != label {
-                    entry.0 = label;
+                    .or_insert_with(|| (sched.clone(), scenario.last_run_at));
+                if entry.0 != sched {
+                    entry.0 = sched;
                     entry.1 = None;
                     scenario.last_run_at = None;
-                    let _ = self.store.save_scenario(&scenario);
+                    self.save_run_state(&scenario, "save scenario after schedule change");
                 }
                 let last_run = entry.1;
                 let Some(schedule) = scenario.schedule.clone() else {
@@ -1281,7 +1376,7 @@ impl Engine {
                                 scenario.name
                             );
                         }
-                        let _ = self.store.save_scenario(&scenario);
+                        self.save_run_state(&scenario, "save scenario last-run after send");
                         // Fixed 1-second stagger between webhook sends
                         // in one tick (transparent, never random).
                         if destination.is_some()
@@ -1308,20 +1403,54 @@ impl Engine {
                         if matches!(schedule, Schedule::Once { .. }) {
                             scenario.enabled = false;
                         }
-                        let _ = self.store.save_scenario(&scenario);
+                        self.save_run_state(&scenario, "save scenario last-run after skip");
+                    }
+                    Err(e) if e.starts_with("invalid scenario:") => {
+                        // A broken scenario is not a broken
+                        // destination: consume the run (like a skip)
+                        // so it is not retried every second, but do
+                        // not count it toward the destination's error
+                        // limit or the engine pause, and do not write
+                        // a failure row — the destination did nothing
+                        // wrong. The scenario stays enabled and will
+                        // fail again at its next scheduled run until
+                        // the user fixes it in the Builder.
+                        tracing::info!("scenario {} invalid, run consumed: {e}", scenario.name);
+                        let due_utc = due.with_timezone(&Utc);
+                        entry.1 = Some(due_utc);
+                        scenario.last_run_at = Some(due_utc);
+                        if matches!(schedule, Schedule::Once { .. }) {
+                            scenario.enabled = false;
+                        }
+                        self.save_run_state(&scenario, "save scenario last-run after invalid run");
                     }
                     Err(e) => {
-                        tracing::warn!("scenario {} failed: {e}", scenario.name);
+                        // Defense in depth: error strings must never
+                        // carry credentials into tracing output, the
+                        // database, or the UI. Scrub once here so all
+                        // three sinks below share the cleaned text.
+                        let safe_err = crate::store::scrub_secrets(&e);
+                        tracing::warn!("scenario {} failed: {safe_err}", scenario.name);
                         // Persist failures so Logs can filter by status
                         // and the Dashboard can count them (QoL). The
                         // detail is truncated: Discord error bodies can
                         // be long, and the log is for diagnosis, not a
-                        // transcript. Errors never contain credentials.
-                        let detail: String = e.chars().take(1000).collect();
-                        let _ = self.store.log_send(&SendLogEntry {
+                        // transcript. Scrubbed before truncating so a
+                        // URL straddling the cut cannot survive in part.
+                        let detail: String = safe_err.chars().take(1000).collect();
+                        // Log channel: the destination's channel in
+                        // webhook mode (scenario.channel_id is empty
+                        // there), mirroring the success path — so the
+                        // Logs destination filter sees failures too.
+                        let log_channel = destination
+                            .as_ref()
+                            .map(|d| d.channel_id.clone())
+                            .filter(|c| !c.is_empty())
+                            .unwrap_or_else(|| scenario.channel_id.clone());
+                        self.write_log(&SendLogEntry {
                             scenario_id: scenario.id.clone(),
                             scenario_name: scenario.name.clone(),
-                            channel_id: scenario.channel_id.clone(),
+                            channel_id: log_channel,
                             status: "failed".into(),
                             detail,
                             message_id: String::new(),
@@ -1343,7 +1472,7 @@ impl Engine {
                                         let _ = self.store.set_destination_failure(
                                             &dest.id,
                                             FailureState::PausedErrors,
-                                            &e,
+                                            &safe_err,
                                         );
                                         crate::notify::play(
                                             crate::notify::SoundEvent::DestinationPaused,
@@ -1367,8 +1496,23 @@ impl Engine {
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
-        self.running.store(false, Ordering::SeqCst);
-        self.release_loop();
+        // Normal exit: the guard below releases the claim as it drops.
+    }
+}
+
+/// Releases the engine-loop claim and clears `running` when dropped,
+/// on every exit path including a panic inside `run_loop`.
+struct LoopGuard {
+    engine: Arc<Engine>,
+}
+
+impl Drop for LoopGuard {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            tracing::error!("engine loop panicked; claim released so the engine can be restarted");
+        }
+        self.engine.running.store(false, Ordering::SeqCst);
+        self.engine.release_loop();
     }
 }
 
@@ -1431,6 +1575,40 @@ mod tests {
         assert!(engine.is_loop_active());
         engine.release_loop();
         assert!(!engine.is_loop_active());
+        assert!(engine.try_claim_loop());
+        engine.release_loop();
+    }
+
+    #[test]
+    fn persist_error_is_remembered_until_a_save_succeeds() {
+        let store = Arc::new(Store::open_memory().unwrap());
+        let engine = Engine::new(store, AntiBanConfig::default(), 300, 5);
+        assert!(engine.last_persist_error().is_none());
+        engine.record_persist_error("test save", "disk full (simulated)");
+        let err = engine.last_persist_error().unwrap();
+        assert!(err.contains("test save"), "{err}");
+        assert!(err.contains("disk full"), "{err}");
+        // A successful run-state save clears it.
+        let scenario = Scenario::new("t");
+        engine.save_run_state(&scenario, "test save");
+        assert!(engine.last_persist_error().is_none());
+    }
+
+    #[test]
+    fn loop_guard_releases_on_panic() {
+        let store = Arc::new(Store::open_memory().unwrap());
+        let engine = Arc::new(Engine::new(store, AntiBanConfig::default(), 300, 5));
+        assert!(engine.try_claim_loop());
+        engine.running.store(true, Ordering::SeqCst);
+        let engine2 = engine.clone();
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = LoopGuard { engine: engine2 };
+            panic!("simulated loop panic");
+        }));
+        assert!(caught.is_err());
+        assert!(!engine.is_loop_active());
+        assert!(!engine.running.load(Ordering::SeqCst));
+        // The engine can be started again after the panic.
         assert!(engine.try_claim_loop());
         engine.release_loop();
     }

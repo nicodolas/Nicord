@@ -20,6 +20,60 @@ pub struct SendMessageBody {
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub embeds: Option<Vec<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_mentions: Option<AllowedMentions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flags: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub poll: Option<serde_json::Value>,
+}
+
+/// The `allowed_mentions` object of a Discord message: which
+/// mention types Discord parses (and pings) in the content.
+#[derive(Debug, Clone, Serialize)]
+pub struct AllowedMentions {
+    pub parse: Vec<&'static str>,
+}
+
+/// Per-send message options, taken from the scenario (idea #7).
+/// The same options apply in both send modes: the webhook
+/// execute body and the create-message body accept the same
+/// `allowed_mentions` / `flags` fields.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SendOptions {
+    /// When false (default), mass pings are blocked.
+    pub allow_mass_mentions: bool,
+    /// When true, SUPPRESS_NOTIFICATIONS is set.
+    pub silent: bool,
+}
+
+impl SendOptions {
+    /// Message flag bit: suppress the push notification.
+    pub const SUPPRESS_NOTIFICATIONS: u32 = 1 << 12;
+
+    /// `allowed_mentions` for these options: `{"parse": ["users"]}`
+    /// when mass pings are blocked (individual user mentions still
+    /// ping; @everyone/@here/roles render as plain text), or None
+    /// to omit the field (Discord's default: everything parses).
+    pub fn allowed_mentions(&self) -> Option<AllowedMentions> {
+        if self.allow_mass_mentions {
+            None
+        } else {
+            Some(AllowedMentions {
+                parse: vec!["users"],
+            })
+        }
+    }
+
+    /// Message `flags` for these options: SUPPRESS_NOTIFICATIONS
+    /// when silent, else None (field omitted).
+    pub fn flags(&self) -> Option<u32> {
+        if self.silent {
+            Some(Self::SUPPRESS_NOTIFICATIONS)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -146,22 +200,38 @@ impl std::fmt::Display for DiscordError {
 }
 impl std::error::Error for DiscordError {}
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DiscordClient {
     token: String,
     http: Client,
 }
 
+impl std::fmt::Debug for DiscordClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print the token: Debug output must be safe to log.
+        // (MessageSender's derived Debug uses this impl.)
+        f.debug_struct("DiscordClient")
+            .field("token", &"<redacted>")
+            .field("http", &self.http)
+            .finish()
+    }
+}
+
 impl DiscordClient {
-    pub fn new(token: &str) -> Self {
-        Self {
+    /// None when the HTTP client cannot be built (TLS backend or
+    /// resolver init failure) — the caller treats the credential as
+    /// unusable instead of crashing. The build used to `expect`,
+    /// which panicked on the engine thread.
+    pub fn new(token: &str) -> Option<Self> {
+        let http = Client::builder()
+            .user_agent("Nicord/0.1.0 (personal use)")
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .ok()?;
+        Some(Self {
             token: token.to_string(),
-            http: Client::builder()
-                .user_agent("Nicord/0.1.0 (personal use)")
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .expect("reqwest client builds"),
-        }
+            http,
+        })
     }
 
     fn auth_header(&self) -> String {
@@ -185,12 +255,12 @@ impl DiscordClient {
             .header("Authorization", self.auth_header())
             .send()
             .await
-            .map_err(|e| DiscordError::Other(format!("network error: {e}")))?;
+            .map_err(|e| reqwest_error("network error", e))?;
         match resp.status() {
             StatusCode::OK => resp
                 .json()
                 .await
-                .map_err(|e| DiscordError::Other(format!("bad channel response: {e}"))),
+                .map_err(|e| reqwest_error("bad channel response", e)),
             s => Err(self.status_error(s, resp).await),
         }
     }
@@ -215,13 +285,13 @@ impl DiscordClient {
             .header("Authorization", self.auth_header())
             .send()
             .await
-            .map_err(|e| DiscordError::Other(format!("network error: {e}")))?;
+            .map_err(|e| reqwest_error("network error", e))?;
         match resp.status() {
             StatusCode::OK => {
                 let v: serde_json::Value = resp
                     .json()
                     .await
-                    .map_err(|e| DiscordError::Other(format!("bad search response: {e}")))?;
+                    .map_err(|e| reqwest_error("bad search response", e))?;
                 Ok(parse_application_commands(&v))
             }
             s => Err(self.status_error(s, resp).await),
@@ -239,7 +309,7 @@ impl DiscordClient {
             .json(&payload)
             .send()
             .await
-            .map_err(|e| DiscordError::Other(format!("network error: {e}")))?;
+            .map_err(|e| reqwest_error("network error", e))?;
         match resp.status() {
             StatusCode::NO_CONTENT | StatusCode::OK | StatusCode::CREATED => Ok(()),
             s => Err(self.status_error(s, resp).await),
@@ -253,6 +323,8 @@ impl DiscordClient {
         channel_id: &str,
         content: &str,
         embeds: &[crate::embed::Embed],
+        opts: &SendOptions,
+        poll: Option<&crate::poll::Poll>,
     ) -> Result<SentMessage, DiscordError> {
         let url = format!("{DISCORD_API}/channels/{channel_id}/messages");
         let body = SendMessageBody {
@@ -262,6 +334,9 @@ impl DiscordClient {
             } else {
                 Some(embeds.iter().map(|e| e.to_json()).collect())
             },
+            allowed_mentions: opts.allowed_mentions(),
+            flags: opts.flags(),
+            poll: poll.map(|p| p.to_json()),
         };
         let resp = self
             .http
@@ -270,7 +345,7 @@ impl DiscordClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| DiscordError::Other(format!("network error: {e}")))?;
+            .map_err(|e| reqwest_error("network error", e))?;
         self.handle_response(resp).await
     }
 
@@ -284,7 +359,7 @@ impl DiscordClient {
             .header("Authorization", self.auth_header())
             .send()
             .await
-            .map_err(|e| DiscordError::Other(format!("network error: {e}")))?;
+            .map_err(|e| reqwest_error("network error", e))?;
         match resp.status() {
             StatusCode::NO_CONTENT | StatusCode::OK => Ok(()),
             s => Err(self.status_error(s, resp).await),
@@ -304,7 +379,7 @@ impl DiscordClient {
             .header("Authorization", self.auth_header())
             .send()
             .await
-            .map_err(|e| DiscordError::Other(format!("network error: {e}")))?;
+            .map_err(|e| reqwest_error("network error", e))?;
         match resp.status() {
             StatusCode::NO_CONTENT | StatusCode::OK => Ok(()),
             s => Err(self.status_error(s, resp).await),
@@ -318,12 +393,12 @@ impl DiscordClient {
             .header("Authorization", self.auth_header())
             .send()
             .await
-            .map_err(|e| DiscordError::Other(format!("network error: {e}")))?;
+            .map_err(|e| reqwest_error("network error", e))?;
         match resp.status() {
             StatusCode::OK => resp
                 .json()
                 .await
-                .map_err(|e| DiscordError::Other(format!("bad /users/@me response: {e}"))),
+                .map_err(|e| reqwest_error("bad /users/@me response", e)),
             s => Err(self.status_error(s, resp).await),
         }
     }
@@ -344,12 +419,12 @@ impl DiscordClient {
             .header("Authorization", self.auth_header())
             .send()
             .await
-            .map_err(|e| DiscordError::Other(format!("network error: {e}")))?;
+            .map_err(|e| reqwest_error("network error", e))?;
         match resp.status() {
             StatusCode::OK => resp
                 .json()
                 .await
-                .map_err(|e| DiscordError::Other(format!("bad guilds response: {e}"))),
+                .map_err(|e| reqwest_error("bad guilds response", e)),
             s => Err(self.status_error(s, resp).await),
         }
     }
@@ -362,12 +437,12 @@ impl DiscordClient {
             .header("Authorization", self.auth_header())
             .send()
             .await
-            .map_err(|e| DiscordError::Other(format!("network error: {e}")))?;
+            .map_err(|e| reqwest_error("network error", e))?;
         match resp.status() {
             StatusCode::OK => resp
                 .json()
                 .await
-                .map_err(|e| DiscordError::Other(format!("bad channels response: {e}"))),
+                .map_err(|e| reqwest_error("bad channels response", e)),
             s => Err(self.status_error(s, resp).await),
         }
     }
@@ -377,7 +452,7 @@ impl DiscordClient {
             StatusCode::OK | StatusCode::CREATED => resp
                 .json()
                 .await
-                .map_err(|e| DiscordError::Other(format!("bad send response: {e}"))),
+                .map_err(|e| reqwest_error("bad send response", e)),
             s => Err(self.status_error(s, resp).await),
         }
     }
@@ -386,6 +461,16 @@ impl DiscordClient {
         let body = resp.text().await.unwrap_or_default();
         discord_error_from_status(status, &body)
     }
+}
+
+/// Build a `DiscordError::Other` from a reqwest error, with the URL
+/// stripped: `reqwest::Error`'s `Display` appends ` for url (<url>)`,
+/// and webhook request URLs contain the token — formatting the raw
+/// error leaked full webhook URLs into send logs, the database, the
+/// Logs UI, and tracing output on any network failure. Every reqwest
+/// error formatted into a `DiscordError` must go through here.
+pub(crate) fn reqwest_error(prefix: &str, e: reqwest::Error) -> DiscordError {
+    DiscordError::Other(format!("{prefix}: {}", e.without_url()))
 }
 
 /// Map an HTTP status + body to a DiscordError. Pure: unit-testable
@@ -398,7 +483,7 @@ pub fn discord_error_from_status(status: StatusCode, body: &str) -> DiscordError
             let retry_after = v.get("retry_after").and_then(|x| x.as_f64()).unwrap_or(5.0);
             let global = v.get("global").and_then(|x| x.as_bool()).unwrap_or(false);
             DiscordError::RateLimited {
-                retry_after_secs: retry_after.ceil() as u64,
+                retry_after_secs: clamp_retry_after(retry_after),
                 global,
             }
         }
@@ -415,13 +500,25 @@ pub fn discord_error_from_status(status: StatusCode, body: &str) -> DiscordError
     }
 }
 
+/// Upper bound for a 429 `retry_after`: Discord sends small values.
+/// An uncapped value can overflow `Instant` arithmetic downstream
+/// (values over ~292 years panic) or wedge a destination for years.
+const MAX_RETRY_AFTER_SECS: u64 = 3600;
+
+/// Clamp a fractional `retry_after` to whole seconds in
+/// `0..=MAX_RETRY_AFTER_SECS`. Saturating: huge, negative, and
+/// non-finite inputs all land inside the range.
+fn clamp_retry_after(retry_after: f64) -> u64 {
+    retry_after.ceil().clamp(0.0, MAX_RETRY_AFTER_SECS as f64) as u64
+}
+
 /// Parse a `retry_after` (seconds, may be fractional) from a 429 body.
 #[allow(dead_code)]
 pub fn parse_retry_after(body: &str) -> u64 {
     serde_json::from_str::<serde_json::Value>(body)
         .ok()
         .and_then(|v| v.get("retry_after")?.as_f64())
-        .map(|f| f.ceil() as u64)
+        .map(clamp_retry_after)
         .unwrap_or(5)
 }
 
@@ -792,5 +889,103 @@ mod tests {
         assert_eq!(bare.id, "");
         assert!(!bare.has_nitro());
         assert_eq!(bare.nitro_label(), "Không có");
+    }
+
+    #[test]
+    fn retry_after_is_clamped() {
+        let err = discord_error_from_status(
+            StatusCode::TOO_MANY_REQUESTS,
+            r#"{"retry_after": 1e20, "global": false}"#,
+        );
+        match err {
+            DiscordError::RateLimited {
+                retry_after_secs, ..
+            } => assert_eq!(retry_after_secs, 3600),
+            _ => panic!("expected RateLimited"),
+        }
+        let err = discord_error_from_status(
+            StatusCode::TOO_MANY_REQUESTS,
+            r#"{"retry_after": 5.5, "global": false}"#,
+        );
+        match err {
+            DiscordError::RateLimited {
+                retry_after_secs, ..
+            } => assert_eq!(retry_after_secs, 6),
+            _ => panic!("expected RateLimited"),
+        }
+    }
+
+    #[test]
+    fn debug_masks_the_token() {
+        let client = DiscordClient::new("SECRET-TOKEN-VALUE-1234").unwrap();
+        let debug = format!("{client:?}");
+        assert!(!debug.contains("SECRET-TOKEN-VALUE-1234"));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn send_options_block_mass_pings_and_set_silent_flag() {
+        let opts = SendOptions::default();
+        let mentions = opts.allowed_mentions().unwrap();
+        assert_eq!(
+            serde_json::to_value(&mentions).unwrap(),
+            serde_json::json!({"parse": ["users"]})
+        );
+        assert_eq!(opts.flags(), None);
+        let opts = SendOptions {
+            allow_mass_mentions: true,
+            silent: true,
+        };
+        assert!(opts.allowed_mentions().is_none());
+        assert_eq!(opts.flags(), Some(1 << 12));
+    }
+
+    #[test]
+    fn send_message_body_omits_unset_option_fields() {
+        let opts = SendOptions::default();
+        let body = SendMessageBody {
+            content: "hi".to_string(),
+            embeds: None,
+            allowed_mentions: opts.allowed_mentions(),
+            flags: opts.flags(),
+            poll: None,
+        };
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["allowed_mentions"]["parse"][0], "users");
+        assert!(json.get("flags").is_none());
+        assert!(json.get("embeds").is_none());
+        let opts = SendOptions {
+            allow_mass_mentions: true,
+            silent: false,
+        };
+        let body = SendMessageBody {
+            content: "hi".to_string(),
+            embeds: None,
+            allowed_mentions: opts.allowed_mentions(),
+            flags: opts.flags(),
+            poll: None,
+        };
+        let json = serde_json::to_value(&body).unwrap();
+        assert!(json.get("allowed_mentions").is_none());
+    }
+
+    #[test]
+    fn send_message_body_carries_poll_when_present() {
+        let poll = crate::poll::Poll {
+            question: "Q?".to_string(),
+            answers: vec!["A".to_string(), "B".to_string()],
+            duration_hours: 24,
+            allow_multiselect: true,
+        };
+        let body = SendMessageBody {
+            content: String::new(),
+            embeds: None,
+            allowed_mentions: None,
+            flags: None,
+            poll: Some(poll.to_json()),
+        };
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["poll"]["question"]["text"], "Q?");
+        assert_eq!(json["poll"]["duration"], 24);
     }
 }

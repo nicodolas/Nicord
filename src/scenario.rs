@@ -11,7 +11,7 @@
 //! - Cron is a real 5-field parser (minute hour dom month dow), not hourly.
 
 use crate::preview::{char_count, DISCORD_CONTENT_LIMIT};
-use chrono::{DateTime, Datelike, Local, NaiveTime, Timelike, Utc};
+use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveTime, Timelike, Utc};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -49,9 +49,15 @@ impl Schedule {
         }
     }
 
-    /// Next run strictly after `from` (local time). Used for display
-    /// ("next run at …"), not for the firing decision — see `due_time`.
-    pub fn next_after(&self, from: DateTime<Local>) -> DateTime<Local> {
+    /// Next run strictly after `from`, computed in the scenario's
+    /// timezone and returned in local time for display. Used for
+    /// display ("next run at …"), not for the firing decision — see
+    /// `due_time`, which uses the same timezone. Computing in Local
+    /// (or UTC for cron) showed the wrong time whenever the scenario
+    /// timezone differed from the machine's.
+    pub fn next_after(&self, from: DateTime<Local>, timezone: &str) -> DateTime<Local> {
+        let tz = tz_from_name(timezone);
+        let from_tz = from.with_timezone(&tz);
         match self {
             Schedule::Once { at } => at.with_timezone(&Local),
             Schedule::EveryMinutes { minutes } => {
@@ -63,30 +69,32 @@ impl Schedule {
                 from + chrono::Duration::hours(h)
             }
             Schedule::Daily { time } => {
-                let today = from
+                let today = from_tz
                     .date_naive()
                     .and_time(*time)
-                    .and_local_timezone(Local)
-                    .single()
-                    .unwrap_or(from);
-                if today > from {
-                    today
-                } else {
-                    today + chrono::Duration::days(1)
-                }
+                    .and_local_timezone(tz)
+                    .single();
+                let next_tz = match today {
+                    Some(t) if t > from_tz => t,
+                    Some(t) => t + chrono::Duration::days(1),
+                    // Ambiguous/nonexistent wall time (DST gap):
+                    // fall back to 24h out rather than guessing.
+                    None => from_tz + chrono::Duration::days(1),
+                };
+                next_tz.with_timezone(&Local)
             }
             Schedule::Weekly { weekdays, time } => {
                 for day_offset in 0..8 {
-                    let candidate_date = from.date_naive() + chrono::Duration::days(day_offset);
+                    let candidate_date = from_tz.date_naive() + chrono::Duration::days(day_offset);
                     let weekday = candidate_date.weekday().num_days_from_monday() as u8;
                     if weekdays.contains(&weekday) {
                         let candidate = candidate_date
                             .and_time(*time)
-                            .and_local_timezone(Local)
+                            .and_local_timezone(tz)
                             .single();
                         if let Some(c) = candidate {
-                            if c > from {
-                                return c;
+                            if c > from_tz {
+                                return c.with_timezone(&Local);
                             }
                         }
                     }
@@ -94,15 +102,33 @@ impl Schedule {
                 from + chrono::Duration::days(7)
             }
             Schedule::Cron { expr } => match parse_cron(expr) {
-                Ok(fields) => {
-                    let tz = chrono_tz::UTC;
-                    let from_tz = from.with_timezone(&tz);
-                    cron_next_after(&fields, from_tz)
-                        .map(|d| d.with_timezone(&Local))
-                        .unwrap_or(from + chrono::Duration::hours(1))
-                }
+                Ok(fields) => cron_next_after(&fields, from_tz)
+                    .map(|d| d.with_timezone(&Local))
+                    .unwrap_or(from + chrono::Duration::hours(1)),
                 Err(_) => from + chrono::Duration::hours(1),
             },
+        }
+    }
+
+    /// Canonical form for change detection: weekday order and cron
+    /// whitespace do not change what the schedule MEANS, so they
+    /// must not reset the last-run anchor (which would re-fire the
+    /// most recent past occurrence — a duplicate send).
+    pub fn normalized(&self) -> Schedule {
+        match self {
+            Schedule::Weekly { weekdays, time } => {
+                let mut w = weekdays.clone();
+                w.sort_unstable();
+                w.dedup();
+                Schedule::Weekly {
+                    weekdays: w,
+                    time: *time,
+                }
+            }
+            Schedule::Cron { expr } => Schedule::Cron {
+                expr: expr.split_whitespace().collect::<Vec<_>>().join(" "),
+            },
+            other => other.clone(),
         }
     }
 
@@ -173,7 +199,9 @@ fn parse_cron_field(field: &str, min: u32, max: u32) -> Result<Vec<bool>, String
             let mut v = min;
             while v <= max {
                 mark(v);
-                v += step;
+                // Saturating: a huge step must stop the scan, not
+                // panic (debug) or wrap to wrong minutes (release).
+                v = v.saturating_add(step);
             }
         } else if let Some((a, b)) = range.split_once('-') {
             let lo: u32 = a.parse().map_err(|_| format!("bad cron number '{a}'"))?;
@@ -184,7 +212,7 @@ fn parse_cron_field(field: &str, min: u32, max: u32) -> Result<Vec<bool>, String
             let mut v = lo;
             while v <= hi {
                 mark(v);
-                v += step;
+                v = v.saturating_add(step);
             }
         } else {
             let v: u32 = range
@@ -198,7 +226,7 @@ fn parse_cron_field(field: &str, min: u32, max: u32) -> Result<Vec<bool>, String
                 let mut x = v;
                 while x <= max {
                     mark(x);
-                    x += step;
+                    x = x.saturating_add(step);
                 }
             } else {
                 mark(v);
@@ -792,11 +820,35 @@ pub struct Scenario {
     /// scenario message list (see the engine's fallback chain).
     #[serde(default)]
     pub use_destination_messages: bool,
-    /// Optional rich embed attached to every message this scenario
-    /// sends (Q8). None = plain text only. An embed may accompany
-    /// empty content (Discord requires content OR embeds).
+    /// Rich embeds attached to every message this scenario sends
+    /// (Q8, extended by idea #8 to up to 10). Empty = plain text
+    /// only. An embed may accompany empty content (Discord
+    /// requires content OR embeds).
+    ///
+    /// Migration: older files stored ONE embed under the key
+    /// `"embed"` (an object, or null). The `alias` + custom
+    /// deserializer below reads that form into this vec, so old
+    /// scenarios, exports, and backups keep working; new files
+    /// serialize only `"embeds"`.
+    #[serde(default, alias = "embed", deserialize_with = "de_embeds")]
+    pub embeds: Vec<crate::embed::Embed>,
+    /// When false (default), mass pings are blocked: the send
+    /// payload carries `allowed_mentions: {"parse": ["users"]}`,
+    /// so @everyone/@here/role mentions render as plain text
+    /// while individual user mentions still ping. When true, the
+    /// field is omitted and Discord parses everything.
     #[serde(default)]
-    pub embed: Option<crate::embed::Embed>,
+    pub allow_mass_mentions: bool,
+    /// When true, the SUPPRESS_NOTIFICATIONS flag is set: the
+    /// message arrives without pushing a notification.
+    #[serde(default)]
+    pub silent_send: bool,
+    /// Optional poll attached to every message this scenario
+    /// sends (idea #3). None = no poll. A poll may accompany
+    /// empty content (Discord requires content OR embeds OR a
+    /// poll). Results are not readable via webhook — see poll.rs.
+    #[serde(default)]
+    pub poll: Option<crate::poll::Poll>,
     #[serde(default)]
     pub schedule: Option<Schedule>,
     #[serde(default)]
@@ -829,6 +881,32 @@ fn default_schema_version() -> u32 {
     1
 }
 
+/// Deserialize `Scenario::embeds` from either the old form (a
+/// single embed object under `"embed"`, or null) or the new form
+/// (an array under `"embeds"`). A missing key never reaches here
+/// (the field's `#[serde(default)]` applies instead).
+fn de_embeds<'de, D>(deserializer: D) -> Result<Vec<crate::embed::Embed>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Order matters: `Many` BEFORE `One`. Serde structs accept
+    // seq form, and `Embed` has defaults on every field — so an
+    // empty array `[]` would otherwise match `One` as a default
+    // embed instead of the empty list.
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        Empty,
+        Many(Vec<crate::embed::Embed>),
+        One(crate::embed::Embed),
+    }
+    Ok(match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::Empty => Vec::new(),
+        OneOrMany::Many(embeds) => embeds,
+        OneOrMany::One(embed) => vec![embed],
+    })
+}
+
 impl Scenario {
     pub fn new(name: &str) -> Self {
         Self {
@@ -840,7 +918,10 @@ impl Scenario {
             channel_id: String::new(),
             destination_id: None,
             use_destination_messages: false,
-            embed: None,
+            embeds: Vec::new(),
+            allow_mass_mentions: false,
+            silent_send: false,
+            poll: None,
             schedule: Some(Schedule::Daily {
                 time: NaiveTime::from_hms_opt(9, 0, 0).unwrap_or_default(),
             }),
@@ -953,7 +1034,13 @@ impl Scenario {
         for node in &self.nodes {
             if node.kind == NodeKind::ActionSendMessage || node.kind == NodeKind::ActionSendEmbed {
                 let content = node_content(node);
-                if content.trim().is_empty() && self.messages.is_empty() && !has_command {
+                // A poll alone satisfies the node: Discord accepts
+                // a message that is only a poll.
+                if content.trim().is_empty()
+                    && self.messages.is_empty()
+                    && !has_command
+                    && self.poll.is_none()
+                {
                     return Err(format!(
                         "Send Message node {} has empty content and no message list",
                         node.id
@@ -961,16 +1048,26 @@ impl Scenario {
                 }
             }
         }
-        // Embed limits (Q8): validated in both modes, since both
-        // transports send the same embed payload.
-        if let Some(embed) = &self.embed {
-            embed.validate()?;
+        // Embed limits (Q8 / idea #8): validated in both modes,
+        // since both transports send the same embed payload.
+        // The 6000-char total is enforced across all embeds.
+        crate::embed::validate_embeds(&self.embeds)?;
+        // Poll limits (idea #3): validated in both modes, since
+        // both transports send the same poll payload.
+        if let Some(poll) = &self.poll {
+            poll.validate()?;
         }
         // Discord rejects any message over 2000 characters, so fail fast
         // here with a clear error instead of failing on every send.
         // This checks the raw text (before template vars / spin-text):
         // conservative for templates that expand, exact for plain text.
         for (idx, msg) in self.messages.iter().enumerate() {
+            // An empty entry would fail on every firing (the send
+            // path rejects empty content after sanitising) and count
+            // toward error pauses — reject it here, once, instead.
+            if msg.trim().is_empty() {
+                return Err(format!("message {} is empty", idx + 1));
+            }
             if char_count(msg) > DISCORD_CONTENT_LIMIT {
                 return Err(format!(
                     "message {} is {} characters, over Discord's 2000-character limit",
@@ -1006,26 +1103,50 @@ impl Scenario {
 
     /// Pick the next message to send, rotating without repeating the last one.
     /// Returns (index, message). `last_index` is the index sent last time.
+    /// Empty/whitespace-only entries are never picked (validation
+    /// rejects them, but corrupt rows bypass validation): the
+    /// returned index is the ORIGINAL position, so no-repeat
+    /// tracking stays consistent. None when no usable message exists.
     pub fn pick_message_with_index(
         &self,
         last_index: Option<usize>,
         rng: &mut impl Rng,
     ) -> Option<(usize, String)> {
-        if self.messages.is_empty() {
+        let candidates: Vec<usize> = self
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| !m.trim().is_empty())
+            .map(|(i, _)| i)
+            .collect();
+        if candidates.is_empty() {
             return None;
         }
-        if self.messages.len() == 1 {
-            return Some((0, self.messages[0].clone()));
+        if candidates.len() == 1 {
+            let idx = candidates[0];
+            return Some((idx, self.messages[idx].clone()));
         }
-        let mut idx = rng.random_range(0..self.messages.len());
+        let mut idx = candidates[rng.random_range(0..candidates.len())];
         if Some(idx) == last_index {
-            idx = (idx + 1) % self.messages.len();
+            let pos = candidates.iter().position(|&c| c == idx).unwrap_or(0);
+            idx = candidates[(pos + 1) % candidates.len()];
         }
         Some((idx, self.messages[idx].clone()))
     }
 
     /// First non-empty content from ActionSendMessage / ActionSendEmbed
     /// nodes, in node order. None if no node carries content.
+    /// The embeds this scenario actually sends: non-empty ones
+    /// only, in order. Empty embeds (e.g. a half-filled composer
+    /// draft) are dropped rather than sent — Discord would 400.
+    pub fn active_embeds(&self) -> Vec<crate::embed::Embed> {
+        self.embeds
+            .iter()
+            .filter(|e| !e.is_empty())
+            .cloned()
+            .collect()
+    }
+
     pub fn node_message(&self) -> Option<String> {
         self.nodes
             .iter()
@@ -1044,13 +1165,15 @@ impl Scenario {
     }
 
     /// Total extra wait (seconds) requested by UtilityWait nodes (capped).
+    /// Saturating: crafted node configs with huge `seconds` values
+    /// must not overflow the sum (debug panic / release wrap).
     pub fn wait_seconds(&self) -> u64 {
         let total: u64 = self
             .nodes
             .iter()
             .filter(|n| n.kind == NodeKind::UtilityWait)
             .filter_map(|n| n.config.get("seconds").and_then(|v| v.as_u64()))
-            .sum();
+            .fold(0u64, |acc, v| acc.saturating_add(v));
         total.min(300)
     }
 
@@ -1195,14 +1318,79 @@ pub fn node_content(node: &Node) -> String {
     String::new()
 }
 
+/// Whether `name` is a valid counter name: 1–64 chars of
+/// letters, digits, `_`, `-`. Anything else is left unrendered
+/// (literal text stays in the message), never an error.
+pub fn valid_counter_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// Names of durable counters referenced by `template`
+/// (`{{counter:name}}`), deduplicated, in first-use order.
+/// Invalid names and unterminated tags are skipped.
+pub fn counter_names(template: &str) -> Vec<String> {
+    const TAG: &str = "{{counter:";
+    let mut names = Vec::new();
+    let mut rest = template;
+    while let Some(start) = rest.find(TAG) {
+        let after = &rest[start + TAG.len()..];
+        let Some(end) = after.find("}}") else {
+            break;
+        };
+        let name = &after[..end];
+        if valid_counter_name(name) && !names.iter().any(|n| n == name) {
+            names.push(name.to_string());
+        }
+        rest = &after[end + 2..];
+    }
+    names
+}
+
+/// Render `{{days_until:YYYY-MM-DD}}` tags: whole days from
+/// `today` until the date, clamped at 0 (a past date renders 0,
+/// so countdowns never go negative). Unparseable dates are left
+/// literal and the scan continues past them.
+fn render_days_until(mut text: String, today: NaiveDate) -> String {
+    const TAG: &str = "{{days_until:";
+    let mut search_from = 0;
+    while let Some(rel) = text[search_from..].find(TAG) {
+        let start = search_from + rel;
+        let Some(close_rel) = text[start..].find("}}") else {
+            break;
+        };
+        let close = start + close_rel;
+        let date_str = &text[start + TAG.len()..close];
+        match NaiveDate::parse_from_str(date_str.trim(), "%Y-%m-%d") {
+            Ok(date) => {
+                let days = (date - today).num_days().max(0).to_string();
+                text.replace_range(start..close + 2, &days);
+                search_from = start + days.len();
+            }
+            Err(_) => {
+                search_from = close + 2;
+            }
+        }
+    }
+    text
+}
+
 /// Render `{{username}}`, `{{server}}`, `{{channel}}`, `{{date}}`,
-/// `{{time}}`, plus any custom `{{name}}` variables.
+/// `{{time}}`, `{{weekday}}`, `{{week_number}}`,
+/// `{{days_until:YYYY-MM-DD}}`, `{{counter:name}}` (from
+/// `counters`; names absent from the map stay literal), plus any
+/// custom `{{name}}` variables. Unknown tags are left as-is:
+/// rendering never fails, it just leaves what it cannot resolve.
 pub fn render_template_with_vars(
     template: &str,
     username: &str,
     server: &str,
     channel: &str,
     vars: &HashMap<String, String>,
+    counters: &HashMap<String, u64>,
 ) -> String {
     let now = Local::now();
     let mut out = template
@@ -1210,7 +1398,13 @@ pub fn render_template_with_vars(
         .replace("{{server}}", server)
         .replace("{{channel}}", channel)
         .replace("{{date}}", &now.format("%Y-%m-%d").to_string())
-        .replace("{{time}}", &now.format("%H:%M").to_string());
+        .replace("{{time}}", &now.format("%H:%M").to_string())
+        .replace("{{weekday}}", &now.format("%A").to_string())
+        .replace("{{week_number}}", &now.format("%V").to_string());
+    out = render_days_until(out, now.date_naive());
+    for (name, value) in counters {
+        out = out.replace(&format!("{{{{counter:{name}}}}}"), &value.to_string());
+    }
     for (k, v) in vars {
         out = out.replace(&format!("{{{{{}}}}}", k), v);
     }
@@ -1342,15 +1536,206 @@ mod tests {
         let s = Schedule::Daily {
             time: NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
         };
-        let from = Local::now()
-            .date_naive()
-            .and_hms_opt(10, 0, 0)
+        // Fixed UTC instants: deterministic on any machine timezone.
+        let from = Utc
+            .with_ymd_and_hms(2026, 11, 17, 10, 0, 0)
             .unwrap()
-            .and_local_timezone(Local)
-            .unwrap();
-        let next = s.next_after(from);
+            .with_timezone(&Local);
+        let next = s.next_after(from, "UTC");
         assert!(next > from);
-        assert_eq!(next.hour(), 9);
+        assert_eq!(next.with_timezone(&Utc).hour(), 9);
+        assert_eq!(next.with_timezone(&Utc).day(), 18);
+    }
+
+    #[test]
+    fn next_after_uses_scenario_timezone() {
+        let s = Schedule::Daily {
+            time: NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
+        };
+        // 10:00 UTC is 05:00 in New York (EST): the next 09:00 NY
+        // run is 14:00 UTC the same day — not tomorrow 09:00 UTC,
+        // which the old Local-based computation returned.
+        let from = Utc
+            .with_ymd_and_hms(2026, 11, 17, 10, 0, 0)
+            .unwrap()
+            .with_timezone(&Local);
+        let next = s.next_after(from, "America/New_York");
+        let expected = Utc
+            .with_ymd_and_hms(2026, 11, 17, 14, 0, 0)
+            .unwrap()
+            .with_timezone(&Local);
+        assert_eq!(next, expected);
+    }
+
+    #[test]
+    fn normalized_ignores_weekday_order_and_cron_whitespace() {
+        let a = Schedule::Weekly {
+            weekdays: vec![1, 2],
+            time: NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
+        };
+        let b = Schedule::Weekly {
+            weekdays: vec![2, 1, 1],
+            time: NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
+        };
+        assert_eq!(a.normalized(), b.normalized());
+        let c = Schedule::Cron {
+            expr: "0 9 * * *".to_string(),
+        };
+        let d = Schedule::Cron {
+            expr: "  0   9  *   *  *  ".to_string(),
+        };
+        assert_eq!(c.normalized(), d.normalized());
+        // A real change still differs.
+        let e = Schedule::Cron {
+            expr: "0 10 * * *".to_string(),
+        };
+        assert_ne!(c.normalized(), e.normalized());
+    }
+
+    #[test]
+    fn validate_rejects_empty_messages() {
+        let mut s = Scenario::new("t");
+        s.channel_id = "123".to_string();
+        s.messages = vec!["hi".to_string(), "   ".to_string()];
+        assert!(s.validate().is_err());
+        s.messages = vec!["".to_string()];
+        assert!(s.validate().is_err());
+    }
+
+    #[test]
+    fn poll_alone_satisfies_validation_and_invalid_poll_fails() {
+        // A scenario with no messages but a valid poll validates:
+        // Discord accepts a poll-only message.
+        let mut s = Scenario::new("poll-only");
+        s.messages.clear();
+        s.poll = Some(crate::poll::Poll {
+            question: "Q?".to_string(),
+            answers: vec!["A".to_string(), "B".to_string()],
+            duration_hours: 24,
+            allow_multiselect: false,
+        });
+        s.channel_id = "111".to_string();
+        assert!(s.validate().is_ok());
+        // An invalid poll fails validation.
+        s.poll.as_mut().unwrap().answers.clear();
+        assert!(s.validate().is_err());
+    }
+
+    #[test]
+    fn embeds_migrate_from_old_single_embed_form() {
+        // Old files: one embed object under "embed".
+        let old = r#"{"name":"s","embed":{"title":"Hi"}}"#;
+        let s: Scenario = serde_json::from_str(old).unwrap();
+        assert_eq!(s.embeds.len(), 1);
+        assert_eq!(s.embeds[0].title, "Hi");
+        // Old files: explicit null (Option<Embed>::None).
+        let old_null = r#"{"name":"s","embed":null}"#;
+        let s: Scenario = serde_json::from_str(old_null).unwrap();
+        assert!(s.embeds.is_empty());
+        // Missing key entirely.
+        let s: Scenario = serde_json::from_str(r#"{"name":"s"}"#).unwrap();
+        assert!(s.embeds.is_empty());
+        // Empty array: the empty list, NOT one default embed
+        // (serde structs accept seq form — variant order in
+        // de_embeds guards this).
+        let s: Scenario = serde_json::from_str(r#"{"name":"s","embeds":[]}"#).unwrap();
+        assert!(s.embeds.is_empty());
+        // New files: an array under "embeds", serialized back under
+        // "embeds" only — never "embed".
+        let new = r#"{"name":"s","embeds":[{"title":"A"},{"title":"B"}]}"#;
+        let s: Scenario = serde_json::from_str(new).unwrap();
+        assert_eq!(s.embeds.len(), 2);
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"embeds\""));
+        assert!(!json.contains("\"embed\":"));
+        // active_embeds drops empty drafts.
+        let mut s = Scenario::new("t");
+        s.embeds = vec![
+            crate::embed::Embed::default(),
+            crate::embed::Embed {
+                title: "Real".to_string(),
+                ..crate::embed::Embed::default()
+            },
+        ];
+        assert_eq!(s.active_embeds().len(), 1);
+    }
+
+    #[test]
+    fn counter_names_extracts_valid_deduped_names() {
+        assert_eq!(
+            counter_names("Day {{counter:day}} of {{counter:day}} and {{counter:week-1}}"),
+            vec!["day".to_string(), "week-1".to_string()]
+        );
+        assert!(counter_names("no counters here").is_empty());
+        // Invalid names are skipped, not errors.
+        assert!(counter_names("{{counter:}} {{counter:has space}} {{counter:a/b}}").is_empty());
+        // Unterminated tag: nothing extracted, no panic.
+        assert!(counter_names("{{counter:never").is_empty());
+        assert!(!valid_counter_name(""));
+        assert!(!valid_counter_name("a".repeat(65).as_str()));
+        assert!(valid_counter_name("series_2-A"));
+    }
+
+    #[test]
+    fn render_template_resolves_new_builtins() {
+        let vars: HashMap<String, String> = HashMap::new();
+        let mut counters: HashMap<String, u64> = HashMap::new();
+        counters.insert("day".to_string(), 3);
+        let now = Local::now();
+        let out = render_template_with_vars(
+            "Today is {{weekday}}, week {{week_number}}, in {{days_until:2999-01-01}} days, day {{counter:day}} of {{counter:missing}}.",
+            "u",
+            "s",
+            "c",
+            &vars,
+            &counters,
+        );
+        assert!(out.contains(&format!("Today is {}", now.format("%A"))));
+        assert!(out.contains(&format!("week {}", now.format("%V"))));
+        let expected_days = (NaiveDate::from_ymd_opt(2999, 1, 1).unwrap() - now.date_naive())
+            .num_days()
+            .max(0);
+        assert!(out.contains(&format!("in {expected_days} days")));
+        assert!(out.contains("day 3 of {{counter:missing}}"));
+        // Past dates clamp at 0; unparseable dates stay literal.
+        let out = render_template_with_vars(
+            "{{days_until:2000-01-01}} and {{days_until:not-a-date}} and {{days_until:2026-13-40}}",
+            "u",
+            "s",
+            "c",
+            &vars,
+            &counters,
+        );
+        assert!(out.starts_with("0 and {{days_until:not-a-date}}"));
+        assert!(out.contains("{{days_until:2026-13-40}}"));
+    }
+
+    #[test]
+    fn picker_never_returns_empty_messages() {
+        use rand::{rngs::StdRng, SeedableRng};
+        let mut s = Scenario::new("t");
+        s.messages = vec!["".to_string(), "hi".to_string(), "  ".to_string()];
+        let mut rng = StdRng::seed_from_u64(1);
+        for _ in 0..20 {
+            let (idx, msg) = s.pick_message_with_index(None, &mut rng).unwrap();
+            assert_eq!(idx, 1);
+            assert_eq!(msg, "hi");
+        }
+        s.messages = vec!["".to_string(), " ".to_string()];
+        assert!(s.pick_message_with_index(None, &mut rng).is_none());
+    }
+
+    #[test]
+    fn wait_seconds_saturates_instead_of_overflowing() {
+        let mut s = Scenario::new("t");
+        let mut n1 = Node::new(NodeKind::UtilityWait);
+        n1.config = serde_json::json!({ "seconds": u64::MAX });
+        let mut n2 = Node::new(NodeKind::UtilityWait);
+        n2.config = serde_json::json!({ "seconds": u64::MAX });
+        s.nodes = vec![n1, n2];
+        // Saturating sum, then the 300s cap — never a wrap to a
+        // small number, never a debug panic.
+        assert_eq!(s.wait_seconds(), 300);
     }
 
     // --- due_time: the scheduler fix, proved by tests ---
@@ -1866,6 +2251,19 @@ mod tests {
         let from_json: ScenarioLimits = serde_json::from_str("{}").unwrap();
         assert_eq!(from_code.daily_cap, 0);
         assert_eq!(from_json.daily_cap, 0);
+    }
+
+    #[test]
+    fn cron_huge_step_marks_only_the_first_value() {
+        // A step near u32::MAX used to panic in debug builds and wrap
+        // to wrong minutes in release builds. Saturating addition
+        // stops the scan after the first value.
+        let fields = parse_cron("30-59/4294967290 * * * *").unwrap();
+        assert!(fields.minute[30]);
+        assert_eq!(fields.minute.iter().filter(|m| **m).count(), 1);
+        let fields = parse_cron("*/4294967290 * * * *").unwrap();
+        assert!(fields.minute[0]);
+        assert_eq!(fields.minute.iter().filter(|m| **m).count(), 1);
     }
 
     #[test]

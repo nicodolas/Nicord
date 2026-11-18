@@ -238,6 +238,20 @@ server name fetched once at engine start (`get_me` + `list_guilds`).
   config file copied to another machine cannot be decrypted
   there. It is obfuscation against casual copying, not a
   keyring — the keyring is the real protection where available.
+  Known limitation: the fallback key is a single SHA-256 with no
+  KDF stretching, and on Windows (no machine ID file) a fixed
+  constant stands in for the machine ID, so any local process
+  that knows the username can derive it. Treat blob-fallback
+  storage as protection against casual inspection only, never
+  as confidentiality against a local attacker.
+- Error strings never carry credentials: reqwest errors are
+  formatted with the URL stripped (`reqwest_error` in
+  `discord.rs`), because reqwest appends the request URL — which
+  for webhooks contains the token — and the scheduler scrubs
+  failure text before it reaches logs, the database, or the UI.
+  The Logs screen scrubs on display too, for rows written before
+  this boundary existed. If logs or a database were ever shared
+  before this fix, regenerate the affected webhooks.
 - At startup, existing blobs are migrated into the keyring when
   it is available, one entry per secret (`account-token`,
   `legacy-webhook`, `destination:<id>`). Migration verifies the
@@ -687,24 +701,75 @@ persist it — and include it in export/import. Full rules:
 
 ## Performance notes
 
-Measured on this Linux VM (debug build, `cargo test -- --ignored`,
-harness tests in `src/store.rs` and `src/app.rs`; re-run them after
-storage or runtime changes — they print, never assert on timing):
+Measured on this Linux VM (debug build unless noted,
+`cargo test -- --ignored`, harness tests in `src/store.rs` and
+`src/app.rs`; re-run them after storage or runtime changes — they
+print, never assert on timing):
 
 - `count_sends_today()` over 10,000 log rows: **~3.3 ms/call**
-  (full scan, no index on `created_at`). It used to run every frame
-  in `update()` — ~3,600 queries/minute at 60 fps. The Dashboard
-  now refreshes the count at most every 5 s (12/minute); the value
-  is computed once at startup so the first frame is correct.
+  before Batch P (full scan, no index on `created_at`), **~1.2
+  ms/call** after (debug harness, worst case: all 10,000 rows
+  stamped today, so the count still visits 10k index entries).
+  It used to run every frame in `update()` — ~3,600
+  queries/minute at 60 fps. The Dashboard refreshes the count
+  at most every 5 s (12/minute); the value is computed once at
+  startup so the first frame is correct. The realistic shape
+  (300 rows today out of 100k) measures 48 µs in release — see
+  Batch P below.
 - `tokio::runtime::Runtime::new()`: **~420 µs/call**. Eleven UI
   call sites each built a fresh runtime per click. They now share
   one process-wide runtime (`shared_runtime()` in `src/app.rs`,
   ~0.1 µs/call after warm-up). Safe because no call site blocks
   nested inside another `block_on` on it.
-- Not optimized: nothing else was measured, so nothing else was
-  changed. In particular the per-frame `load_destinations()` calls
-  in the Logs filter and the engine's per-tick queries were left
-  alone — measure before touching them.
+
+### Batch P (measured, overnight research)
+
+A read-only harness compiled the real modules and measured the
+exact store queries against 10k/100k/300k-row databases before
+any change was made. Findings that drove the work:
+
+- **No indexes existed**, and `send_logs` is never pruned, so the
+  Dashboard's per-frame counts scanned the whole table: ~131 ms
+  per frame at 100k rows (~1 year at the 300/day cap), ~383 ms
+  at 300k. One sparse cron (`0 0 29 2 *`) added ~153 ms/frame
+  on top: `next_after` walks minute-by-minute (~38 ms/call) and
+  the UI called it ~4× per scenario per frame.
+- **R1 — indexes + range rewrite.** Three indexes
+  (`(status, created_at)`, `(destination_id, status, created_at)`,
+  `(scenario_id, id)`), created idempotently on open, plus
+  rewriting `substr(created_at,1,10) = today` to a half-open
+  `[today, tomorrow)` range (`utc_today_bounds`, equivalent for
+  every stored string). Measured at 100k rows: the today-count
+  18.8 ms → 48 µs (390×), per-destination count 17 ms → 54 µs,
+  `MAX(created_at)` 17.3 ms → 11 µs. The rewrite is essential:
+  the index alone only gave 1.5×. One-time migration ~0.9 s at
+  100k rows; DB 19.6 → 32.8 MB.
+- **R2 — next-run cache.** `NextRunCache` in `app.rs`: 60 s TTL,
+  keyed by scenario + schedule + timezone (edits invalidate),
+  past values recomputed at once. Display only — the engine
+  fires via `due_time`. The schedule editor still calls
+  `next_after` directly (draft schedule, one call per frame).
+- **R3 — WAL + `synchronous=FULL`.** Each `log_send` commit cost
+  ~90 ms on this VM's storage (fsync per commit in DELETE mode).
+  WAL removes the per-commit fsync; FULL keeps the same crash
+  durability as before (a power loss cannot lose the last
+  scenario edit). Export/import never copy the raw DB file, so
+  the sidecars are safe. Absolute milliseconds on a Windows SSD
+  will differ; only the mechanism transfers.
+- **R4 — `query_logs` restructure.** The always-true keyword
+  clause defeated index use; omitting it when the keyword is
+  empty (identical result set) cut a rare-scenario filter from
+  12.8 ms to 0.29 ms at 100k rows. Keyword search itself
+  (39 ms at 100k) has no B-tree fix and was left alone.
+- **R5 — hygiene.** `load_destination(id)` is a direct
+  `WHERE id=?` lookup; the Logs screen loads destinations once
+  per frame instead of twice.
+- **Deliberately not optimized** (measured fast enough):
+  per-tick scenario clone (44 µs), `load_config` + decrypt per
+  resolution (~30 µs, live-reload kept), fresh `reqwest::Client`
+  per send (9 µs CPU; TLS reuse unmeasured, no claim made),
+  `due_time` (≤651 µs on a background thread), unfiltered
+  `query_logs`, CSV export query.
 
 ## Correctness fixes (Package A)
 
@@ -722,9 +787,10 @@ by reading the code (no new features):
   per bad row (row id + truncated parse error). Startup collects
   them into the health report; exports name them in the status
   message; the automatic pre-import backup warns when it skipped
-  rows. Import-replace deletes whole tables (`delete_all_*`)
-  instead of load-then-delete, so corrupt rows cannot survive a
-  "replace everything" import.
+  rows. Import-replace runs as one atomic `Store::replace_all`
+  transaction (Batch B1) instead of load-then-delete, so corrupt
+  rows cannot survive a "replace everything" import and a failed
+  import leaves the old data untouched.
 - **Per-scenario cap default unified.** `ScenarioLimits::default()`
   was 300 while the serde default for a missing `daily_cap` was 0
   ("inherit the account/global cap"), so new and imported scenarios
@@ -747,6 +813,266 @@ by reading the code (no new features):
   for a lock (`busy_timeout`), so a second Nicord instance holding
   the database no longer makes writes fail instantly with
   "database is locked".
+
+## Run-state persistence failures (M2)
+
+The engine's run loop used to ignore `save_scenario` failures
+after a send/skip: a failed last-run save means a restart
+re-fires the run (a duplicate send), with no warning anywhere.
+All five run-loop save sites now go through
+`Engine::save_run_state`, which logs the failure loudly and
+remembers it; the Dashboard health card shows the last
+persistence error live until a later save succeeds. Send-log
+writes go through `Engine::write_log`, which logs failures
+(history loss cannot cause a duplicate send, so it stays out
+of the health card).
+
+## Scheduled polls (idea #3)
+
+One poll per scenario (`src/poll.rs`), sent with every message
+in both modes — the `poll` field is accepted by the
+execute-webhook body and the create-message body alike.
+Limits (official docs): question ≤ 300 chars, 2–10 answers,
+each ≤ 55 chars, duration 1–168 h. A poll may accompany empty
+content: validation accepts a poll-only scenario, and the
+engine's content picking falls through to empty text when no
+message source has content but a poll is present. Results are
+NOT readable via webhook (and the user-token path does not
+read messages), so the composer states that results are visible
+only inside Discord. One real test message is recommended to
+confirm the payload shape, as with the other webhook behaviors.
+
+Composer-draft fix (found while building this): the Q8 embed
+composer saved only when the embed validated — but a fresh
+draft is empty, so the enable checkbox unchecked itself on the
+next frame and the composer could never be entered. Both
+composers now save drafts as edited; validation gates
+enabling/sending (via `validate_inner` and the engine's
+send-time validation), not the editor.
+
+## Richer embeds (idea #8)
+
+- **Up to 10 embeds per scenario** (Discord's limit). The model
+  moved from `Scenario.embed: Option<Embed>` to `embeds:
+  Vec<Embed>`; old files (one object under `"embed"`, or null)
+  migrate automatically via a serde alias + custom deserializer
+  (`de_embeds` — variant order matters: the array form is tried
+  before the single-object form, because serde structs accept
+  seq form and `[]` would otherwise parse as one default
+  embed). New files serialize only `"embeds"`. The 6000-char
+  total is enforced ACROSS all embeds by `validate_embeds`, in
+  addition to each embed's own limits. Empty embeds are dropped
+  at send time (`active_embeds`) rather than 400-ing.
+- **New embed fields:** title link `url`, large `image_url`,
+  small `thumbnail_url` — all https-only (same rule as
+  destination avatars), empty = absent. An image-only embed
+  counts as non-empty (it renders). URLs are not counted in the
+  6000-char total (Discord counts title/description/fields/
+  footer/author only).
+- **No timestamp field, deliberately:** a fixed timestamp on a
+  recurring message would go stale; a send-time stamp belongs
+  in the send layer, not the stored model.
+- The composer edits a list (add/remove per embed, shared
+  field editor + preview), shows the combined total, and
+  fail-closes on save when the set is invalid.
+
+## Drip series & template variables (idea #6)
+
+New template variables, rendered by `render_template_with_vars`
+(unknown tags stay literal — rendering never fails):
+
+- `{{counter:name}}` — a durable counter stored in the `meta`
+  table (`counter:<name>`). The stored value IS what renders;
+  it starts at 1 and increments by 1 after each successful send
+  that used it (failed/deferred runs never advance the series).
+  Names are 1–64 chars of letters, digits, `_`, `-`; anything
+  else stays literal. The Builder shows the counters a scenario
+  uses, with current values and a reset (delete the row → the
+  next render starts at 1 again). Counters are exported with
+  the setup in every mode and replaced on import — a series
+  survives a move to another machine.
+- `{{weekday}}` (full English name), `{{week_number}}` (ISO
+  week, 01–53), `{{days_until:YYYY-MM-DD}}` (whole days from
+  today, clamped at 0; unparseable dates stay literal).
+  Like `{{date}}`/`{{time}}`, these use the machine's local
+  time, not the scenario timezone (documented behavior).
+
+Counters render in message sends only: the command path passes
+an empty counter map, so a `{{counter:...}}` tag in a command
+stays literal and never increments.
+
+## Mention control & silent send (idea #7)
+
+Two per-scenario settings, stored on the scenario (persisted and
+exported with it, serde defaults keep old scenarios working):
+
+- **Block mass pings (default).** Unless the scenario opts in,
+  every send carries `allowed_mentions: {"parse": ["users"]}`:
+  @everyone/@here/role mentions render as plain text and ping
+  nobody, while individual user mentions still ping. Opting in
+  omits the field (Discord's default: everything parses). The
+  Builder warns when a scenario's messages contain @everyone/
+  @here while blocking is on.
+- **Silent send.** Sets the SUPPRESS_NOTIFICATIONS flag
+  (`1 << 12`): the message arrives without pushing a
+  notification.
+
+Both fields ride the same `SendOptions` in webhook mode and
+user-token mode (the execute-webhook body and the create-message
+body accept the same fields). Implemented from Discord's
+official message-object documentation; one real test message
+is still recommended to confirm Discord honors `allowed_mentions`
+via webhook execute, as with the other webhook behaviors.
+
+## Maintenance (Group 3)
+
+- **Scheduled automatic backups.** On by default: every
+  `auto_backup_interval_days` (default 1), Nicord writes a
+  local-mode export (same bytes as the pre-import backup, via
+  `backup::write_local_backup`) to `<config_dir>/backups/` and
+  prunes to the newest `auto_backup_keep` (default 7) files.
+  The due check runs at most every 60 s from `update()`; the
+  backup itself is a small export and runs inline. Failures are
+  logged (`tracing::warn!`), not shown — a backup failing every
+  60 s must not spam the status line; the Settings card shows
+  the last successful time (`last_auto_backup_at`), so a stale
+  timestamp is the visible signal. "Sao lưu ngay" runs the same
+  path on demand and reports in the status line. Like all local
+  backups, automatic backups are machine-bound: they restore
+  only on the machine that wrote them.
+- **Log retention.** `log_retention_days` (default 90, 0 =
+  keep forever). `Store::prune_logs` deletes rows dated before
+  the UTC cutoff, once at startup and on demand from Settings
+  (the button reports how many rows were deleted). Deleted
+  pages are reused by SQLite; the file does not shrink (no
+  VACUUM — a large database would freeze the UI at startup).
+  Pruning never touches schedules, destinations, or today's
+  statistics. The send log grows unboundedly without it
+  (~100k rows ≈ one year at the 300/day cap), which is what
+  made the Batch P indexes necessary.
+- **Log detail view.** The "Chi tiết" button on a log row opens
+  a detail card above the list: the full detail text (selectable,
+  secret-scrubbed on display) plus message id, destination id,
+  and channel id. Esc closes it. Session-only state.
+- **i18n.** The new Group 1/3 strings are keyed in both
+  languages. Pre-existing section titles and body copy remain
+  Vietnamese-only: completing them is incremental work (add a
+  key, then use `t()` at the call site), deliberately not
+  churned in this batch.
+
+## Seeing the future (Group 1)
+
+Three computed views — no new persisted state (the >20% rule was
+evaluated: everything here is derived from schedules, destinations,
+and the send log, so nothing is saved or exported):
+
+- **Upcoming-sends timeline** (Dashboard). The next 20 runs across
+  enabled scenarios within 7 days, each with its destination and
+  a blocked-run warning when the run will be skipped. Clicking
+  "Sửa" jumps to the scenario in the Builder. Computation lives
+  in `src/timeline.rs` (`future_runs` iterates `next_after`;
+  `blocked_reason` mirrors the engine's ahead-of-time skip
+  checks: destination state, quiet window, today's daily cap,
+  time-window nodes). Refreshed at most every 30 s — a sparse
+  cron costs ~38 ms per forward step, so the timeline must not
+  recompute every frame.
+- **7-day chart** (Dashboard). Sent vs failed bars per day from
+  one `counts_by_day` query (range-bounded, index-friendly),
+  hand-drawn with the egui painter; no chart dependency. The
+  `deleted` audit rows are excluded.
+- **Schedule simulation** (Builder schedule editor). The next 10
+  runs of the DRAFT schedule with the same blocked-run warnings,
+  cached by draft key (schedule + timezone + scenario) so edits
+  recompute once, not per frame.
+
+Honest limits, stated in the UI: the daily-cap warning only
+applies to runs dated today (future counts cannot be known);
+429 cooldowns and the night sleep window are not predicted;
+interval schedules are projected forward from now rather than
+from the last fired run, so the first projected run can differ
+from the engine's next firing by less than one interval.
+
+## Correctness fixes (Batch B2)
+
+A second batch from the overnight bug hunt (no new features).
+Items marked [test] have a regression test; the engine-loop items
+are covered by code review (the loop is not unit-testable).
+
+- **Per-destination caps count by destination, not channel**
+  [test]. `count_sends_today_for_channel` silently skipped the
+  cap when `channel_id` was empty, misattributed caps when the id
+  was stale, and merged two destinations in one channel into one
+  bucket. Counting is now by `destination_id`
+  (`count_sends_today_for_destination`), unconditionally.
+- **Empty messages rejected and never picked** [test]. Validation
+  checked only the 2000-char limit, so a crafted import could
+  plant an empty message that the fallback chain would "send"
+  (a failure log + error counting every run). Both validators
+  reject empty/whitespace entries, and both message pickers skip
+  them, so corrupt rows cannot produce an empty send either.
+- **Displayed "next run" uses the scenario timezone** [test].
+  `Schedule::next_after` computed Daily/Weekly in local time and
+  Cron in UTC while the engine fires in the scenario timezone,
+  so the UI showed a different time than the actual send. The
+  display path now takes the scenario timezone and computes in
+  it, matching `due_time`.
+- **Schedule-change detection compares schedules, not labels**
+  [test]. The engine remembered `schedule.label()`; reordering
+  weekdays or changing cron whitespace reset the last-run
+  anchor and could duplicate a send. It now compares
+  `Schedule::normalized()` values.
+- **Quiet hours and Time Windows agree** [test]. The destination
+  quiet window was end-inclusive, treated start==end as one
+  quiet minute, and failed OPEN on a one-sided setting; Time
+  Window nodes were end-exclusive with start==end never inside.
+  Both are now end-exclusive, start==end means never, and a
+  one-sided or unparseable quiet window fails CLOSED (quiet).
+- **Re-enabling a fired Once scenario works** [test]. `due_time`
+  never fires a Once scenario with a `last_run_at`, so
+  re-enabling one silently did nothing. Enabling now clears the
+  anchor for Once schedules only; recurring schedules keep it.
+- **Destination migration assigns scenarios even when
+  destinations already exist** [test]. The assignment loop only
+  ran on the fresh-migration path; scenarios left unassigned
+  could never be enabled in webhook mode.
+- **Startup never overwrites an unreadable config.** `load_config`
+  collapsed missing/corrupt/transiently-unreadable into defaults,
+  and startup saves could then destroy a good config file.
+  `load_config_status` distinguishes Fresh/Loaded/Unreadable;
+  startup skips both config saves when unreadable and the health
+  report warns about it.
+- **Keyring operations time out after 10 s** [test]. A hung
+  platform store used to block the keyring thread forever (join
+  with no timeout). Operations now use a channel +
+  `recv_timeout`; a timeout degrades like any other keyring
+  failure (reads fail closed, writes fall back to a blob).
+- **Validation failures no longer blame the destination.** The
+  engine loop counted a broken scenario's validation error
+  toward the destination's error limit and the 3-error engine
+  pause. Such failures now consume the run like a skip: no
+  counters, no failure row. Failure rows also log the
+  destination's channel in webhook mode (they used the empty
+  scenario channel, so the Logs destination filter missed them).
+- **Updater: macOS asset name, version-bound fallback, safe
+  swap** [test]. macOS used to look for a Linux asset name; it
+  now looks for `Nicord-v{version}-macos-arm64.zip`, and the
+  platform-zip fallback requires the version in the name (no
+  silent downgrades). The helper scripts now swap via a temp
+  name + rename and check every critical step (a failed swap
+  keeps the old exe, the `.bak`, and the staging dir, and never
+  relaunches); a zip with the exe in a subdirectory is refused;
+  `launch_helper_and_exit` reports a spawn failure instead of
+  exiting anyway; the release-JSON response is size-capped.
+- **Small items** [test]. `wait_seconds` sums saturating (no
+  overflow on crafted configs); `store_secret` never writes an
+  empty secret to the keyring; the legacy-webhook dual-write
+  clears a persisted destination pause only when the URL was
+  actually resolved and re-stored.
+- **Known and documented, not changed.** `{{date}}`/`{{time}}`
+  template variables render in the machine's local timezone,
+  not the scenario timezone (changing the signature through the
+  render path was judged too invasive for the value; the
+  schedule itself already respects the scenario timezone).
 
 ## Known limitations
 

@@ -18,6 +18,7 @@ mod gateway;
 mod health;
 mod i18n;
 mod notify;
+mod poll;
 mod preview;
 mod scenario;
 mod scheduler;
@@ -25,6 +26,7 @@ mod secret_store;
 mod spintax;
 mod store;
 mod theme;
+mod timeline;
 #[cfg(target_os = "windows")]
 mod tray;
 mod updater;

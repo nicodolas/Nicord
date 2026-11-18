@@ -72,6 +72,24 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
         (Lang::En, "dash.sent_today") => "Sent today",
         (Lang::En, "dash.next_run") => "Next run",
         (Lang::En, "dash.destination") => "Destination",
+        (Lang::En, "dash.timeline") => "Upcoming sends (7 days)",
+        (Lang::En, "dash.week_chart") => "Last 7 days",
+        (Lang::En, "dash.timeline_edit") => "Edit",
+        (Lang::En, "builder.simulation") => "Preview: next 10 runs",
+        (Lang::En, "builder.poll") => "Poll (optional)",
+        (Lang::En, "logs.detail_title") => "Log detail",
+        (Lang::En, "logs.detail_btn") => "Details",
+        (Lang::En, "logs.close") => "Close",
+        (Lang::En, "settings.maintenance") => "Automatic backups & log retention",
+        (Lang::En, "settings.auto_backup") => "Back up configuration automatically",
+        (Lang::En, "settings.every") => "Every",
+        (Lang::En, "settings.days") => "days",
+        (Lang::En, "settings.keep") => "keep",
+        (Lang::En, "settings.copies") => "copies",
+        (Lang::En, "settings.backup_now") => "Back up now",
+        (Lang::En, "settings.retention") => "Keep send history:",
+        (Lang::En, "settings.forever") => "Forever",
+        (Lang::En, "settings.prune_now") => "Clean up old logs now",
         // Builder sections.
         (Lang::En, "builder.editor") => "Editor",
         (Lang::En, "builder.schedule") => "Schedule",
@@ -139,6 +157,24 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
         (Lang::Vi, "dash.sent_today") => "Đã gửi hôm nay",
         (Lang::Vi, "dash.next_run") => "Lịch tới",
         (Lang::Vi, "dash.destination") => "Đích đến",
+        (Lang::Vi, "dash.timeline") => "Lịch gửi sắp tới (7 ngày)",
+        (Lang::Vi, "dash.week_chart") => "7 ngày qua",
+        (Lang::Vi, "dash.timeline_edit") => "Sửa",
+        (Lang::Vi, "builder.simulation") => "Xem trước: 10 lần chạy tới",
+        (Lang::Vi, "builder.poll") => "Bình chọn (tùy chọn)",
+        (Lang::Vi, "logs.detail_title") => "Chi tiết log",
+        (Lang::Vi, "logs.detail_btn") => "Chi tiết",
+        (Lang::Vi, "logs.close") => "Đóng",
+        (Lang::Vi, "settings.maintenance") => "Sao lưu tự động & lưu trữ log",
+        (Lang::Vi, "settings.auto_backup") => "Tự động sao lưu cấu hình",
+        (Lang::Vi, "settings.every") => "Mỗi",
+        (Lang::Vi, "settings.days") => "ngày",
+        (Lang::Vi, "settings.keep") => "giữ lại",
+        (Lang::Vi, "settings.copies") => "bản",
+        (Lang::Vi, "settings.backup_now") => "Sao lưu ngay",
+        (Lang::Vi, "settings.retention") => "Giữ lịch sử gửi:",
+        (Lang::Vi, "settings.forever") => "Mãi mãi",
+        (Lang::Vi, "settings.prune_now") => "Dọn dẹp log cũ ngay",
         (Lang::Vi, "builder.editor") => "Editor",
         (Lang::Vi, "builder.schedule") => "Lịch chạy",
         (Lang::Vi, "builder.templates") => "Thư viện mẫu",
@@ -197,6 +233,14 @@ mod tests {
         assert_eq!(t(Lang::En, "settings.language"), "Language");
         assert_eq!(t(Lang::Vi, "builder.enable_all"), "Bật tất cả");
         assert_eq!(t(Lang::En, "settings.font_size"), "Font size");
+        assert_eq!(t(Lang::Vi, "dash.timeline"), "Lịch gửi sắp tới (7 ngày)");
+        assert_eq!(t(Lang::En, "builder.simulation"), "Preview: next 10 runs");
+        assert_eq!(
+            t(Lang::Vi, "settings.maintenance"),
+            "Sao lưu tự động & lưu trữ log"
+        );
+        assert_eq!(t(Lang::En, "settings.prune_now"), "Clean up old logs now");
+        assert_eq!(t(Lang::Vi, "logs.detail_btn"), "Chi tiết");
         assert_eq!(t(Lang::Vi, "no.such.key"), "???");
     }
 }

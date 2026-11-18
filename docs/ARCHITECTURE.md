@@ -110,13 +110,23 @@ Webhook mode (same tick, queue, cap, and retry policy; simpler send):
 - `backup.rs` — config export/import: versioned JSON format,
   Portable/Safe/Local modes, passphrase KDF, replacement import
   with validation + warnings. See `docs/CONFIG-RULES.md`.
+- `poll.rs` — Discord poll model: limits, validation, payload
+  shape. One poll per scenario, both send modes.
+- `timeline.rs` — pure upcoming-send computation: `future_runs`
+  iterates `next_after`; `blocked_reason` mirrors the engine's
+  skip checks; `upcoming_runs` merges scenarios into the
+  Dashboard timeline; `simulate_scenario` powers the Builder
+  schedule preview. No I/O, no mutation.
 - `store.rs` — SQLite tables `scenarios` / `send_logs` / `destinations`
   / `templates` / `meta`; JSON `AppConfig` (incl. `SendMode`,
   encrypted webhook URL, webhook display metadata). `send_logs`
   carries `message_id` / `destination_id` (Q13) with a guarded
-  `ALTER TABLE` migration for older databases. `AppConfig::default()`
-  is manual and must match the serde field defaults (guarded by a
-  test — a derived Default silently zeroed the caps).
+  `ALTER TABLE` migration for older databases. The file database
+  runs in WAL mode with `synchronous=FULL`, and `send_logs` has
+  three indexes (Batch P) so the Dashboard's per-frame counts seek
+  instead of scanning. `AppConfig::default()` is manual and must
+  match the serde field defaults (guarded by a test — a derived
+  Default silently zeroed the caps).
 
 ## License keys — removed in v0.1.0
 

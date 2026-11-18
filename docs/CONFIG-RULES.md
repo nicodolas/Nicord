@@ -66,9 +66,18 @@ Fields added after the initial rules, each evaluated under §1:
   along in exports as part of `AppConfig`; a foreign window
   geometry is clamped on load, so importing it on another
   machine is harmless.
+- `auto_backup_enabled`, `auto_backup_interval_days`,
+  `auto_backup_keep`, `last_auto_backup_at`,
+  `log_retention_days` (`AppConfig`, Group 3): backup schedule
+  and retention are plainly expected to survive restarts —
+  persisted. They ride along in exports as part of `AppConfig`;
+  `last_auto_backup_at` transfers too, so a restored machine
+  does not immediately re-backup.
 - Deliberately NOT persisted: the Builder search query (a
-  transient filter — nobody expects it back after a restart)
-  and keyboard shortcuts (fixed bindings, no state to save).
+  transient filter — nobody expects it back after a restart),
+  keyboard shortcuts (fixed bindings, no state to save), the
+  log detail selection, and the timeline/simulation caches
+  (derived views, recomputed every session).
 
 ## 3. Export / import must cover every persisted setting
 
