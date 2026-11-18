@@ -740,11 +740,18 @@ values, matching counters.
   author 256, total ≤ 6000. The color range 0..=0xFFFFFF is an
   app decision (docs say only "integer"). Embeds send via both
   transports; empty content is allowed with an embed.
-- **Language (Q9).** Vietnamese (default) + English, switched
-  instantly from Settings. Coverage is the core UI (navigation,
-  titles, section titles, common buttons); body copy and status
-  messages stay Vietnamese until their keys are added
-  (incremental — see `src/i18n.rs`).
+- **Language.** Vietnamese-only UI (2026-11-18 sweep): every
+  user-visible string — keyed strings, hardcoded labels, status
+  messages, validation errors, tray menu — is Vietnamese, with
+  one consistent glossary (Tổng quan / Soạn kịch bản / Đích đến
+  / Lịch sử / Cài đặt). The old English path and the Settings
+  language selector were removed; `src/i18n.rs` keeps only the
+  `Vi` variant (old configs with a `language` field still parse).
+  Internal identifiers (DB status values, taxonomy prefixes
+  `skip:`/`defer:`, JSON keys) stay English by design; product
+  terms (Webhook, Embed, Slash, Cron) are kept as-is. A guard
+  test (`no_keyed_string_is_english`) fails the build if a
+  keyed string regresses to English.
 - **Emoji picker (Q10).** Offline grid (same characters as the
   preview shortcode table) inserts the real Unicode character,
   plus custom emoji markup paste (`<:name:id>`). Custom emoji
@@ -1206,11 +1213,9 @@ the defang exactly as before.
   a detail card above the list: the full detail text (selectable,
   secret-scrubbed on display) plus message id, destination id,
   and channel id. Esc closes it. Session-only state.
-- **i18n.** The new Group 1/3 strings are keyed in both
-  languages. Pre-existing section titles and body copy remain
-  Vietnamese-only: completing them is incremental work (add a
-  key, then use `t()` at the call site), deliberately not
-  churned in this batch.
+- **i18n.** (Historical: this batch keyed its strings in both
+  languages when the UI was dual-language. The 2026-11-18
+  Vietnamese-only sweep removed the English path entirely.)
 
 ## Seeing the future (Group 1)
 

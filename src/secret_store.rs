@@ -123,10 +123,10 @@ fn on_keyring_thread_with_timeout<T: Send + 'static>(
     });
     rx.recv_timeout(timeout).map_err(|e| match e {
         std::sync::mpsc::RecvTimeoutError::Timeout => {
-            "OS keyring operation timed out (the platform store did not respond)".to_string()
+            "thao tác khóa hệ thống hết thời gian (kho lưu trữ nền tảng không phản hồi)".to_string()
         }
         std::sync::mpsc::RecvTimeoutError::Disconnected => {
-            "OS keyring operation failed (worker thread panicked)".to_string()
+            "thao tác khóa hệ thống thất bại (luồng phụ gặp lỗi)".to_string()
         }
     })
 }
@@ -175,11 +175,11 @@ pub fn load_secret(stored: &str) -> Result<String, String> {
 pub fn load_secret_with(stored: &str, kr: &dyn Keyring) -> Result<String, String> {
     if let Some(entry) = stored.strip_prefix(KEYRING_PREFIX) {
         if entry.is_empty() {
-            return Err("invalid keyring reference".to_string());
+            return Err("tham chiếu khóa không hợp lệ".to_string());
         }
         return kr
             .get(entry)
-            .map_err(|e| format!("cannot read secret from the OS keyring: {e}"));
+            .map_err(|e| format!("không đọc được secret từ khóa hệ thống: {e}"));
     }
     decrypt_token(stored)
 }
@@ -204,9 +204,7 @@ pub fn store_secret_with(entry: &str, plaintext: &str, kr: &dyn Keyring) -> Resu
         match kr.set(entry, plaintext) {
             Ok(()) => return Ok(format!("{KEYRING_PREFIX}{entry}")),
             Err(e) => {
-                tracing::warn!(
-                    "keyring write failed ({e}); falling back to machine-encrypted storage"
-                );
+                tracing::warn!("ghi khóa thất bại ({e}); dùng bộ nhớ mã hóa theo máy thay thế");
             }
         }
     }
@@ -336,7 +334,7 @@ mod tests {
             std::time::Duration::from_millis(50),
         );
         let err = r.unwrap_err();
-        assert!(err.contains("timed out"), "{err}");
+        assert!(err.contains("hết thời gian"), "{err}");
     }
 
     #[test]
@@ -344,7 +342,7 @@ mod tests {
         let r =
             on_keyring_thread_with_timeout(|| panic!("boom"), std::time::Duration::from_secs(5));
         let err = r.unwrap_err();
-        assert!(err.contains("panicked"), "{err}");
+        assert!(err.contains("luồng phụ"), "{err}");
     }
 
     #[test]
@@ -388,7 +386,7 @@ mod tests {
     fn keyring_reference_fails_closed_when_unavailable_or_missing() {
         let kr = MockKeyring::new(false);
         let err = load_secret_with("kr:account-token", &kr).unwrap_err();
-        assert!(err.contains("OS keyring"), "{err}");
+        assert!(err.contains("khóa hệ thống"), "{err}");
         let kr = MockKeyring::new(true);
         let err = load_secret_with("kr:account-token", &kr).unwrap_err();
         assert!(err.contains("No matching credential"), "{err}");

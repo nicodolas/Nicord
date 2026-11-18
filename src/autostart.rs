@@ -22,12 +22,13 @@ pub fn set_enabled(enabled: bool) -> Result<(), String> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let (run, _) = hkcu
         .create_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Run")
-        .map_err(|e| format!("cannot open Run key: {e}"))?;
+        .map_err(|e| format!("không mở được khóa Run: {e}"))?;
     if enabled {
-        let exe = std::env::current_exe().map_err(|e| format!("cannot find exe path: {e}"))?;
+        let exe =
+            std::env::current_exe().map_err(|e| format!("không tìm được đường dẫn exe: {e}"))?;
         let value = format!("\"{}\"", exe.display());
         run.set_value("Nicord", &value)
-            .map_err(|e| format!("cannot write Run key: {e}"))?;
+            .map_err(|e| format!("không ghi được khóa Run: {e}"))?;
     } else {
         // Deleting a missing value is not an error.
         let _ = run.delete_value("Nicord");
@@ -42,9 +43,10 @@ pub fn is_enabled() -> bool {
 
 #[cfg(target_os = "linux")]
 pub fn set_enabled(enabled: bool) -> Result<(), String> {
-    let path = autostart_file().ok_or_else(|| "cannot find autostart dir".to_string())?;
+    let path = autostart_file().ok_or_else(|| "không tìm được thư mục autostart".to_string())?;
     if enabled {
-        let exe = std::env::current_exe().map_err(|e| format!("cannot find exe path: {e}"))?;
+        let exe =
+            std::env::current_exe().map_err(|e| format!("không tìm được đường dẫn exe: {e}"))?;
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
@@ -76,7 +78,7 @@ pub fn is_enabled() -> bool {
 
 #[cfg(not(any(target_os = "windows", target_os = "linux")))]
 pub fn set_enabled(_enabled: bool) -> Result<(), String> {
-    Err("autostart is not supported on this platform".into())
+    Err("nền tảng này không hỗ trợ tự khởi động".into())
 }
 
 #[cfg(test)]

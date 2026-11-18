@@ -254,12 +254,12 @@ impl std::fmt::Display for DiscordError {
                 global,
             } => write!(
                 f,
-                "rate limited (429), retry after {}s, global={}",
+                "bị giới hạn (429), thử lại sau {}s, toàn cục={}",
                 retry_after_secs, global
             ),
-            DiscordError::Unauthorized(m) => write!(f, "unauthorized (401): {m}"),
-            DiscordError::Forbidden(m) => write!(f, "forbidden (403): {m}"),
-            DiscordError::NotFound(m) => write!(f, "not found (404): {m}"),
+            DiscordError::Unauthorized(m) => write!(f, "không có quyền (401): {m}"),
+            DiscordError::Forbidden(m) => write!(f, "bị cấm (403): {m}"),
+            DiscordError::NotFound(m) => write!(f, "không tìm thấy (404): {m}"),
             DiscordError::Other(m) => write!(f, "{m}"),
         }
     }
@@ -321,12 +321,12 @@ impl DiscordClient {
             .header("Authorization", self.auth_header())
             .send()
             .await
-            .map_err(|e| reqwest_error("network error", e))?;
+            .map_err(|e| reqwest_error("lỗi mạng", e))?;
         match resp.status() {
             StatusCode::OK => resp
                 .json()
                 .await
-                .map_err(|e| reqwest_error("bad channel response", e)),
+                .map_err(|e| reqwest_error("phản hồi kênh không hợp lệ", e)),
             s => Err(self.status_error(s, resp).await),
         }
     }
@@ -351,13 +351,13 @@ impl DiscordClient {
             .header("Authorization", self.auth_header())
             .send()
             .await
-            .map_err(|e| reqwest_error("network error", e))?;
+            .map_err(|e| reqwest_error("lỗi mạng", e))?;
         match resp.status() {
             StatusCode::OK => {
                 let v: serde_json::Value = resp
                     .json()
                     .await
-                    .map_err(|e| reqwest_error("bad search response", e))?;
+                    .map_err(|e| reqwest_error("phản hồi tìm kiếm không hợp lệ", e))?;
                 Ok(parse_application_commands(&v))
             }
             s => Err(self.status_error(s, resp).await),
@@ -375,7 +375,7 @@ impl DiscordClient {
             .json(&payload)
             .send()
             .await
-            .map_err(|e| reqwest_error("network error", e))?;
+            .map_err(|e| reqwest_error("lỗi mạng", e))?;
         match resp.status() {
             StatusCode::NO_CONTENT | StatusCode::OK | StatusCode::CREATED => Ok(()),
             s => Err(self.status_error(s, resp).await),
@@ -411,7 +411,7 @@ impl DiscordClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| reqwest_error("network error", e))?;
+            .map_err(|e| reqwest_error("lỗi mạng", e))?;
         self.handle_response(resp).await
     }
 
@@ -450,7 +450,7 @@ impl DiscordClient {
             .multipart(form)
             .send()
             .await
-            .map_err(|e| reqwest_error("network error", e))?;
+            .map_err(|e| reqwest_error("lỗi mạng", e))?;
         self.handle_response(resp).await
     }
 
@@ -470,12 +470,12 @@ impl DiscordClient {
         let id = message_id.trim();
         if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
             return Err(DiscordError::Other(
-                "message id must be a numeric Discord snowflake".into(),
+                "id tin nhắn phải là số snowflake của Discord".into(),
             ));
         }
         if content.chars().count() > 2000 {
             return Err(DiscordError::Other(
-                "message is longer than Discord's 2000-character limit".into(),
+                "tin nhắn dài hơn giới hạn 2000 ký tự của Discord".into(),
             ));
         }
         let url = format!("{DISCORD_API}/channels/{channel_id}/messages/{id}");
@@ -497,7 +497,7 @@ impl DiscordClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| reqwest_error("network error", e))?;
+            .map_err(|e| reqwest_error("lỗi mạng", e))?;
         self.handle_response(resp).await
     }
 
@@ -511,7 +511,7 @@ impl DiscordClient {
             .header("Authorization", self.auth_header())
             .send()
             .await
-            .map_err(|e| reqwest_error("network error", e))?;
+            .map_err(|e| reqwest_error("lỗi mạng", e))?;
         match resp.status() {
             StatusCode::NO_CONTENT | StatusCode::OK => Ok(()),
             s => Err(self.status_error(s, resp).await),
@@ -531,7 +531,7 @@ impl DiscordClient {
             .header("Authorization", self.auth_header())
             .send()
             .await
-            .map_err(|e| reqwest_error("network error", e))?;
+            .map_err(|e| reqwest_error("lỗi mạng", e))?;
         match resp.status() {
             StatusCode::NO_CONTENT | StatusCode::OK => Ok(()),
             s => Err(self.status_error(s, resp).await),
@@ -545,12 +545,12 @@ impl DiscordClient {
             .header("Authorization", self.auth_header())
             .send()
             .await
-            .map_err(|e| reqwest_error("network error", e))?;
+            .map_err(|e| reqwest_error("lỗi mạng", e))?;
         match resp.status() {
             StatusCode::OK => resp
                 .json()
                 .await
-                .map_err(|e| reqwest_error("bad /users/@me response", e)),
+                .map_err(|e| reqwest_error("phản hồi /users/@me không hợp lệ", e)),
             s => Err(self.status_error(s, resp).await),
         }
     }
@@ -560,7 +560,7 @@ impl DiscordClient {
     pub async fn get_me_typed(&self) -> Result<Me, DiscordError> {
         let v = self.get_me().await?;
         serde_json::from_value(v)
-            .map_err(|e| DiscordError::Other(format!("bad /users/@me body: {e}")))
+            .map_err(|e| DiscordError::Other(format!("nội dung /users/@me không hợp lệ: {e}")))
     }
 
     #[allow(dead_code)]
@@ -571,12 +571,12 @@ impl DiscordClient {
             .header("Authorization", self.auth_header())
             .send()
             .await
-            .map_err(|e| reqwest_error("network error", e))?;
+            .map_err(|e| reqwest_error("lỗi mạng", e))?;
         match resp.status() {
             StatusCode::OK => resp
                 .json()
                 .await
-                .map_err(|e| reqwest_error("bad guilds response", e)),
+                .map_err(|e| reqwest_error("phản hồi danh sách server không hợp lệ", e)),
             s => Err(self.status_error(s, resp).await),
         }
     }
@@ -589,12 +589,12 @@ impl DiscordClient {
             .header("Authorization", self.auth_header())
             .send()
             .await
-            .map_err(|e| reqwest_error("network error", e))?;
+            .map_err(|e| reqwest_error("lỗi mạng", e))?;
         match resp.status() {
             StatusCode::OK => resp
                 .json()
                 .await
-                .map_err(|e| reqwest_error("bad channels response", e)),
+                .map_err(|e| reqwest_error("phản hồi danh sách kênh không hợp lệ", e)),
             s => Err(self.status_error(s, resp).await),
         }
     }
@@ -604,7 +604,7 @@ impl DiscordClient {
             StatusCode::OK | StatusCode::CREATED => resp
                 .json()
                 .await
-                .map_err(|e| reqwest_error("bad send response", e)),
+                .map_err(|e| reqwest_error("phản hồi gửi tin không hợp lệ", e)),
             s => Err(self.status_error(s, resp).await),
         }
     }
@@ -640,13 +640,13 @@ pub fn discord_error_from_status(status: StatusCode, body: &str) -> DiscordError
             }
         }
         StatusCode::UNAUTHORIZED => {
-            DiscordError::Unauthorized("token is invalid or expired".into())
+            DiscordError::Unauthorized("token không hợp lệ hoặc đã hết hạn".into())
         }
         StatusCode::FORBIDDEN => DiscordError::Forbidden(
-            "no permission to send in this channel (or token is restricted)".into(),
+            "không có quyền gửi trong kênh này (hoặc token bị hạn chế)".into(),
         ),
         StatusCode::NOT_FOUND => DiscordError::NotFound(
-            "the channel or webhook no longer exists (deleted or regenerated)".into(),
+            "kênh hoặc webhook không còn tồn tại (đã xóa hoặc đã tạo lại)".into(),
         ),
         _ => DiscordError::Other(format!("Discord HTTP {}: {}", status.as_u16(), body)),
     }

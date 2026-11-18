@@ -149,7 +149,7 @@ fn build_export_with_iterations(
     iterations: u32,
 ) -> Result<(ExportFile, Vec<String>), String> {
     if mode == ExportMode::Portable && passphrase.is_empty() {
-        return Err("a passphrase is required for a portable export".into());
+        return Err("cần mật khẩu cho file xuất portable".into());
     }
     let mut app_config = config.clone();
     // Secrets never live in `app_config` inside the file.
@@ -210,7 +210,7 @@ fn build_export_with_iterations(
                     &d.encrypted_url,
                     &key,
                     &mut warnings,
-                    &format!("destination '{}'", d.display_name()),
+                    &format!("đích đến '{}'", d.display_name()),
                 );
                 d.encrypted_url = re;
                 ported.push(d);
@@ -221,7 +221,7 @@ fn build_export_with_iterations(
                 // warning destination is wrong — instead, fail loudly
                 // so the user knows the export is incomplete.
                 return Err(format!(
-                    "cannot export these secrets (they may belong to another machine): {}",
+                    "không xuất được các secret này (có thể thuộc về máy khác): {}",
                     warnings.join("; ")
                 ));
             }
@@ -370,17 +370,17 @@ fn prune_auto_backups(dir: &std::path::Path, keep: usize) {
 /// Parse and validate an export file's envelope (format/version).
 /// Returns the parsed file; secret decryption happens in `apply_import`.
 pub fn parse_export(text: &str) -> Result<ExportFile, String> {
-    let file: ExportFile =
-        serde_json::from_str(text).map_err(|e| format!("not a valid Nicord export file: {e}"))?;
+    let file: ExportFile = serde_json::from_str(text)
+        .map_err(|e| format!("không phải file xuất Nicord hợp lệ: {e}"))?;
     if file.format != EXPORT_FORMAT {
         return Err(format!(
-            "unknown export format '{}' (expected '{EXPORT_FORMAT}')",
+            "định dạng xuất '{}' không rõ (cần '{EXPORT_FORMAT}')",
             file.format
         ));
     }
     if file.version != EXPORT_VERSION {
         return Err(format!(
-            "unsupported export version {} (this app reads version {EXPORT_VERSION})",
+            "phiên bản xuất {} không được hỗ trợ (app này đọc phiên bản {EXPORT_VERSION})",
             file.version
         ));
     }
@@ -448,22 +448,22 @@ fn apply_import_with(
         let secrets = file
             .secrets
             .as_ref()
-            .ok_or("portable export is missing its secrets block")?;
+            .ok_or("file xuất portable thiếu khối secret")?;
         if secrets.kdf != "pbkdf2-hmac-sha256" {
-            return Err(format!("unsupported KDF '{}'", secrets.kdf));
+            return Err(format!("KDF '{}' không được hỗ trợ", secrets.kdf));
         }
         if !(1..=2_000_000).contains(&secrets.iterations) {
             return Err(format!(
-                "unsupported KDF iteration count {}",
+                "số vòng lặp KDF {} không được hỗ trợ",
                 secrets.iterations
             ));
         }
         if passphrase.is_empty() {
-            return Err("a passphrase is required to import a portable export".into());
+            return Err("cần mật khẩu để nhập file xuất portable".into());
         }
         let salt = B64
             .decode(&secrets.salt_b64)
-            .map_err(|_| "portable export has an invalid salt".to_string())?;
+            .map_err(|_| "file xuất portable có salt không hợp lệ".to_string())?;
         Some(export_key(passphrase, &salt, secrets.iterations))
     } else {
         None
@@ -492,9 +492,9 @@ fn apply_import_with(
         }
         ExportMode::Portable => {
             let (Some(secrets), Some(key)) = (file.secrets.as_ref(), portable_key.as_ref()) else {
-                return Err("portable export is missing its secrets block".into());
+                return Err("file xuất portable thiếu khối secret".into());
             };
-            let token_plain = portable_decrypt(&secrets.token, key, "account token")?;
+            let token_plain = portable_decrypt(&secrets.token, key, "token tài khoản")?;
             if !token_plain.is_empty() {
                 pending_secrets.push((
                     ENTRY_ACCOUNT_TOKEN.to_string(),
@@ -524,7 +524,7 @@ fn apply_import_with(
         if !seen_dest_ids.insert(d.id.clone()) {
             report.destinations_skipped += 1;
             report.warnings.push(format!(
-                "Destination '{}' skipped: duplicate id in the export file.",
+                "Đích đến '{}' bị bỏ qua: id trùng trong file xuất.",
                 d.display_name()
             ));
             continue;
@@ -534,7 +534,7 @@ fn apply_import_with(
         // into the row, the plaintext waits for phase 3.
         if file.mode == ExportMode::Portable && !d.encrypted_url.trim().is_empty() {
             let Some(key) = portable_key.as_ref() else {
-                return Err("portable export is missing its secrets block".into());
+                return Err("file xuất portable thiếu khối secret".into());
             };
             match portable_decrypt(&d.encrypted_url, key, &d.display_name()) {
                 Ok(plain) => {
@@ -551,7 +551,7 @@ fn apply_import_with(
                     report.destinations_skipped += 1;
                     report
                         .warnings
-                        .push(format!("Destination '{}' skipped: {e}", d.display_name()));
+                        .push(format!("Đích đến '{}' bị bỏ qua: {e}", d.display_name()));
                     continue;
                 }
             }
@@ -564,7 +564,7 @@ fn apply_import_with(
             report.destinations_skipped += 1;
             report
                 .warnings
-                .push(format!("Destination '{}' skipped: {e}", d.display_name()));
+                .push(format!("Đích đến '{}' bị bỏ qua: {e}", d.display_name()));
             continue;
         }
         // A destination without a URL can never be enabled.
@@ -575,7 +575,7 @@ fn apply_import_with(
     }
     if imported_dests.len() > crate::destination::MAX_DESTINATIONS_HARD {
         return Err(format!(
-            "export contains {} destinations, over the hard ceiling of {}",
+            "file xuất chứa {} đích đến, vượt trần cứng {}",
             imported_dests.len(),
             crate::destination::MAX_DESTINATIONS_HARD
         ));
@@ -602,7 +602,7 @@ fn apply_import_with(
         if !seen_scenario_ids.insert(s.id.clone()) {
             report.scenarios_skipped += 1;
             report.warnings.push(format!(
-                "Scenario '{}' skipped: duplicate id in the export file.",
+                "Kịch bản '{}' bị bỏ qua: id trùng trong file xuất.",
                 s.name
             ));
             continue;
@@ -615,7 +615,7 @@ fn apply_import_with(
             report.scenarios_skipped += 1;
             report
                 .warnings
-                .push(format!("Scenario '{}' skipped: {e}", s.name));
+                .push(format!("Kịch bản '{}' bị bỏ qua: {e}", s.name));
             continue;
         }
         // Drop destination ids that were not imported (broadcast
@@ -627,7 +627,7 @@ fn apply_import_with(
         let dropped = before - s.destination_ids.len();
         if dropped > 0 {
             report.warnings.push(format!(
-                "Scenario '{}' references {dropped} destination(s) that were not imported; those were removed.",
+                "Kịch bản '{}' dùng tới {dropped} đích đến không được nhập; các đích đến đó đã bị xóa khỏi kịch bản.",
                 s.name
             ));
         }
@@ -649,7 +649,7 @@ fn apply_import_with(
             .count();
         if api_nodes > 0 {
             report.warnings.push(format!(
-                "Scenario '{}' has {api_nodes} Call API node(s): their URLs are secrets bound to the exporting machine — re-enter each URL on this machine.",
+                "Kịch bản '{}' có {api_nodes} node Call API: địa chỉ của chúng là secret gắn với máy đã xuất — nhập lại từng địa chỉ trên máy này.",
                 s.name
             ));
         }
@@ -663,12 +663,12 @@ fn apply_import_with(
         if t.name.trim().is_empty() {
             report
                 .warnings
-                .push("Template with an empty name skipped.".to_string());
+                .push("Mẫu không có tên đã bị bỏ qua.".to_string());
             continue;
         }
         if crate::preview::over_limit(&t.content) {
             report.warnings.push(format!(
-                "Template '{}' skipped: over the 2000-character limit.",
+                "Mẫu '{}' bị bỏ qua: vượt giới hạn 2000 ký tự.",
                 t.name
             ));
             continue;
@@ -698,7 +698,7 @@ fn apply_import_with(
             Ok(stored) => stored,
             Err(e) => {
                 report.warnings.push(format!(
-                    "Secret for '{entry}' kept as a machine-encrypted blob: {e}"
+                    "Secret của '{entry}' giữ nguyên dạng blob mã hóa theo máy: {e}"
                 ));
                 continue;
             }
@@ -711,7 +711,7 @@ fn apply_import_with(
                     d.encrypted_url = stored;
                     if let Err(e) = store.save_destination(d) {
                         report.warnings.push(format!(
-                            "Destination '{}' kept its machine-encrypted URL: {e}",
+                            "Đích đến '{}' giữ nguyên URL mã hóa theo máy: {e}",
                             d.display_name()
                         ));
                     }
@@ -734,7 +734,7 @@ fn portable_decrypt(blob: &str, key: &[u8; 32], what: &str) -> Result<String, St
         return Ok(String::new());
     }
     decrypt_with_key(key, blob)
-        .map_err(|_| format!("cannot decrypt {what} — wrong passphrase or corrupt export file"))
+        .map_err(|_| format!("không giải mã được {what} — sai mật khẩu hoặc file xuất bị hỏng"))
 }
 
 /// Blob form of a plaintext secret: empty stays empty, else a
@@ -764,11 +764,11 @@ pub fn read_import_file(path: &std::path::Path) -> Result<String, String> {
         .map_err(|e| e.to_string())?;
     if buf.len() > MAX_IMPORT_BYTES {
         return Err(format!(
-            "import file is larger than the {} MiB limit",
+            "file nhập lớn hơn giới hạn {} MiB",
             MAX_IMPORT_BYTES / (1024 * 1024)
         ));
     }
-    String::from_utf8(buf).map_err(|_| "import file is not valid UTF-8".to_string())
+    String::from_utf8(buf).map_err(|_| "file nhập không phải UTF-8 hợp lệ".to_string())
 }
 
 #[cfg(test)]
@@ -891,7 +891,7 @@ mod tests {
         }
         assert_eq!(file.destinations.len(), 21);
         let err = apply_import_with(&store, &file, "correct horse", &kr).unwrap_err();
-        assert!(err.contains("hard ceiling"), "unexpected error: {err}");
+        assert!(err.contains("trần cứng"), "unexpected error: {err}");
         // Keyring untouched.
         assert_eq!(kr.get(ENTRY_ACCOUNT_TOKEN).unwrap(), "OLD-TOKEN");
         assert_eq!(kr.get(ENTRY_LEGACY_WEBHOOK).unwrap(), "OLD-URL");
@@ -975,7 +975,10 @@ mod tests {
         let loaded = store.load_scenarios().unwrap();
         assert_eq!(loaded.len(), 1);
         assert!(loaded[0].destination_ids.is_empty());
-        assert!(report.warnings.iter().any(|w| w.contains("not imported")));
+        assert!(report
+            .warnings
+            .iter()
+            .any(|w| w.contains("không được nhập")));
     }
 
     #[test]

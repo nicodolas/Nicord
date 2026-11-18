@@ -76,35 +76,35 @@ pub fn json_value_to_string(value: &serde_json::Value) -> String {
 pub fn parse_api_url(raw: &str) -> Result<String, String> {
     let s = raw.trim();
     if s.is_empty() {
-        return Err("API URL is empty".into());
+        return Err("địa chỉ API đang trống".into());
     }
     if s.len() > 2048 {
-        return Err("API URL is too long".into());
+        return Err("địa chỉ API quá dài".into());
     }
     if s.contains('#') || s.chars().any(|c| c.is_ascii_whitespace()) {
-        return Err("API URL must look like https://host/path".into());
+        return Err("địa chỉ API phải có dạng https://host/path".into());
     }
     // Byte-compare the scheme (see parse_webhook_url for why
     // slicing is avoided before the match).
     let prefix_ok = s.len() >= 8 && s.as_bytes()[..8].eq_ignore_ascii_case(b"https://");
     if !prefix_ok {
-        return Err("API URL must use https://".into());
+        return Err("địa chỉ API phải dùng https://".into());
     }
     let rest = &s[8..];
     let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
     let authority = &rest[..authority_end];
     if authority.is_empty() || authority.contains('@') {
-        return Err("API URL must look like https://host/path".into());
+        return Err("địa chỉ API phải có dạng https://host/path".into());
     }
     // Split an explicit port (digits only); IPv6 literals are
     // rejected — bracketed hosts are out of scope for v1.
     let (host, port) = match authority.split_once(':') {
         Some((h, p)) => {
             if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
-                return Err("API URL port must be numeric".into());
+                return Err("cổng của địa chỉ API phải là số".into());
             }
             if p.parse::<u16>().is_err() {
-                return Err("API URL port is out of range".into());
+                return Err("cổng của địa chỉ API ngoài khoảng cho phép".into());
             }
             (h, Some(p))
         }
@@ -112,7 +112,7 @@ pub fn parse_api_url(raw: &str) -> Result<String, String> {
     };
     let _ = port;
     if host.is_empty() || host.contains('[') || host.contains(']') {
-        return Err("API URL must look like https://host/path".into());
+        return Err("địa chỉ API phải có dạng https://host/path".into());
     }
     Ok(host.to_ascii_lowercase())
 }
@@ -153,21 +153,23 @@ pub async fn fetch_api_value(
 ) -> Result<String, String> {
     let host = parse_api_url(url)?;
     if !host_allowed(&host, allowlist) {
-        return Err(format!("host '{host}' is not in the API allowlist"));
+        return Err(format!(
+            "host '{host}' không nằm trong danh sách host được phép"
+        ));
     }
     let client = reqwest::Client::builder()
         .user_agent("Nicord/0.1.0 (personal use)")
         .timeout(std::time::Duration::from_secs(timeout_secs.max(1)))
         .build()
-        .map_err(|e| format!("cannot build HTTP client: {e}"))?;
+        .map_err(|e| format!("không tạo được HTTP client: {e}"))?;
     let mut resp = client
         .get(url.trim())
         .send()
         .await
-        .map_err(|e| reqwest_error("network error", e).to_string())?;
+        .map_err(|e| reqwest_error("lỗi mạng", e).to_string())?;
     let status = resp.status();
     if !status.is_success() {
-        return Err(format!("API returned HTTP {status}"));
+        return Err(format!("API trả về HTTP {status}"));
     }
     // Stream with a hard cap: a response over the cap is refused
     // as soon as it crosses it, without buffering the rest.
@@ -177,20 +179,20 @@ pub async fn fetch_api_value(
             Ok(Some(chunk)) => {
                 if buf.len() + chunk.len() > max_bytes {
                     return Err(format!(
-                        "API response is over the {} cap",
+                        "phản hồi API vượt giới hạn {}",
                         crate::scheduler::format_bytes(max_bytes as u64)
                     ));
                 }
                 buf.extend_from_slice(&chunk);
             }
             Ok(None) => break,
-            Err(e) => return Err(reqwest_error("network error", e).to_string()),
+            Err(e) => return Err(reqwest_error("lỗi mạng", e).to_string()),
         }
     }
-    let doc: serde_json::Value =
-        serde_json::from_slice(&buf).map_err(|_| "API response is not valid JSON".to_string())?;
+    let doc: serde_json::Value = serde_json::from_slice(&buf)
+        .map_err(|_| "phản hồi API không phải JSON hợp lệ".to_string())?;
     let value = extract_json_path(&doc, field_path)
-        .ok_or_else(|| format!("field '{field_path}' was not found in the API response"))?;
+        .ok_or_else(|| format!("không tìm thấy trường '{field_path}' trong phản hồi API"))?;
     Ok(json_value_to_string(value))
 }
 

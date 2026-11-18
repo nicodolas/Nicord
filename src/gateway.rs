@@ -111,8 +111,8 @@ impl Gateway {
         let deadline = Instant::now() + timeout;
         let (mut ws, _) = tokio::time::timeout(timeout, connect_async(GATEWAY_URL))
             .await
-            .map_err(|_| DiscordError::Other("gateway connect timed out".into()))?
-            .map_err(|e| DiscordError::Other(format!("gateway connect failed: {e}")))?;
+            .map_err(|_| DiscordError::Other("kết nối gateway hết thời gian".into()))?
+            .map_err(|e| DiscordError::Other(format!("kết nối gateway thất bại: {e}")))?;
         let result = async {
             // Wait for HELLO, then Identify.
             let hello = read_until(&mut ws, deadline, |t| hello_interval(t).is_some()).await?;
@@ -120,14 +120,16 @@ impl Gateway {
             let payload = identify_payload(token);
             ws.send(Message::Text(payload.to_string().into()))
                 .await
-                .map_err(|e| DiscordError::Other(format!("gateway send failed: {e}")))?;
+                .map_err(|e| DiscordError::Other(format!("gửi qua gateway thất bại: {e}")))?;
             // Wait for READY, answering heartbeats on the way.
             let mut interval: Option<u64> = hello_interval(&hello);
             let mut last_beat = Instant::now();
             loop {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
-                    return Err(DiscordError::Other("gateway READY timed out".into()));
+                    return Err(DiscordError::Other(
+                        "chờ READY của gateway hết thời gian".into(),
+                    ));
                 }
                 let beat_in =
                     interval.map(|i| Duration::from_millis(i).saturating_sub(last_beat.elapsed()));
@@ -138,11 +140,11 @@ impl Gateway {
                             Ok(Some(Ok(_))) => continue,
                             Ok(Some(Err(e))) => {
                                 return Err(DiscordError::Other(format!(
-                                    "gateway read failed: {e}"
+                                    "đọc gateway thất bại: {e}"
                                 )));
                             }
                             Ok(None) => {
-                                return Err(DiscordError::Other("gateway closed".into()));
+                                return Err(DiscordError::Other("gateway đã đóng".into()));
                             }
                             Err(_) => {
                                 // Heartbeat due.
@@ -150,7 +152,9 @@ impl Gateway {
                                 ws.send(Message::Text(hb.to_string().into()))
                                     .await
                                     .map_err(|e| {
-                                        DiscordError::Other(format!("gateway send failed: {e}"))
+                                        DiscordError::Other(format!(
+                                            "gửi qua gateway thất bại: {e}"
+                                        ))
                                     })?;
                                 last_beat = Instant::now();
                                 continue;
@@ -161,13 +165,15 @@ impl Gateway {
                         Ok(Some(Ok(Message::Text(t)))) => t.to_string(),
                         Ok(Some(Ok(_))) => continue,
                         Ok(Some(Err(e))) => {
-                            return Err(DiscordError::Other(format!("gateway read failed: {e}")));
+                            return Err(DiscordError::Other(format!("đọc gateway thất bại: {e}")));
                         }
                         Ok(None) => {
-                            return Err(DiscordError::Other("gateway closed".into()));
+                            return Err(DiscordError::Other("gateway đã đóng".into()));
                         }
                         Err(_) => {
-                            return Err(DiscordError::Other("gateway READY timed out".into()));
+                            return Err(DiscordError::Other(
+                                "chờ READY của gateway hết thời gian".into(),
+                            ));
                         }
                     },
                 };
@@ -179,7 +185,7 @@ impl Gateway {
                         ws.send(Message::Text(hb.to_string().into()))
                             .await
                             .map_err(|e| {
-                                DiscordError::Other(format!("gateway send failed: {e}"))
+                                DiscordError::Other(format!("gửi qua gateway thất bại: {e}"))
                             })?;
                         last_beat = Instant::now();
                     }
@@ -313,7 +319,7 @@ where
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(DiscordError::Other("gateway wait timed out".into()));
+            return Err(DiscordError::Other("chờ gateway hết thời gian".into()));
         }
         match tokio::time::timeout(remaining, ws.next()).await {
             Ok(Some(Ok(Message::Text(t)))) => {
@@ -324,13 +330,13 @@ where
             }
             Ok(Some(Ok(_))) => continue,
             Ok(Some(Err(e))) => {
-                return Err(DiscordError::Other(format!("gateway read failed: {e}")));
+                return Err(DiscordError::Other(format!("đọc gateway thất bại: {e}")));
             }
             Ok(None) => {
-                return Err(DiscordError::Other("gateway closed".into()));
+                return Err(DiscordError::Other("gateway đã đóng".into()));
             }
             Err(_) => {
-                return Err(DiscordError::Other("gateway wait timed out".into()));
+                return Err(DiscordError::Other("chờ gateway hết thời gian".into()));
             }
         }
     }

@@ -263,7 +263,7 @@ fn try_enable_scenario(list: &mut [Scenario], i: usize, is_webhook: bool) -> Opt
         s.validate()
     };
     if let Err(e) = valid {
-        return Some(format!("Cannot enable: {e}"));
+        return Some(format!("Không bật được: {e}"));
     }
     if !is_webhook {
         // Hypothetical list with this scenario enabled: only 1
@@ -345,6 +345,20 @@ fn sender_for_config(config: &AppConfig) -> Option<MessageSender> {
 /// User-token mode: the single account sender, no destination.
 /// Empty when nothing resolves — the engine skips such scenarios
 /// instead of silently sending to a different channel.
+/// Display label for a `send_logs` status value. The stored values
+/// ("sent", "edited", "failed", "deleted") stay English — they are
+/// data, matched by the store and the filters — but the user only
+/// ever sees the Vietnamese label.
+fn log_status_label(status: &str) -> &'static str {
+    match status {
+        "sent" => "Đã gửi",
+        "edited" => "Đã sửa",
+        "failed" => "Thất bại",
+        "deleted" => "Đã xóa",
+        _ => "Tất cả trạng thái",
+    }
+}
+
 fn resolve_senders_for_scenario(
     store: &Store,
     config: &AppConfig,
@@ -603,7 +617,7 @@ impl NicordApp {
         };
         if has_enabled && can_start {
             app.start_engine();
-            app.set_status("Resumed enabled scenarios from last session.");
+            app.set_status("Đã khôi phục các kịch bản đang bật từ phiên trước.");
         }
         // Auto-update: one quiet check on startup (never on Onboarding,
         // so the dialog cannot appear before setup is done). A failed
@@ -676,15 +690,15 @@ impl NicordApp {
         }
     }
 
-    /// Create a scenario from the "New scenario name" field (or
-    /// "Untitled scenario" when it is empty), pre-selecting the
+    /// Create a scenario from the "Tên kịch bản mới" field (or
+    /// "Kịch bản chưa đặt tên" when it is empty), pre-selecting the
     /// first sendable destination in webhook mode. Shared by the
-    /// "+ New scenario" button and the Ctrl+N shortcut.
+    /// "+ Kịch bản mới" button and the Ctrl+N shortcut.
     fn create_scenario(&mut self) {
         // No scenario-count limit: the only limit is 1 distinct
         // channel, enforced when a scenario is enabled.
         let name = if self.new_scenario_name.trim().is_empty() {
-            "Untitled scenario".to_string()
+            "Kịch bản chưa đặt tên".to_string()
         } else {
             self.new_scenario_name.trim().to_string()
         };
@@ -727,13 +741,13 @@ impl NicordApp {
     /// checked destination gets the test, like a real firing).
     fn test_send(&self) {
         let Some(scenario) = self.test_send_target() else {
-            self.set_status("No scenario yet — create one first.");
+            self.set_status("Chưa có kịch bản nào — tạo một cái trước.");
             return;
         };
         let targets = resolve_senders_for_scenario(&self.store, &self.config, &scenario);
         if targets.is_empty() {
             self.set_status(
-                "No valid credential/destination for this scenario in the current send mode.",
+                "Không có thông tin đăng nhập/đích đến hợp lệ cho kịch bản này ở chế độ gửi hiện tại.",
             );
             return;
         }
@@ -744,7 +758,7 @@ impl NicordApp {
                 Ok(rt) => rt,
                 Err(e) => {
                     if let Ok(mut s) = status.lock() {
-                        *s = format!("cannot start runtime: {e}");
+                        *s = format!("không khởi động được tiến trình chạy nền: {e}");
                     }
                     return;
                 }
@@ -791,7 +805,7 @@ impl NicordApp {
                         destination
                             .as_ref()
                             .map(|d| d.display_name())
-                            .unwrap_or_else(|| "account".to_string())
+                            .unwrap_or_else(|| "tài khoản".to_string())
                     )),
                 }
             }
@@ -808,18 +822,18 @@ impl NicordApp {
                     if total == 1 {
                         match sent_ids.into_iter().next().unwrap_or_default() {
                             id if id.is_empty() => {
-                                "Test sent! (webhook, no id returned)".to_string()
+                                "Đã gửi thử! (webhook, không trả về id)".to_string()
                             }
-                            id => format!("Test sent! message id {id}"),
+                            id => format!("Đã gửi thử! id tin nhắn {id}"),
                         }
                     } else {
-                        format!("Test sent to all {total} destinations!")
+                        format!("Đã gửi thử tới tất cả {total} đích đến!")
                     }
                 } else if sent_ids.is_empty() {
-                    format!("Test failed: {}", failures.join("; "))
+                    format!("Gửi thử thất bại: {}", failures.join("; "))
                 } else {
                     format!(
-                        "Test sent to {}/{} destinations; failed: {}",
+                        "Đã gửi thử tới {}/{} đích đến; thất bại: {}",
                         sent_ids.len(),
                         total,
                         failures.join("; ")
@@ -836,7 +850,7 @@ impl NicordApp {
         let token = match load_secret(&self.config.encrypted_token) {
             Ok(t) => t,
             Err(e) => {
-                self.set_status(&format!("No valid token stored: {e}"));
+                self.set_status(&format!("Không có token hợp lệ đã lưu: {e}"));
                 return;
             }
         };
@@ -847,14 +861,14 @@ impl NicordApp {
                 Ok(rt) => rt,
                 Err(e) => {
                     if let Ok(mut s) = status.lock() {
-                        *s = format!("cannot start runtime: {e}");
+                        *s = format!("không khởi động được tiến trình chạy nền: {e}");
                     }
                     return;
                 }
             };
             let Some(client) = DiscordClient::new(&token) else {
                 if let Ok(mut s) = status.lock() {
-                    *s = "Cannot build the HTTP client (TLS/resolver init failed).".to_string();
+                    *s = "Không tạo được HTTP client (lỗi khởi tạo TLS/DNS).".to_string();
                 }
                 return;
             };
@@ -909,14 +923,14 @@ impl NicordApp {
                 Ok(rt) => rt,
                 Err(e) => {
                     if let Ok(mut s) = status.lock() {
-                        *s = format!("cannot start runtime: {e}");
+                        *s = format!("không khởi động được tiến trình chạy nền: {e}");
                     }
                     return;
                 }
             };
             let Some(client) = WebhookClient::new(parsed, "") else {
                 if let Ok(mut s) = status.lock() {
-                    *s = "Cannot build the HTTP client (TLS/resolver init failed).".to_string();
+                    *s = "Không tạo được HTTP client (lỗi khởi tạo TLS/DNS).".to_string();
                 }
                 return;
             };
@@ -1075,7 +1089,7 @@ impl NicordApp {
     fn recheck_stored_webhook(&self) {
         match load_secret(&self.config.encrypted_webhook_url) {
             Ok(url) => self.check_webhook(url),
-            Err(e) => self.set_status(&format!("No valid webhook URL stored: {e}")),
+            Err(e) => self.set_status(&format!("Không có webhook URL hợp lệ đã lưu: {e}")),
         }
     }
 
@@ -1086,27 +1100,27 @@ impl NicordApp {
     /// User-token mode only: webhooks cannot send commands.
     fn test_command(&self, i: usize, node_id: &str) {
         if self.config.send_mode == SendMode::Webhook {
-            self.set_status("Webhook mode cannot send commands.");
+            self.set_status("Chế độ Webhook không gửi được lệnh.");
             return;
         }
         let token = match load_secret(&self.config.encrypted_token) {
             Ok(t) => t,
             Err(e) => {
-                self.set_status(&format!("No valid token stored: {e}"));
+                self.set_status(&format!("Không có token hợp lệ đã lưu: {e}"));
                 return;
             }
         };
         let (scenario, name) = {
             let Ok(list) = self.scenarios.lock() else {
-                self.set_status("Cannot read scenarios.");
+                self.set_status("Không đọc được kịch bản.");
                 return;
             };
             let Some(s) = list.get(i) else {
-                self.set_status("No scenario selected.");
+                self.set_status("Chưa chọn kịch bản nào.");
                 return;
             };
             let Some(n) = s.nodes.iter().find(|n| n.id == node_id).cloned() else {
-                self.set_status("Node not found.");
+                self.set_status("Không tìm thấy node.");
                 return;
             };
             let display = CommandConfig::from_node(&n).display_name();
@@ -1122,7 +1136,7 @@ impl NicordApp {
                 Ok(rt) => rt,
                 Err(e) => {
                     if let Ok(mut s) = status.lock() {
-                        *s = format!("cannot start runtime: {e}");
+                        *s = format!("không khởi động được tiến trình chạy nền: {e}");
                     }
                     return;
                 }
@@ -1175,7 +1189,9 @@ impl NicordApp {
                 Ok(rt) => rt,
                 Err(e) => {
                     if let Ok(mut u) = shared.lock() {
-                        u.state = UpdateState::Failed(format!("cannot start runtime: {e}"));
+                        u.state = UpdateState::Failed(format!(
+                            "không khởi động được tiến trình chạy nền: {e}"
+                        ));
                     }
                     return;
                 }
@@ -1278,7 +1294,9 @@ impl NicordApp {
                 Ok(rt) => rt,
                 Err(e) => {
                     if let Ok(mut u) = shared.lock() {
-                        u.state = UpdateState::Failed(format!("cannot start runtime: {e}"));
+                        u.state = UpdateState::Failed(format!(
+                            "không khởi động được tiến trình chạy nền: {e}"
+                        ));
                         u.dialog = true;
                     }
                     return;
@@ -1414,7 +1432,7 @@ impl NicordApp {
         if self.config.tray_enabled && self.tray.is_none() {
             self.tray = crate::tray::Tray::new();
             if self.tray.is_none() {
-                self.set_status("Could not create the tray icon.");
+                self.set_status("Không tạo được biểu tượng khay.");
             }
         } else if !self.config.tray_enabled {
             self.tray = None;
@@ -1426,7 +1444,7 @@ impl NicordApp {
         // wind-down after Stop). The atomic claim in `run_loop` is the
         // correctness guard; this avoids spawning a wasted thread.
         if self.engine.is_loop_active() {
-            self.set_status("Engine is already running.");
+            self.set_status("Đang chạy rồi.");
             return;
         }
         self.engine.resume();
@@ -1457,7 +1475,7 @@ impl NicordApp {
                 engine2.run_loop(resolve_sender, scenarios_fn).await;
             });
         });
-        self.set_status("Engine started — running in background.");
+        self.set_status("Đã bắt đầu — đang chạy nền.");
     }
 
     /// Load the account's servers in a background thread (channel picker).
@@ -1465,7 +1483,7 @@ impl NicordApp {
         let token = match load_secret(&self.config.encrypted_token) {
             Ok(t) => t,
             Err(e) => {
-                self.set_status(&format!("No valid token stored: {e}"));
+                self.set_status(&format!("Không có token hợp lệ đã lưu: {e}"));
                 return;
             }
         };
@@ -1486,12 +1504,12 @@ impl NicordApp {
                         *g = list;
                     }
                     if let Ok(mut s) = status.lock() {
-                        *s = format!("Loaded {n} servers — pick one below.");
+                        *s = format!("Đã tải {n} server — chọn một cái ở dưới.");
                     }
                 }
                 Err(e) => {
                     if let Ok(mut s) = status.lock() {
-                        *s = format!("Cannot list servers: {e}");
+                        *s = format!("Không liệt kê được server: {e}");
                     }
                 }
             }
@@ -1503,7 +1521,7 @@ impl NicordApp {
         let token = match load_secret(&self.config.encrypted_token) {
             Ok(t) => t,
             Err(e) => {
-                self.set_status(&format!("No valid token stored: {e}"));
+                self.set_status(&format!("Không có token hợp lệ đã lưu: {e}"));
                 return;
             }
         };
@@ -1525,12 +1543,12 @@ impl NicordApp {
                         *c = text;
                     }
                     if let Ok(mut s) = status.lock() {
-                        *s = format!("Loaded {n} text channels — pick one below.");
+                        *s = format!("Đã tải {n} kênh chat — chọn một cái ở dưới.");
                     }
                 }
                 Err(e) => {
                     if let Ok(mut s) = status.lock() {
-                        *s = format!("Cannot list channels: {e}");
+                        *s = format!("Không liệt kê được kênh: {e}");
                     }
                 }
             }
@@ -1717,7 +1735,7 @@ impl eframe::App for NicordApp {
                     crate::tray::TrayAction::ToggleEngine => {
                         if self.engine.is_loop_active() {
                             self.engine.stop_all();
-                            self.set_status("Engine stopped.");
+                            self.set_status("Đã dừng.");
                         } else {
                             self.start_engine();
                         }
@@ -1797,7 +1815,7 @@ impl eframe::App for NicordApp {
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.label(
-                                RichText::new("1 channel • 300 messages/day • resets 00:00 UTC")
+                                RichText::new("1 kênh • 300 tin nhắn/ngày • đặt lại lúc 00:00 UTC")
                                     .small()
                                     .color(theme::palette().text_muted),
                             );
@@ -2018,7 +2036,7 @@ impl NicordApp {
             ui.label(RichText::new("•").size(22.0).color(theme::ACCENT_LIGHT));
         });
         ui.label(
-            RichText::new("Discord auto-sender")
+            RichText::new("Gửi tin nhắn Discord tự động")
                 .small()
                 .color(theme::palette().text_muted),
         );
@@ -2048,24 +2066,24 @@ impl NicordApp {
             if ui
                 .add_sized(
                     [ui.available_width(), 40.0],
-                    egui::Button::new(RichText::new("Emergency Stop").color(theme::WHITE))
+                    egui::Button::new(RichText::new("Dừng khẩn cấp").color(theme::WHITE))
                         .fill(theme::palette().danger),
                 )
                 .clicked()
             {
                 self.engine.stop_all();
-                self.set_status("EMERGENCY STOP — all queues halted.");
+                self.set_status("DỪNG KHẨN CẤP — mọi hàng đợi đã dừng.");
             }
             ui.add_space(8.0);
             theme::card_frame().show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 // The footer uses a bottom-up layout, so force the card's
-                // own contents back to top-down (otherwise "Today" would
+                // own contents back to top-down (otherwise "Hôm nay" would
                 // render at the bottom of the card).
                 ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
-                    ui.label(theme::semibold("Today", 14.0));
+                    ui.label(theme::semibold("Hôm nay", 14.0));
                     ui.label(
-                        RichText::new(format!("Sent today: {} / 300", self.sent_today)).small(),
+                        RichText::new(format!("Đã gửi hôm nay: {} / 300", self.sent_today)).small(),
                     );
                     // Hand-drawn bar: the stock ProgressBar shows a blue
                     // pill even at 0/300 (min-width fill).
@@ -2074,7 +2092,7 @@ impl NicordApp {
                         self.sent_today as f32 / 300.0,
                         &format!("{} / 300", self.sent_today),
                     );
-                    theme::muted(ui, "Resets 00:00 UTC");
+                    theme::muted(ui, "Đặt lại lúc 00:00 UTC");
                     ui.add_space(6.0);
                     let running = self
                         .engine
@@ -2093,16 +2111,16 @@ impl NicordApp {
                             theme::palette().text_muted
                         }));
                         let status = if let Some(left) = &pause_label {
-                            format!("Engine paused ({left})")
+                            format!("Tạm dừng ({left})")
                         } else if running {
-                            "Engine running".to_string()
+                            "Đang chạy".to_string()
                         } else {
-                            "Engine stopped".to_string()
+                            "Đã dừng".to_string()
                         };
                         ui.label(RichText::new(status).small());
                     });
                     let count = self.scenarios.lock().map(|l| l.len()).unwrap_or(0);
-                    theme::muted(ui, &format!("Scenarios: {count}"));
+                    theme::muted(ui, &format!("Kịch bản: {count}"));
                     // Next scheduled run across enabled scenarios — fills
                     // the card with something useful instead of dead space.
                     let next = self.scenarios.lock().map(|l| {
@@ -2112,7 +2130,7 @@ impl NicordApp {
                             .min()
                     });
                     if let Ok(Some(t)) = next {
-                        theme::muted(ui, &format!("Next run: {}", t.format("%d/%m %H:%M")));
+                        theme::muted(ui, &format!("Lần chạy tới: {}", t.format("%d/%m %H:%M")));
                     }
                 });
             });
@@ -2127,7 +2145,7 @@ impl NicordApp {
         ui.vertical_centered(|ui| {
             theme::card_frame().show(ui, |ui| {
                 ui.set_max_width(620.0);
-                ui.heading("Welcome to Nicord");
+                ui.heading("Chào mừng bạn đến với Nicord");
                 theme::muted(ui, "Gửi tin nhắn Discord tự động, theo lịch của bạn");
                 ui.add_space(10.0);
                 theme::section_title(ui, "Chọn cách gửi");
@@ -2150,7 +2168,7 @@ impl NicordApp {
                     self.show_onboarding_token(ui);
                 }
                 ui.add_space(10.0);
-                if theme::ghost_button(ui, "Skip for now -> Dashboard").clicked() {
+                if theme::ghost_button(ui, "Để sau -> Tổng quan").clicked() {
                     self.config.tos_accepted = self.tos_checked;
                     let _ = save_config(&self.config);
                     // F-GUI-1: the health card was computed at startup
@@ -2185,7 +2203,7 @@ impl NicordApp {
         ui.add(
             egui::TextEdit::singleline(&mut self.webhook_url_input)
                 .password(true)
-                .hint_text("paste your webhook URL here"),
+                .hint_text("dán webhook URL vào đây"),
         );
         ui.add_space(4.0);
         ui.horizontal(|ui| {
@@ -2196,7 +2214,7 @@ impl NicordApp {
             if theme::primary_button(ui, "Lưu webhook").clicked() {
                 let input = self.webhook_url_input.trim().to_string();
                 if input.is_empty() {
-                    self.set_status("Webhook URL is empty.");
+                    self.set_status("Webhook URL đang trống.");
                 } else {
                     match parse_webhook_url(&input) {
                         Ok(parsed) => match store_secret(ENTRY_LEGACY_WEBHOOK, &input) {
@@ -2220,12 +2238,14 @@ impl NicordApp {
                                     // startup-time token-mode warning.
                                     self.refresh_health();
                                     self.screen = Screen::Dashboard;
-                                    self.set_status("Webhook saved (encrypted, local only).");
+                                    self.set_status("Đã lưu webhook (mã hóa, chỉ trên máy này).");
                                 } else {
-                                    self.set_status("Failed to save config.");
+                                    self.set_status("Không lưu được cấu hình.");
                                 }
                             }
-                            Err(e) => self.set_status(&format!("Cannot encrypt webhook URL: {e}")),
+                            Err(e) => {
+                                self.set_status(&format!("Không mã hóa được webhook URL: {e}"))
+                            }
                         },
                         Err(e) => self.set_status(&e),
                     }
@@ -2250,32 +2270,32 @@ impl NicordApp {
         theme::danger_frame().show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.label(
-                RichText::new("WARNING — READ FIRST")
+                RichText::new("CẢNH BÁO — ĐỌC TRƯỚC")
                     .color(theme::palette().danger)
                     .text_style(egui::TextStyle::Name("SectionTitle".into())),
             );
             ui.label(
-                "Automating a normal Discord user account (self-bot) is forbidden \
-                 by Discord's Terms of Service and can result in PERMANENT account \
-                 termination. Nicord makes no guarantee you will never be banned. \
-                 Use a SPARE account, never your main account.",
+                "Tự động hóa tài khoản Discord thường (self-bot) bị cấm bởi \
+                 Điều khoản Dịch vụ của Discord và có thể dẫn tới KHÓA VĨNH VIỄN \
+                 tài khoản. Nicord không đảm bảo bạn sẽ không bao giờ bị khóa. \
+                 Hãy dùng tài khoản PHỤ, không bao giờ dùng tài khoản chính.",
             );
         });
         ui.add_space(10.0);
         ui.checkbox(
             &mut self.tos_checked,
-            "I understand the risk and accept responsibility for my own account.",
+            "Tôi hiểu rủi ro và tự chịu trách nhiệm cho tài khoản của mình.",
         );
         ui.add_space(10.0);
-        theme::section_title(ui, "Step 1 — Your Discord token");
-        ui.label("Paste once, stored encrypted locally.");
-        ui.label("Get it yourself from Discord like a developer token. Never share it with anyone — not even Nicord support.");
+        theme::section_title(ui, "Bước 1 — Token Discord của bạn");
+        ui.label("Dán một lần, lưu mã hóa trên máy.");
+        ui.label("Tự lấy từ Discord như token dành cho nhà phát triển. Không bao giờ chia sẻ với bất kỳ ai — kể cả hỗ trợ của Nicord.");
         if !self.config.token_last4.is_empty() {
             // token_last4 holds ONLY the last 4 chars (never the full token);
             // mask_token shows at most those 4, so even an old config that
             // still contains a full token can never leak it on screen.
             ui.label(format!(
-                "Token stored: {}",
+                "Token đã lưu: {}",
                 mask_token(&self.config.token_last4)
             ));
         }
@@ -2284,11 +2304,11 @@ impl NicordApp {
             ui.add(
                 egui::TextEdit::singleline(&mut self.token_input)
                     .password(true)
-                    .hint_text("paste your Discord token here"),
+                    .hint_text("dán token Discord vào đây"),
             );
-            if theme::primary_button(ui, "Save token").clicked() {
+            if theme::primary_button(ui, "Lưu token").clicked() {
                 if self.token_input.trim().is_empty() {
-                    self.set_status("Token is empty.");
+                    self.set_status("Token đang trống.");
                 } else {
                     match store_secret(ENTRY_ACCOUNT_TOKEN, self.token_input.trim()) {
                         Ok(enc) => {
@@ -2313,12 +2333,12 @@ impl NicordApp {
                                 // path — refresh before showing Dashboard.
                                 self.refresh_health();
                                 self.screen = Screen::Dashboard;
-                                self.set_status("Token saved (encrypted, local only).");
+                                self.set_status("Đã lưu token (mã hóa, chỉ trên máy này).");
                             } else {
-                                self.set_status("Failed to save config.");
+                                self.set_status("Không lưu được cấu hình.");
                             }
                         }
-                        Err(e) => self.set_status(&format!("Cannot encrypt token: {e}")),
+                        Err(e) => self.set_status(&format!("Không mã hóa được token: {e}")),
                     }
                 }
             }
@@ -2454,7 +2474,7 @@ impl NicordApp {
                                     (Screen::Destinations, "Đi tới Đích đến")
                                 }
                                 crate::health::HealthTarget::Builder => {
-                                    (Screen::Builder, "Đi tới Soạn")
+                                    (Screen::Builder, "Đi tới Soạn kịch bản")
                                 }
                                 crate::health::HealthTarget::Settings => {
                                     (Screen::Settings, "Đi tới Cài đặt")
@@ -2527,18 +2547,18 @@ impl NicordApp {
         // F-GUI-4: show the 3-error engine pause (with countdown)
         // instead of a misleading "Running".
         let engine_status = if let Some(left) = self.error_pause_label() {
-            format!("Paused ({left})")
+            format!("Tạm dừng ({left})")
         } else if running {
-            "Running".to_string()
+            "Đang chạy".to_string()
         } else {
-            "Stopped".to_string()
+            "Đã dừng".to_string()
         };
         ui.columns(3, |cols| {
-            theme::stat_card(&mut cols[0], "Scenarios", &count.to_string());
-            theme::stat_card(&mut cols[1], "Engine", &engine_status);
+            theme::stat_card(&mut cols[0], "Kịch bản", &count.to_string());
+            theme::stat_card(&mut cols[1], "Trạng thái", &engine_status);
             theme::stat_card(
                 &mut cols[2],
-                "Sent today (limit 300)",
+                "Đã gửi hôm nay (giới hạn 300)",
                 &format!("{} / 300", self.sent_today),
             );
         });
@@ -2546,23 +2566,23 @@ impl NicordApp {
         ui.columns(3, |cols| {
             theme::stat_card(
                 &mut cols[0],
-                "Success rate",
+                "Tỉ lệ thành công",
                 &success_pct
                     .map(|p| format!("{p:.0}%"))
                     .unwrap_or_else(|| "—".to_string()),
             );
             theme::stat_card(
                 &mut cols[1],
-                "Send rate",
+                "Tốc độ gửi",
                 &format!("{rate_per_min:.1}/phút"),
             );
-            theme::stat_card(&mut cols[2], "Deleted (this session)", &deleted.to_string());
+            theme::stat_card(&mut cols[2], "Đã xóa (phiên này)", &deleted.to_string());
         });
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.label(theme::dot(theme::palette().text_muted));
             ui.label(
-                RichText::new(format!("Next run: {next_text}"))
+                RichText::new(format!("Lần chạy tới: {next_text}"))
                     .small()
                     .color(theme::palette().text_muted),
             );
@@ -2595,26 +2615,26 @@ impl NicordApp {
         ui.add_space(12.0);
         // Actions.
         theme::card(ui, |ui| {
-            theme::section_title(ui, "Actions");
+            theme::section_title(ui, "Hành động");
             ui.horizontal(|ui| {
-                if theme::primary_button(ui, "Start engine").clicked() {
+                if theme::primary_button(ui, "Chạy").clicked() {
                     self.start_engine();
                 }
-                if ui.button("Stop engine").clicked() {
+                if ui.button("Dừng").clicked() {
                     self.engine.stop_all();
-                    self.set_status("Engine stopped.");
+                    self.set_status("Đã dừng.");
                 }
                 let test_label = match self.test_send_target() {
                     Some(s) => {
                         let name: String = s.name.chars().take(24).collect();
-                        format!("Test send '{name}' (sends a REAL message)")
+                        format!("Gửi thử '{name}' (gửi tin nhắn THẬT)")
                     }
-                    None => "Test send (sends a REAL message)".to_string(),
+                    None => "Gửi thử (gửi tin nhắn THẬT)".to_string(),
                 };
                 if ui.button(test_label).clicked() {
                     self.test_send();
                 }
-                if ui.button("Minimise (engine keeps running)").clicked() {
+                if ui.button("Thu nhỏ (vẫn chạy nền)").clicked() {
                     ui.ctx()
                         .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                 }
@@ -2638,21 +2658,21 @@ impl NicordApp {
                     match result {
                         Ok(()) => {
                             restrict_permissions(&path);
-                            self.set_status(&format!("Stats exported to {}", path.display()))
+                            self.set_status(&format!("Đã xuất thống kê ra {}", path.display()))
                         }
-                        Err(e) => self.set_status(&format!("Export failed: {e}")),
+                        Err(e) => self.set_status(&format!("Xuất thất bại: {e}")),
                     }
                 }
             });
             ui.add_space(6.0);
             #[cfg(target_os = "windows")]
             let tray_note = if self.config.tray_enabled {
-                "Closing the window hides Nicord to the tray — the engine keeps running. Right-click the tray icon to quit."
+                "Đóng cửa sổ sẽ ẩn Nicord xuống khay — vẫn chạy nền. Bấm chuột phải vào biểu tượng khay để thoát."
             } else {
-                "Note: enable “System tray” in Settings to hide Nicord to the tray on close. Closing the window stops the engine."
+                "Lưu ý: bật “Khay hệ thống” trong Cài đặt để ẩn Nicord xuống khay khi đóng. Đóng cửa sổ sẽ dừng việc chạy."
             };
             #[cfg(not(target_os = "windows"))]
-            let tray_note = "Note: there is no system-tray icon on this platform — keep the window open (minimised is fine). Closing the window stops the engine.";
+            let tray_note = "Lưu ý: nền tảng này không có biểu tượng khay hệ thống — hãy để cửa sổ mở (thu nhỏ cũng được). Đóng cửa sổ sẽ dừng việc chạy.";
             theme::muted(ui, tray_note);
         });
         ui.add_space(12.0);
@@ -2708,7 +2728,7 @@ impl NicordApp {
         ui.add_space(12.0);
         // Scenario list.
         theme::card(ui, |ui| {
-            theme::section_title(ui, "Scenarios");
+            theme::section_title(ui, "Kịch bản");
             let rows: Vec<(usize, String, bool, String, String)> = self
                 .scenarios
                 .lock()
@@ -2718,7 +2738,7 @@ impl NicordApp {
                         .map(|(i, s)| {
                             let next = next_runs
                                 .get(&s.id)
-                                .map(|t| format!("next {}", t.format("%Y-%m-%d %H:%M")))
+                                .map(|t| format!("tới {}", t.format("%Y-%m-%d %H:%M")))
                                 .unwrap_or_default();
                             (
                                 i,
@@ -2732,9 +2752,9 @@ impl NicordApp {
                 })
                 .unwrap_or_default();
             if rows.is_empty() {
-                ui.label("No scenarios yet. Go to Builder -> New scenario.");
+                ui.label("Chưa có kịch bản nào. Vào Soạn kịch bản → Kịch bản mới.");
                 ui.add_space(8.0);
-                if theme::primary_button(ui, "Create a scenario").clicked() {
+                if theme::primary_button(ui, "Tạo kịch bản").clicked() {
                     self.screen = Screen::Builder;
                 }
             } else {
@@ -2748,13 +2768,17 @@ impl NicordApp {
                         }));
                         ui.label(theme::semibold(name, 15.0));
                         ui.label(
-                            RichText::new(if *enabled { "enabled" } else { "disabled" })
-                                .small()
-                                .color(if *enabled {
-                                    theme::palette().success
-                                } else {
-                                    theme::palette().text_muted
-                                }),
+                            RichText::new(if *enabled {
+                                "đang bật"
+                            } else {
+                                "đang tắt"
+                            })
+                            .small()
+                            .color(if *enabled {
+                                theme::palette().success
+                            } else {
+                                theme::palette().text_muted
+                            }),
                         );
                         ui.label(
                             RichText::new(format!("{schedule}  {next}"))
@@ -2762,7 +2786,7 @@ impl NicordApp {
                                 .color(theme::palette().text_muted),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if theme::ghost_button(ui, "Edit").clicked() {
+                            if theme::ghost_button(ui, "Sửa").clicked() {
                                 edit = Some(*i);
                             }
                         });
@@ -2784,7 +2808,7 @@ impl NicordApp {
     }
 
     fn show_builder(&mut self, ui: &mut egui::Ui) {
-        ui.label("Add nodes, move them up/down, edit the selected scenario. Dry-run validates without sending.");
+        ui.label("Thêm node, di chuyển lên/xuống, sửa kịch bản đã chọn. Chạy thử chỉ kiểm tra, không gửi.");
         ui.add_space(12.0);
         // Two columns: scenario list | editor for the selected scenario.
         // The editor content scrolls, but the action bar (Validate, node
@@ -2819,7 +2843,7 @@ impl NicordApp {
                         theme::section_title(ui, t(self.lang(), "builder.editor"));
                         theme::muted(
                             ui,
-                            "Select a scenario on the left to edit it, or create a new one in the list.",
+                            "Chọn một kịch bản bên trái để sửa, hoặc tạo mới trong danh sách.",
                         );
                     });
                 }
@@ -2836,10 +2860,10 @@ impl NicordApp {
                 let field_w = (ui.available_width() - 132.0).max(100.0);
                 ui.add(
                     egui::TextEdit::singleline(&mut self.new_scenario_name)
-                        .hint_text("New scenario name")
+                        .hint_text("Tên kịch bản mới")
                         .desired_width(field_w),
                 );
-                if theme::primary_button(ui, "+ New scenario").clicked() {
+                if theme::primary_button(ui, "+ Kịch bản mới").clicked() {
                     self.create_scenario();
                 }
             });
@@ -2873,7 +2897,7 @@ impl NicordApp {
                 }
             });
             ui.add_space(8.0);
-            theme::section_title(ui, "Your scenarios");
+            theme::section_title(ui, "Kịch bản của bạn");
             let mut selected = self.selected;
             let mut to_delete: Option<usize> = None;
             let mut to_toggle: Option<usize> = None;
@@ -2889,7 +2913,7 @@ impl NicordApp {
                 let list = self.scenarios.lock().unwrap();
                 total = list.len();
                 if list.is_empty() {
-                    theme::muted(ui, "No scenarios yet — create your first one above.");
+                    theme::muted(ui, "Chưa có kịch bản nào — tạo kịch bản đầu tiên ở trên.");
                 }
                 for (i, s) in list.iter().enumerate() {
                     if scenario_matches_query(s, &query) {
@@ -2911,7 +2935,7 @@ impl NicordApp {
                             if ui
                                 .add(
                                     egui::Button::new(
-                                        RichText::new("Delete").color(theme::palette().danger),
+                                        RichText::new("Xóa").color(theme::palette().danger),
                                     )
                                     .fill(theme::palette().btn_bg),
                                 )
@@ -2920,20 +2944,17 @@ impl NicordApp {
                                 to_delete = Some(i);
                             }
                             ui.add_space(6.0);
-                            if ui
-                                .button(if s.enabled { "Disable" } else { "Enable" })
-                                .clicked()
-                            {
+                            if ui.button(if s.enabled { "Tắt" } else { "Bật" }).clicked() {
                                 to_toggle = Some(i);
                             }
                             ui.add_space(6.0);
-                            if ui.button("Clone").clicked() {
+                            if ui.button("Nhân bản").clicked() {
                                 to_clone = Some(i);
                             }
                         });
                     });
                     if !s.channel_id.is_empty() {
-                        theme::muted(ui, &format!("channel: {}", s.channel_id));
+                        theme::muted(ui, &format!("kênh: {}", s.channel_id));
                     }
                     ui.separator();
                 }
@@ -3042,7 +3063,7 @@ impl NicordApp {
                     }
                 }
                 self.selected = selected;
-                self.set_status("Scenario cloned (disabled — review it, then enable).");
+                self.set_status("Đã nhân bản kịch bản (đang tắt — kiểm tra rồi bật lại).");
             }
         });
     }
@@ -3177,24 +3198,24 @@ impl NicordApp {
                         ),
                     );
                 }
-                theme::muted(ui, "Lệnh (Send Command) không hoạt động ở chế độ Webhook.");
+                theme::muted(ui, "Lệnh (node Gửi lệnh) không hoạt động ở chế độ Webhook.");
                 ui.add_space(6.0);
             } else {
-                ui.label("Channel picker (loads your servers/channels from Discord):");
+                ui.label("Chọn kênh (tải server/kênh của bạn từ Discord):");
                 ui.horizontal(|ui| {
-                    if ui.button("Load servers").clicked() {
+                    if ui.button("Tải server").clicked() {
                         self.load_guilds();
                     }
                     let guilds = self.guilds.lock().map(|g| g.clone()).unwrap_or_default();
                     if !guilds.is_empty() {
                         let mut picked = self.picker_guild_id.clone();
-                        egui::ComboBox::from_label("Server")
+                        egui::ComboBox::from_label("Máy chủ")
                             .selected_text(
                                 guilds
                                     .iter()
                                     .find(|g| g.id == picked)
                                     .map(|g| g.name.clone())
-                                    .unwrap_or_else(|| "pick a server".to_string()),
+                                    .unwrap_or_else(|| "chọn server".to_string()),
                             )
                             .show_ui(ui, |ui| {
                                 for g in &guilds {
@@ -3211,13 +3232,13 @@ impl NicordApp {
                     let channels = self.channels.lock().map(|c| c.clone()).unwrap_or_default();
                     if !channels.is_empty() {
                         let mut picked = channel_id.clone();
-                        egui::ComboBox::from_label("Channel")
+                        egui::ComboBox::from_label("Kênh")
                             .selected_text(
                                 channels
                                     .iter()
                                     .find(|c| c.id == picked)
                                     .map(|c| format!("#{}", c.name))
-                                    .unwrap_or_else(|| "pick a channel".to_string()),
+                                    .unwrap_or_else(|| "chọn kênh".to_string()),
                             )
                             .show_ui(ui, |ui| {
                                 for c in &channels {
@@ -3235,15 +3256,14 @@ impl NicordApp {
                             });
                     }
                 });
-                ui.label("Destination channel ID (or pick above):");
+                ui.label("ID kênh đích (hoặc chọn ở trên):");
                 ui.add(
-                    egui::TextEdit::singleline(&mut channel_id)
-                        .hint_text("e.g. 123456789012345678"),
+                    egui::TextEdit::singleline(&mut channel_id).hint_text("vd: 123456789012345678"),
                 );
             } // end user-mode channel picker
-            ui.label("Messages (rotate, spin-text {a|b} supported):");
+            ui.label("Tin nhắn (xoay vòng, hỗ trợ spin-text {a|b}):");
             if messages.is_empty() {
-                theme::muted(ui, "No messages yet — add one below.");
+                theme::muted(ui, "Chưa có tin nhắn nào — thêm ở dưới.");
             }
             egui::ScrollArea::vertical()
                 .id_salt("builder_messages")
@@ -3268,7 +3288,7 @@ impl NicordApp {
                 let field_w = (ui.available_width() - 132.0).max(100.0);
                 ui.add(
                     egui::TextEdit::singleline(&mut self.new_message)
-                        .hint_text("Add a message...")
+                        .hint_text("Thêm tin nhắn...")
                         .desired_width(field_w),
                 );
                 // Over the Discord limit: the button is disabled and
@@ -3277,7 +3297,7 @@ impl NicordApp {
                 let add_clicked = ui
                     .add_enabled(
                         !self.new_message.trim().is_empty() && !too_long,
-                        egui::Button::new("+ Add message"),
+                        egui::Button::new("+ Thêm tin nhắn"),
                     )
                     .clicked();
                 if add_clicked {
@@ -3295,7 +3315,7 @@ impl NicordApp {
             ui.add_space(4.0);
             self.show_content_source(ui, i);
             ui.add_space(6.0);
-            ui.label("Nodes (in order — click a command or Call API node to edit it):");
+            ui.label("Node (theo thứ tự — bấm vào node lệnh hoặc Call API để sửa):");
             // Q1 preview: live Discord-style preview of the text
             // being composed, with a 2000-character counter.
             self.show_message_preview(ui);
@@ -3325,9 +3345,9 @@ impl NicordApp {
             }
             for (kind, id, cmd_name) in &nodes {
                 let label = if kind == &NodeKind::ActionSendCommand {
-                    format!("• {} — Lệnh: {cmd_name}", kind.group())
+                    format!("• {} — Lệnh: {cmd_name}", kind.group_label())
                 } else {
-                    format!("• {} — {}", kind.group(), kind.label())
+                    format!("• {} — {}", kind.group_label(), kind.label())
                 };
                 if ui
                     .selectable_label(self.selected_node.as_deref() == Some(id.as_str()), label)
@@ -3824,12 +3844,12 @@ impl NicordApp {
         // Write back (only when valid: schedule validates + timezone parses).
         if changed && error.is_none() {
             if timezone.parse::<chrono_tz::Tz>().is_err() {
-                self.set_status(&format!("Unknown timezone '{timezone}' — not saved."));
+                self.set_status(&format!("Múi giờ '{timezone}' không rõ — chưa lưu."));
                 return;
             }
             if let Some(sc) = &schedule {
                 if let Err(e) = sc.validate() {
-                    self.set_status(&format!("Invalid schedule — not saved: {e}"));
+                    self.set_status(&format!("Lịch không hợp lệ — chưa lưu: {e}"));
                     return;
                 }
             }
@@ -3864,9 +3884,9 @@ impl NicordApp {
                     {
                         Ok(_) => {
                             self.template_name.clear();
-                            self.set_status("Template saved.");
+                            self.set_status("Đã lưu mẫu.");
                         }
-                        Err(e) => self.set_status(&format!("Cannot save template: {e}")),
+                        Err(e) => self.set_status(&format!("Không lưu được mẫu: {e}")),
                     }
                 }
             });
@@ -3891,7 +3911,7 @@ impl NicordApp {
                                 }
                             }
                             self.save_scenarios();
-                            self.set_status("Template inserted into this scenario.");
+                            self.set_status("Đã chèn mẫu vào kịch bản này.");
                         }
                     });
                 });
@@ -4087,7 +4107,7 @@ impl NicordApp {
                 }
             }
             for (label, value) in [
-                ("Blurple", 0x5865F2u32),
+                ("Tím Discord", 0x5865F2u32),
                 ("Xanh", 0x57F287),
                 ("Đỏ", 0xED4245),
                 ("Vàng", 0xFEE75C),
@@ -4099,13 +4119,13 @@ impl NicordApp {
                 }
             }
         });
-        ui.label("Fields (tối đa 25, tên 256 / giá trị 1024):");
+        ui.label("Các trường (tối đa 25, tên 256 / giá trị 1024):");
         let mut to_remove: Option<usize> = None;
         for (idx, field) in e.fields.iter_mut().enumerate() {
             ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut field.name).hint_text("Tên field"));
+                ui.add(egui::TextEdit::singleline(&mut field.name).hint_text("Tên trường"));
                 ui.add(egui::TextEdit::singleline(&mut field.value).hint_text("Giá trị"));
-                ui.checkbox(&mut field.inline, "inline");
+                ui.checkbox(&mut field.inline, "Cùng hàng");
                 if ui.button("Xóa").clicked() {
                     to_remove = Some(idx);
                 }
@@ -4115,7 +4135,8 @@ impl NicordApp {
             e.fields.remove(idx);
             *changed = true;
         }
-        if e.fields.len() < crate::embed::EMBED_MAX_FIELDS && ui.button("+ Thêm field").clicked() {
+        if e.fields.len() < crate::embed::EMBED_MAX_FIELDS && ui.button("+ Thêm trường").clicked()
+        {
             e.fields.push(crate::embed::EmbedField::default());
             *changed = true;
         }
@@ -4145,7 +4166,7 @@ impl NicordApp {
                 ui.label(theme::semibold(&e.title, 16.0));
             }
             if !e.url.trim().is_empty() {
-                theme::muted(ui, &format!("Link: {}", e.url));
+                theme::muted(ui, &format!("Liên kết: {}", e.url));
             }
             if !e.description.trim().is_empty() {
                 ui.label(&e.description);
@@ -4528,12 +4549,12 @@ impl NicordApp {
                 );
             });
             ui.horizontal(|ui| {
-                ui.label("Version:");
+                ui.label("Phiên bản:");
                 ui.add(
                     egui::TextEdit::singleline(&mut cfg.version).hint_text("để trống để tự tìm"),
                 );
             });
-            ui.label("Tham số (options):");
+            ui.label("Tham số:");
             let mut opt_remove: Option<usize> = None;
             for (oi, opt) in cfg.options.iter_mut().enumerate() {
                 ui.horizontal(|ui| {
@@ -4580,7 +4601,7 @@ impl NicordApp {
                         .desired_width(40.0),
                 );
             });
-            ui.label("Tham số (args):");
+            ui.label("Tham số:");
             let mut arg_remove: Option<usize> = None;
             for (ai, arg) in cfg.args.iter_mut().enumerate() {
                 ui.horizontal(|ui| {
@@ -4688,21 +4709,21 @@ impl NicordApp {
                                 cfg.url_ref = stored;
                                 cfg.url_host = host;
                                 self.api_url_input.clear();
-                                self.set_status("API URL saved (encrypted).");
+                                self.set_status("Đã lưu địa chỉ API (mã hóa).");
                             }
                             Err(e) => {
-                                self.set_status(&format!("Could not save API URL: {e}"));
+                                self.set_status(&format!("Không lưu được địa chỉ API: {e}"));
                             }
                         }
                     }
-                    Err(e) => self.set_status(&format!("Invalid API URL: {e}")),
+                    Err(e) => self.set_status(&format!("Địa chỉ API không hợp lệ: {e}")),
                 }
             }
             if !cfg.url_ref.trim().is_empty() && ui.button("Xóa địa chỉ").clicked() {
                 delete_secret(&cfg.url_ref);
                 cfg.url_ref.clear();
                 cfg.url_host.clear();
-                self.set_status("API URL removed.");
+                self.set_status("Đã xóa địa chỉ API.");
             }
         });
         ui.horizontal(|ui| {
@@ -4768,7 +4789,7 @@ impl NicordApp {
         theme::slim_card_frame().show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal_wrapped(|ui| {
-                if theme::primary_button(ui, "Validate (dry-run)").clicked() {
+                if theme::primary_button(ui, "Kiểm tra (chạy thử)").clicked() {
                     let result = self
                         .scenarios
                         .lock()
@@ -4776,15 +4797,15 @@ impl NicordApp {
                         .and_then(|l| l.get(i).map(|s| s.validate()));
                     match result {
                         Some(Ok(())) => {
-                            self.set_status("Dry-run OK: scenario is valid, nothing was sent.")
+                            self.set_status("Chạy thử OK: kịch bản hợp lệ, chưa gửi gì.")
                         }
-                        Some(Err(e)) => self.set_status(&format!("Validation failed: {e}")),
-                        None => self.set_status("No scenario selected."),
+                        Some(Err(e)) => self.set_status(&format!("Kiểm tra thất bại: {e}")),
+                        None => self.set_status("Chưa chọn kịch bản nào."),
                     }
                 }
                 // Short labels so Validate + both node buttons fit on one
                 // row in the narrow column (no wrap = no extra height).
-                if ui.button("+ Send Message").clicked() {
+                if ui.button("+ Gửi tin nhắn").clicked() {
                     if let Ok(mut list) = self.scenarios.lock() {
                         if let Some(s) = list.get_mut(i) {
                             s.nodes.push(Node::new(NodeKind::ActionSendMessage));
@@ -4792,7 +4813,7 @@ impl NicordApp {
                     }
                     self.save_scenarios();
                 }
-                if ui.button("+ Send Command").clicked() {
+                if ui.button("+ Gửi lệnh").clicked() {
                     if let Ok(mut list) = self.scenarios.lock() {
                         if let Some(s) = list.get_mut(i) {
                             s.nodes.push(Node::new(NodeKind::ActionSendCommand));
@@ -4800,7 +4821,7 @@ impl NicordApp {
                     }
                     self.save_scenarios();
                 }
-                if ui.button("+ Wait").clicked() {
+                if ui.button("+ Chờ").clicked() {
                     if let Ok(mut list) = self.scenarios.lock() {
                         if let Some(s) = list.get_mut(i) {
                             s.nodes.push(Node::new(NodeKind::UtilityWait));
@@ -4820,10 +4841,10 @@ impl NicordApp {
             ui.add_space(4.0);
             ui.add(
                 egui::TextEdit::singleline(&mut self.import_path)
-                    .hint_text("Path to a scenario .json to import"),
+                    .hint_text("Đường dẫn tới file .json kịch bản cần nhập"),
             );
             ui.horizontal(|ui| {
-                if ui.button("Export scenario JSON").clicked() {
+                if ui.button("Xuất kịch bản (JSON)").clicked() {
                     let path = config_dir().join(format!(
                         "nicord-export-{}.json",
                         self.scenarios
@@ -4842,13 +4863,13 @@ impl NicordApp {
                     match result {
                         Some(Ok(())) => {
                             restrict_permissions(&path);
-                            self.set_status(&format!("Exported to {}", path.display()))
+                            self.set_status(&format!("Đã xuất ra {}", path.display()))
                         }
-                        Some(Err(e)) => self.set_status(&format!("Export failed: {e}")),
-                        None => self.set_status("No scenario selected."),
+                        Some(Err(e)) => self.set_status(&format!("Xuất thất bại: {e}")),
+                        None => self.set_status("Chưa chọn kịch bản nào."),
                     }
                 }
-                if ui.button("Import scenario").clicked() {
+                if ui.button("Nhập kịch bản").clicked() {
                     let path = self.import_path.trim().to_string();
                     match crate::backup::read_import_file(std::path::Path::new(&path)) {
                         Ok(text) => {
@@ -4858,7 +4879,7 @@ impl NicordApp {
                             let (scenario, warnings) = analyze_import(&text, is_webhook);
                             self.import_warnings = warnings;
                             let Some(mut imported) = scenario else {
-                                self.set_status("Import blocked — see warnings in the editor.");
+                                self.set_status("Nhập bị chặn — xem cảnh báo trong phần sửa.");
                                 return;
                             };
                             imported.id = uuid::Uuid::new_v4().to_string();
@@ -4873,7 +4894,7 @@ impl NicordApp {
                                     as_enabled.enabled = true;
                                     hypo.push(as_enabled);
                                     if let Some(v) = channels_violation(&hypo) {
-                                        self.set_status(&format!("Import blocked: {v}"));
+                                        self.set_status(&format!("Nhập bị chặn: {v}"));
                                         ok = false;
                                     }
                                 }
@@ -4886,16 +4907,16 @@ impl NicordApp {
                                 let n = self.import_warnings.len();
                                 if n == 0 {
                                     self.set_status(
-                                        "Scenario imported (disabled — enable it to run).",
+                                        "Đã nhập kịch bản (đang tắt — bật để chạy).",
                                     );
                                 } else {
                                     self.set_status(&format!(
-                                        "Scenario imported with {n} warning(s) — see editor (disabled — enable it to run)."
+                                        "Đã nhập kịch bản với {n} cảnh báo — xem trong phần sửa (đang tắt — bật để chạy)."
                                     ));
                                 }
                             }
                         }
-                        Err(e) => self.set_status(&format!("Cannot read import file: {e}")),
+                        Err(e) => self.set_status(&format!("Không đọc được file nhập: {e}")),
                     }
                 }
             });
@@ -4907,14 +4928,14 @@ impl NicordApp {
     /// bypass. The message is clearly labelled as a test.
     fn test_destination(&self, dest_id: &str) {
         let Ok(Some(dest)) = self.store.load_destination(dest_id) else {
-            self.set_status("Destination not found.");
+            self.set_status("Không tìm thấy đích đến.");
             return;
         };
         let Some(sender) = sender_for_destination(&dest) else {
-            self.set_status("Destination has no usable webhook URL yet.");
+            self.set_status("Đích đến chưa có webhook URL dùng được.");
             return;
         };
-        let mut scenario = Scenario::new("Nicord test");
+        let mut scenario = Scenario::new("Nicord gửi thử");
         scenario.messages = vec![format!(
             "Tin thử từ Nicord — đích đến '{}'. Bạn có thể xóa tin này trong Discord.",
             dest.display_name()
@@ -4928,7 +4949,7 @@ impl NicordApp {
                 Ok(rt) => rt,
                 Err(e) => {
                     if let Ok(mut s) = status.lock() {
-                        *s = format!("cannot start runtime: {e}");
+                        *s = format!("không khởi động được tiến trình chạy nền: {e}");
                     }
                     return;
                 }
@@ -4942,9 +4963,9 @@ impl NicordApp {
             }
             if let Ok(mut s) = status.lock() {
                 *s = match result {
-                    Ok(id) if id.is_empty() => "Test sent! (webhook, no id returned)".to_string(),
-                    Ok(id) => format!("Test sent! message id {id}"),
-                    Err(e) => format!("Test failed: {e}"),
+                    Ok(id) if id.is_empty() => "Đã gửi thử! (webhook, không trả về id)".to_string(),
+                    Ok(id) => format!("Đã gửi thử! id tin nhắn {id}"),
+                    Err(e) => format!("Gửi thử thất bại: {e}"),
                 };
             }
         });
@@ -4982,7 +5003,7 @@ impl NicordApp {
                         draft.paused_at = None;
                     }
                     Err(e) => {
-                        self.set_status(&format!("Cannot encrypt webhook URL: {e}"));
+                        self.set_status(&format!("Không mã hóa được webhook URL: {e}"));
                         return false;
                     }
                 },
@@ -4996,7 +5017,7 @@ impl NicordApp {
             draft.enabled = false;
         }
         if let Err(e) = draft.validate() {
-            self.set_status(&format!("Cannot save destination: {e}"));
+            self.set_status(&format!("Không lưu được đích đến: {e}"));
             return false;
         }
         draft.updated_at = Some(chrono::Utc::now().to_rfc3339());
@@ -5005,11 +5026,11 @@ impl NicordApp {
                 self.dest_selected_id = Some(draft.id.clone());
                 self.dest_draft = Some(draft);
                 self.dest_url_input.clear();
-                self.set_status("Destination saved.");
+                self.set_status("Đã lưu đích đến.");
                 true
             }
             Err(e) => {
-                self.set_status(&format!("Cannot save destination: {e}"));
+                self.set_status(&format!("Không lưu được đích đến: {e}"));
                 false
             }
         }
@@ -5104,10 +5125,10 @@ impl NicordApp {
                                             && updated.encrypted_url.trim().is_empty()
                                         {
                                             self.set_status(
-                                                "Cannot enable: destination has no webhook URL yet.",
+                                                "Không bật được: đích đến chưa có webhook URL.",
                                             );
                                         } else if let Err(e) = updated.validate() {
-                                            self.set_status(&format!("Cannot enable: {e}"));
+                                            self.set_status(&format!("Không bật được: {e}"));
                                         } else {
                                             let _ = self.store.save_destination(&updated);
                                             if self.dest_selected_id.as_deref()
@@ -5163,7 +5184,7 @@ impl NicordApp {
                     egui::TextEdit::singleline(&mut self.dest_url_input)
                         .password(true)
                         .hint_text(if draft.encrypted_url.is_empty() {
-                            "paste webhook URL here"
+                            "dán webhook URL vào đây"
                         } else {
                             "để trống để giữ URL đã lưu, dán URL mới để đổi"
                         }),
@@ -5195,7 +5216,7 @@ impl NicordApp {
                 if theme::ghost_button(ui, "Kiểm tra URL").clicked() {
                     let url = self.dest_url_input.clone();
                     if url.trim().is_empty() {
-                        self.set_status("Paste a webhook URL first.");
+                        self.set_status("Dán webhook URL trước.");
                     } else {
                         self.check_webhook(url);
                     }
@@ -5279,7 +5300,7 @@ impl NicordApp {
             ui.horizontal(|ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.dest_new_message)
-                        .hint_text("Add a default message..."),
+                        .hint_text("Thêm tin nhắn mặc định..."),
                 );
                 let too_long = over_limit(self.dest_new_message.trim());
                 if ui
@@ -5314,7 +5335,7 @@ impl NicordApp {
                     draft.failure_state = crate::destination::FailureState::Ok;
                     draft.last_error.clear();
                     draft.paused_at = None;
-                    self.set_status("Destination resumed.");
+                    self.set_status("Đã tiếp tục đích đến.");
                 }
                 theme::muted(ui, "Nếu webhook đã bị xóa trong Discord, hãy dán URL mới và kiểm tra lại thay vì chỉ tiếp tục.");
             }
@@ -5354,7 +5375,7 @@ impl NicordApp {
                             self.dest_draft = Some(copy);
                             self.dest_url_input.clear();
                             self.set_status(
-                                "Destination cloned (no URL — paste one and check it).",
+                                "Đã nhân bản đích đến (chưa có URL — dán URL và kiểm tra).",
                             );
                         }
                     }
@@ -5453,7 +5474,7 @@ impl NicordApp {
                             self.dest_delete_confirm = None;
                             self.dest_selected_id = None;
                             self.dest_draft = None;
-                            self.set_status("Destination deleted.");
+                            self.set_status("Đã xóa đích đến.");
                         }
                         if ui.button("Hủy").clicked() {
                             self.dest_delete_confirm = None;
@@ -5465,7 +5486,7 @@ impl NicordApp {
     }
 
     fn show_logs(&mut self, ui: &mut egui::Ui) {
-        ui.label("Send history (token is never logged).");
+        ui.label("Lịch sử gửi tin (token không bao giờ bị ghi lại).");
         ui.add_space(4.0);
         // Scenario names for the filter dropdown (read once per frame).
         let scenario_options: Vec<(String, String)> = self
@@ -5487,44 +5508,40 @@ impl NicordApp {
         };
         theme::card(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label("Filter:");
+                ui.label("Lọc:");
                 ui.add(
                     egui::TextEdit::singleline(&mut self.log_filter)
-                        .hint_text("keyword (name, status, detail)"),
+                        .hint_text("từ khóa (tên, trạng thái, chi tiết)"),
                 );
                 // Status filter (QoL Q4).
-                let status_label = if self.log_status_filter.is_empty() {
-                    "All statuses"
-                } else {
-                    self.log_status_filter.as_str()
-                };
+                let status_label = log_status_label(&self.log_status_filter);
                 egui::ComboBox::from_id_salt("log_status_filter")
                     .selected_text(status_label)
                     .show_ui(ui, |ui| {
                         ui.selectable_value(
                             &mut self.log_status_filter,
                             String::new(),
-                            "All statuses",
+                            "Tất cả trạng thái",
                         );
                         ui.selectable_value(
                             &mut self.log_status_filter,
                             "sent".to_string(),
-                            "sent",
+                            log_status_label("sent"),
                         );
                         ui.selectable_value(
                             &mut self.log_status_filter,
                             "edited".to_string(),
-                            "edited",
+                            log_status_label("edited"),
                         );
                         ui.selectable_value(
                             &mut self.log_status_filter,
                             "failed".to_string(),
-                            "failed",
+                            log_status_label("failed"),
                         );
                         ui.selectable_value(
                             &mut self.log_status_filter,
                             "deleted".to_string(),
-                            "deleted",
+                            log_status_label("deleted"),
                         );
                     });
                 // Scenario filter (QoL Q4).
@@ -5532,14 +5549,14 @@ impl NicordApp {
                     .iter()
                     .find(|(id, _)| *id == self.log_scenario_filter)
                     .map(|(_, name)| name.clone())
-                    .unwrap_or_else(|| "All scenarios".to_string());
+                    .unwrap_or_else(|| "Tất cả kịch bản".to_string());
                 egui::ComboBox::from_id_salt("log_scenario_filter")
                     .selected_text(scenario_label)
                     .show_ui(ui, |ui| {
                         ui.selectable_value(
                             &mut self.log_scenario_filter,
                             String::new(),
-                            "All scenarios",
+                            "Tất cả kịch bản",
                         );
                         for (id, name) in &scenario_options {
                             ui.selectable_value(&mut self.log_scenario_filter, id.clone(), name);
@@ -5553,14 +5570,14 @@ impl NicordApp {
                         .iter()
                         .find(|d| d.channel_id == self.log_channel_filter)
                         .map(|d| d.display_name())
-                        .unwrap_or_else(|| "All destinations".to_string());
+                        .unwrap_or_else(|| "Tất cả đích đến".to_string());
                     egui::ComboBox::from_id_salt("log_channel_filter")
                         .selected_text(dest_label)
                         .show_ui(ui, |ui| {
                             ui.selectable_value(
                                 &mut self.log_channel_filter,
                                 String::new(),
-                                "All destinations",
+                                "Tất cả đích đến",
                             );
                             for d in &log_dests {
                                 if !d.channel_id.is_empty() {
@@ -5573,7 +5590,7 @@ impl NicordApp {
                             }
                         });
                 }
-                if ui.button("Export logs (CSV)").clicked() {
+                if ui.button("Xuất lịch sử (CSV)").clicked() {
                     let path = config_dir().join("nicord-logs.csv");
                     let status = if self.log_status_filter.is_empty() {
                         None
@@ -5621,13 +5638,13 @@ impl NicordApp {
                     match result {
                         Ok(Ok(())) => {
                             restrict_permissions(&path);
-                            self.set_status(&format!("Logs exported to {}", path.display()))
+                            self.set_status(&format!("Đã xuất lịch sử ra {}", path.display()))
                         }
-                        Ok(Err(e)) => self.set_status(&format!("Export failed: {e}")),
-                        Err(e) => self.set_status(&format!("Cannot load logs: {e}")),
+                        Ok(Err(e)) => self.set_status(&format!("Xuất thất bại: {e}")),
+                        Err(e) => self.set_status(&format!("Không tải được lịch sử: {e}")),
                     }
                 }
-                if ui.button("Refresh").clicked() {
+                if ui.button("Làm mới").clicked() {
                     ctx_request_repaint(ui);
                 }
             });
@@ -5677,12 +5694,12 @@ impl NicordApp {
                             });
                             ui.label(format!("Thời gian: {}", row.created_at));
                             ui.label(format!("Kịch bản: {}", row.scenario_name));
-                            ui.label(format!("Trạng thái: {}", row.status));
+                            ui.label(format!("Trạng thái: {}", log_status_label(&row.status)));
                             if !row.channel_id.is_empty() {
                                 ui.label(format!("Kênh: {}", row.channel_id));
                             }
                             if !row.message_id.is_empty() {
-                                ui.label(format!("Message ID: {}", row.message_id));
+                                ui.label(format!("ID tin nhắn: {}", row.message_id));
                             }
                             if !row.destination_id.is_empty() {
                                 ui.label(format!("Đích đến: {}", row.destination_id));
@@ -5694,7 +5711,7 @@ impl NicordApp {
                 }
                 if rows.is_empty() {
                     theme::card(ui, |ui| {
-                        theme::muted(ui, "No logs yet — send history will appear here.");
+                        theme::muted(ui, "Chưa có lịch sử — lịch sử gửi sẽ hiện ở đây.");
                     });
                 } else {
                     // Destinations for manual delete (Q13): a row is
@@ -5726,7 +5743,8 @@ impl NicordApp {
                                     );
                                     ui.label(theme::semibold(&row.scenario_name, 15.0));
                                     ui.label(
-                                        RichText::new(&row.status).color(status_color),
+                                        RichText::new(log_status_label(&row.status))
+                                            .color(status_color),
                                     );
                                     if theme::ghost_button(ui, t(self.lang(), "logs.detail_btn"))
                                         .clicked()
@@ -5769,7 +5787,7 @@ impl NicordApp {
                 }
             }
             Err(e) => {
-                ui.label(format!("Cannot load logs: {e}"));
+                ui.label(format!("Không tải được lịch sử: {e}"));
             }
         }
     }
@@ -5793,7 +5811,7 @@ impl NicordApp {
             let dest = match store.load_destination(&row.destination_id) {
                 Ok(Some(d)) => d,
                 _ => {
-                    fail("Cannot delete: the destination no longer exists.".to_string());
+                    fail("Không xóa được: đích đến không còn tồn tại.".to_string());
                     return;
                 }
             };
@@ -5803,19 +5821,19 @@ impl NicordApp {
             {
                 Some(u) => u,
                 None => {
-                    fail("Cannot delete: the destination URL is unreadable.".to_string());
+                    fail("Không xóa được: không đọc được URL của đích đến.".to_string());
                     return;
                 }
             };
             let Some(client) = crate::webhook::WebhookClient::new(url, "") else {
-                fail("Cannot delete: the HTTP client could not be built.".to_string());
+                fail("Không xóa được: không tạo được HTTP client.".to_string());
                 return;
             };
             let client = client.with_thread_id(&dest.thread_id);
             let rt = match shared_runtime() {
                 Ok(rt) => rt,
                 Err(e) => {
-                    fail(format!("cannot start runtime: {e}"));
+                    fail(format!("không khởi động được tiến trình chạy nền: {e}"));
                     return;
                 }
             };
@@ -5835,22 +5853,20 @@ impl NicordApp {
             match result {
                 Ok(()) => {
                     audit(format!(
-                        "User deleted Discord message {message_id} (log #{})",
+                        "Người dùng đã xóa tin nhắn Discord {message_id} (lịch sử #{})",
                         row.id
                     ));
-                    fail(format!("Deleted message {message_id} from Discord."));
+                    fail(format!("Đã xóa tin nhắn {message_id} khỏi Discord."));
                 }
                 Err(crate::discord::DiscordError::NotFound(_)) => {
                     audit(format!(
-                        "Delete requested for message {message_id} (log #{}): already gone (404)",
+                        "Đã yêu cầu xóa tin nhắn {message_id} (lịch sử #{}): đã mất rồi (404)",
                         row.id
                     ));
-                    fail(format!(
-                        "Message {message_id} was already deleted on Discord."
-                    ));
+                    fail(format!("Tin nhắn {message_id} đã bị xóa trên Discord rồi."));
                 }
                 Err(e) => {
-                    fail(format!("Delete failed: {e}"));
+                    fail(format!("Xóa thất bại: {e}"));
                 }
             }
         });
@@ -5909,11 +5925,11 @@ impl NicordApp {
                 if mode == crate::backup::ExportMode::Portable
                     && self.backup_passphrase != self.backup_passphrase_confirm
                 {
-                    self.set_status("Passphrases do not match.");
+                    self.set_status("Hai mật khẩu không khớp.");
                 } else if mode == crate::backup::ExportMode::Portable
                     && self.backup_passphrase.len() < 8
                 {
-                    self.set_status("Passphrase must be at least 8 characters.");
+                    self.set_status("Mật khẩu phải dài ít nhất 8 ký tự.");
                 } else {
                     match crate::backup::build_export(
                         &self.store,
@@ -5940,7 +5956,7 @@ impl NicordApp {
                                     let _ = save_config(&self.config);
                                     if warnings.is_empty() {
                                         self.set_status(&format!(
-                                            "Config exported to {}",
+                                            "Đã xuất cấu hình ra {}",
                                             path.display()
                                         ));
                                     } else {
@@ -5950,7 +5966,7 @@ impl NicordApp {
                                         // are in the startup health
                                         // report.
                                         self.set_status(&format!(
-                                            "Config exported to {} — WARNING: {} unreadable row(s) skipped: {}",
+                                            "Đã xuất cấu hình ra {} — CẢNH BÁO: đã bỏ qua {} hàng không đọc được: {}",
                                             path.display(),
                                             warnings.len(),
                                             warnings[0]
@@ -5959,10 +5975,10 @@ impl NicordApp {
                                     self.backup_passphrase.clear();
                                     self.backup_passphrase_confirm.clear();
                                 }
-                                Err(e) => self.set_status(&format!("Export failed: {e}")),
+                                Err(e) => self.set_status(&format!("Xuất thất bại: {e}")),
                             }
                         }
-                        Err(e) => self.set_status(&format!("Export failed: {e}")),
+                        Err(e) => self.set_status(&format!("Xuất thất bại: {e}")),
                     }
                 }
             }
@@ -6095,7 +6111,7 @@ impl NicordApp {
             }
             theme::muted(
                 ui,
-                "Bản sao lưu nằm trong thư mục backups cạnh config.json và chỉ khôi phục được trên máy này (giống bản sao lưu trước khi import). Lưu cùng Save settings ở dưới.",
+                "Bản sao lưu nằm trong thư mục backups cạnh config.json và chỉ khôi phục được trên máy này (giống bản sao lưu trước khi import). Lưu cùng nút Lưu cài đặt ở dưới.",
             );
             if theme::primary_button(ui, backup_now_label).clicked() {
                 match crate::backup::run_auto_backup(
@@ -6134,12 +6150,12 @@ impl NicordApp {
             });
             theme::muted(
                 ui,
-                "Log cũ hơn số ngày này sẽ bị xóa khi mở app. Xóa log không ảnh hưởng lịch gửi hay thống kê hôm nay.",
+                "Lịch sử cũ hơn số ngày này sẽ bị xóa khi mở app. Xóa lịch sử không ảnh hưởng lịch gửi hay thống kê hôm nay.",
             );
             if theme::ghost_button(ui, prune_now_label).clicked() {
                 match self.store.prune_logs(self.config.log_retention_days) {
-                    Ok(0) => self.set_status("Không có log cũ cần xóa."),
-                    Ok(n) => self.set_status(&format!("Đã xóa {n} dòng log cũ.")),
+                    Ok(0) => self.set_status("Không có lịch sử cũ cần xóa."),
+                    Ok(n) => self.set_status(&format!("Đã xóa {n} dòng lịch sử cũ.")),
                     Err(e) => self.set_status(&format!("Dọn dẹp thất bại: {e}")),
                 }
             }
@@ -6152,20 +6168,20 @@ impl NicordApp {
     fn do_import(&mut self) {
         let path = self.backup_import_path.trim().to_string();
         if path.is_empty() {
-            self.set_status("Enter the import file path first.");
+            self.set_status("Nhập đường dẫn file nhập trước.");
             return;
         }
         let text = match crate::backup::read_import_file(std::path::Path::new(&path)) {
             Ok(t) => t,
             Err(e) => {
-                self.set_status(&format!("Cannot read import file: {e}"));
+                self.set_status(&format!("Không đọc được file nhập: {e}"));
                 return;
             }
         };
         let file = match crate::backup::parse_export(&text) {
             Ok(f) => f,
             Err(e) => {
-                self.set_status(&format!("Import rejected: {e}"));
+                self.set_status(&format!("Nhập bị từ chối: {e}"));
                 return;
             }
         };
@@ -6181,12 +6197,12 @@ impl NicordApp {
         ) {
             Ok(warnings) => {
                 if warnings.is_empty() {
-                    format!("Backup saved to {}.", backup_path.display())
+                    format!("Đã lưu bản sao lưu vào {}.", backup_path.display())
                 } else {
                     // The safety net itself is incomplete: say so
                     // before the replace happens.
                     format!(
-                        "Backup saved to {} — WARNING: {} unreadable row(s) were skipped from the backup.",
+                        "Đã lưu bản sao lưu vào {} — CẢNH BÁO: {} hàng không đọc được đã bị bỏ qua khỏi bản sao lưu.",
                         backup_path.display(),
                         warnings.len()
                     )
@@ -6194,7 +6210,7 @@ impl NicordApp {
             }
             Err(e) => {
                 self.set_status(&format!(
-                    "Import aborted: cannot write automatic backup ({e}). Nothing was changed."
+                    "Đã hủy nhập: không ghi được bản sao lưu tự động ({e}). Không có gì thay đổi."
                 ));
                 return;
             }
@@ -6234,7 +6250,7 @@ impl NicordApp {
                 self.dest_selected_id = None;
                 self.dest_draft = None;
                 self.set_status(&format!(
-                    "Import done: {} scenarios, {} destinations, {} templates. {backup_note}",
+                    "Nhập xong: {} kịch bản, {} đích đến, {} mẫu. {backup_note}",
                     report.scenarios_imported,
                     report.destinations_imported,
                     report.templates_imported
@@ -6242,7 +6258,7 @@ impl NicordApp {
             }
             Err(e) => {
                 self.set_status(&format!(
-                    "Import failed: {e} Nothing was changed. {backup_note}"
+                    "Nhập thất bại: {e} Không có gì thay đổi. {backup_note}"
                 ));
             }
         }
@@ -6269,7 +6285,7 @@ impl NicordApp {
                 ui,
                 "Webhook là cách chính thức của Discord: chỉ gửi tin nhắn tới 1 kênh, \
                  không gửi được lệnh, không có typing. Tài khoản (self-bot) có nguy cơ bị khóa. \
-                 Đổi chế độ không xóa thông tin đã lưu của chế độ kia. Bấm Save settings ở dưới để lưu.",
+                 Đổi chế độ không xóa thông tin đã lưu của chế độ kia. Bấm Lưu cài đặt ở dưới để lưu.",
             );
             if self.config.send_mode == SendMode::Webhook
                 && self.config.encrypted_webhook_url.is_empty()
@@ -6279,7 +6295,9 @@ impl NicordApp {
             if self.config.send_mode == SendMode::UserToken
                 && self.config.encrypted_token.is_empty()
             {
-                ui.label("Chưa có token — quay lại Onboarding để lưu token, hoặc chọn Webhook.");
+                ui.label(
+                    "Chưa có token — quay lại màn hình thiết lập để lưu token, hoặc chọn Webhook.",
+                );
             }
         });
         ui.add_space(12.0);
@@ -6334,7 +6352,7 @@ impl NicordApp {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.webhook_url_input)
                         .password(true)
-                        .hint_text("paste a new webhook URL here"),
+                        .hint_text("dán webhook URL mới vào đây"),
                 );
                 ui.horizontal(|ui| {
                     if theme::ghost_button(ui, "Kiểm tra webhook").clicked() {
@@ -6344,7 +6362,7 @@ impl NicordApp {
                     if theme::primary_button(ui, "Lưu webhook").clicked() {
                         let input = self.webhook_url_input.trim().to_string();
                         if input.is_empty() {
-                            self.set_status("Webhook URL is empty.");
+                            self.set_status("Webhook URL đang trống.");
                         } else {
                             match parse_webhook_url(&input) {
                                 Ok(parsed) => match store_secret(ENTRY_LEGACY_WEBHOOK, &input) {
@@ -6362,15 +6380,14 @@ impl NicordApp {
                                             self.upsert_destination_from_legacy();
                                             self.webhook_url_input.clear();
                                             self.set_status(
-                                                "Webhook saved (encrypted, local only).",
+                                                "Đã lưu webhook (mã hóa, chỉ trên máy này).",
                                             );
                                         } else {
-                                            self.set_status("Failed to save config.");
+                                            self.set_status("Không lưu được cấu hình.");
                                         }
                                     }
-                                    Err(e) => {
-                                        self.set_status(&format!("Cannot encrypt webhook URL: {e}"))
-                                    }
+                                    Err(e) => self
+                                        .set_status(&format!("Không mã hóa được webhook URL: {e}")),
                                 },
                                 Err(e) => self.set_status(&e),
                             }
@@ -6399,7 +6416,7 @@ impl NicordApp {
                 });
                 theme::muted(
                     ui,
-                    "Tên hiển thị và tên thân thiện được lưu cùng Save settings ở dưới.",
+                    "Tên hiển thị và tên thân thiện được lưu cùng nút Lưu cài đặt ở dưới.",
                 );
             });
             ui.add_space(12.0);
@@ -6426,7 +6443,7 @@ impl NicordApp {
                 });
                 theme::muted(
                     ui,
-                    "Lưu cùng Save settings ở dưới; áp dụng ngay cho engine đang chạy.",
+                    "Lưu cùng nút Lưu cài đặt ở dưới; áp dụng ngay mà không cần khởi động lại.",
                 );
             });
             ui.add_space(12.0);
@@ -6482,7 +6499,7 @@ impl NicordApp {
             }
             ui.checkbox(
                 &mut self.config.antiban.smart_templates,
-                "Smart Templates: Spintax {a|b} + biến thể tin nhắn ngẫu nhiên",
+                "Mẫu thông minh: Spintax {a|b} + biến thể tin nhắn ngẫu nhiên",
             );
             theme::muted(
                 ui,
@@ -6490,7 +6507,7 @@ impl NicordApp {
             );
             ui.checkbox(
                 &mut self.config.antiban.auto_typing,
-                "Auto Typing: hiện “đang gõ...” trước khi gửi",
+                "Tự gõ: hiện “đang gõ...” trước khi gửi",
             );
             ui.horizontal(|ui| {
                 ui.label("Thời gian gõ (giây):");
@@ -6508,7 +6525,7 @@ impl NicordApp {
             });
             ui.checkbox(
                 &mut self.config.antiban.auto_break,
-                "Auto Break: nghỉ dài định kỳ sau một số tin",
+                "Nghỉ tự động: nghỉ dài định kỳ sau một số tin",
             );
             ui.horizontal(|ui| {
                 ui.label("Nghỉ sau (tin):");
@@ -6540,7 +6557,7 @@ impl NicordApp {
             });
             ui.checkbox(
                 &mut self.config.antiban.auto_delete,
-                "Auto Delete: tự xóa tin sau khi gửi",
+                "Tự xóa: tự xóa tin sau khi gửi",
             );
             ui.horizontal(|ui| {
                 ui.label("Xóa sau (ms, 0 = ngay lập tức):");
@@ -6550,10 +6567,7 @@ impl NicordApp {
                         .speed(100),
                 );
             });
-            theme::muted(
-                ui,
-                "Auto Delete chỉ xóa tin Nicord vừa gửi, không xóa tin cũ.",
-            );
+            theme::muted(ui, "Tự xóa chỉ xóa tin Nicord vừa gửi, không xóa tin cũ.");
         });
         ui.add_space(12.0);
         // API host allowlist (idea #5): edited in a local draft,
@@ -6597,16 +6611,16 @@ impl NicordApp {
         });
         ui.add_space(12.0);
         theme::card(ui, |ui| {
-            theme::section_title(ui, "Limits");
-            ui.label("Limits: 1 channel • 300 messages/day (resets 00:00 UTC)");
-            ui.checkbox(&mut self.config.autostart, "Start with the computer");
+            theme::section_title(ui, "Giới hạn");
+            ui.label("Giới hạn: 1 kênh • 300 tin nhắn/ngày (đặt lại lúc 00:00 UTC)");
+            ui.checkbox(&mut self.config.autostart, "Khởi động cùng máy tính");
             #[cfg(target_os = "windows")]
             ui.checkbox(
                 &mut self.config.tray_enabled,
                 "Thu nhỏ xuống khay hệ thống khi đóng cửa sổ (X)",
             );
             #[cfg(not(target_os = "windows"))]
-            theme::muted(ui, "System tray: chỉ có trên Windows.");
+            theme::muted(ui, "Khay hệ thống: chỉ có trên Windows.");
             // Start minimized: instant toggle, saved immediately.
             // Label resolved first: the checkbox holds a &mut
             // borrow of the config while it is built.
@@ -6618,25 +6632,7 @@ impl NicordApp {
                 let _ = save_config(&self.config);
             }
             theme::muted(ui, "Khởi động cùng máy được ghi thật vào hệ thống (Windows Run / Linux autostart). Khi bật khay hệ thống, đóng cửa sổ sẽ ẩn Nicord xuống khay thay vì thoát — bấm chuột phải vào icon khay để thoát hẳn.");
-            // Language (Q9): instant switch, saved immediately.
-            ui.horizontal(|ui| {
-                ui.label(t(self.lang(), "settings.language"));
-                let mut lang = self.lang();
-                egui::ComboBox::from_id_salt("ui_language")
-                    .selected_text(match lang {
-                        Lang::Vi => "Tiếng Việt",
-                        Lang::En => "English",
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut lang, Lang::Vi, "Tiếng Việt");
-                        ui.selectable_value(&mut lang, Lang::En, "English");
-                    });
-                if lang != self.lang() {
-                    self.config.language = lang.code().to_string();
-                    let _ = save_config(&self.config);
-                    self.set_status("Language switched.");
-                }
-            });
+            // The UI is Vietnamese-only (see i18n.rs): no language switch.
             // Theme (Q12): instant switch, saved immediately.
             ui.horizontal(|ui| {
                 ui.label("Giao diện:");
@@ -6658,7 +6654,7 @@ impl NicordApp {
                         choice,
                         crate::theme::UiScale::from_code(&self.config.ui_scale),
                     );
-                    self.set_status("Theme switched.");
+                    self.set_status("Đã đổi giao diện.");
                 }
             });
             // Font size: instant switch, saved immediately.
@@ -6696,7 +6692,7 @@ impl NicordApp {
                         crate::theme::ThemeChoice::from_code(&self.config.theme),
                         scale,
                     );
-                    self.set_status("Font size switched.");
+                    self.set_status("Đã đổi cỡ chữ.");
                 }
             });
             // Notification sounds (Q11): instant toggles, saved immediately.
@@ -6738,7 +6734,7 @@ impl NicordApp {
                         .send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
                             100.0, 100.0,
                         )));
-                    self.set_status("Window size reset.");
+                    self.set_status("Đã đặt lại kích thước cửa sổ.");
                 }
                 theme::muted(
                     ui,
@@ -6775,10 +6771,10 @@ impl NicordApp {
                     .set_dest_error_limit(self.config.consecutive_error_limit);
                 // Apply the real OS autostart hook.
                 match crate::autostart::set_enabled(self.config.autostart) {
-                    Ok(()) => self.set_status("Settings saved."),
-                    Err(e) => {
-                        self.set_status(&format!("Settings saved, but autostart failed: {e}"))
-                    }
+                    Ok(()) => self.set_status("Đã lưu cài đặt."),
+                    Err(e) => self.set_status(&format!(
+                        "Đã lưu cài đặt, nhưng không bật được khởi động cùng máy: {e}"
+                    )),
                 }
                 #[cfg(target_os = "windows")]
                 self.sync_tray();
@@ -6810,11 +6806,12 @@ impl NicordApp {
         theme::danger_frame().show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.label(
-                RichText::new("Danger zone")
+                RichText::new("Vùng nguy hiểm")
                     .color(theme::palette().danger)
                     .text_style(egui::TextStyle::Name("SectionTitle".into())),
             );
-            if theme::danger_button(ui, "Delete all local data (token, scenarios)").clicked() {
+            if theme::danger_button(ui, "Xóa toàn bộ dữ liệu cục bộ (token, kịch bản)").clicked()
+            {
                 // Actually delete the scenarios too: resetting the config
                 // alone left them in the DB (and in the UI), despite the
                 // button promising to delete them.
@@ -6830,7 +6827,7 @@ impl NicordApp {
                 self.config = AppConfig::default();
                 let _ = save_config(&self.config);
                 self.screen = Screen::Onboarding;
-                self.set_status("Local data cleared.");
+                self.set_status("Đã xóa dữ liệu cục bộ.");
             }
         });
     }

@@ -73,14 +73,14 @@ impl WebhookUrl {
 pub fn parse_webhook_url(raw: &str) -> Result<WebhookUrl, String> {
     let s = raw.trim();
     if s.is_empty() {
-        return Err("webhook URL is empty".into());
+        return Err("webhook URL đang trống".into());
     }
     if s.len() > 2048 {
-        return Err("webhook URL is too long".into());
+        return Err("webhook URL quá dài".into());
     }
     if s.contains('#') || s.chars().any(|c| c.is_ascii_whitespace()) {
         return Err(
-            "webhook URL must look like https://discord.com/api/webhooks/{id}/{token}".into(),
+            "webhook URL phải có dạng https://discord.com/api/webhooks/{id}/{token}".into(),
         );
     }
     // Scheme: "https://" (case-insensitive for the scheme only; the
@@ -90,12 +90,12 @@ pub fn parse_webhook_url(raw: &str) -> Result<WebhookUrl, String> {
     // comparison is exact, and slicing at 8 is safe once it matched.
     let prefix_ok = s.len() >= 8 && s.as_bytes()[..8].eq_ignore_ascii_case(b"https://");
     if !prefix_ok {
-        return Err("webhook URL must start with https://discord.com/api/webhooks/".into());
+        return Err("webhook URL phải bắt đầu bằng https://discord.com/api/webhooks/".into());
     }
     let rest = &s[8..];
     let slash = rest
         .find('/')
-        .ok_or("webhook URL must start with https://discord.com/api/webhooks/")?;
+        .ok_or("webhook URL phải bắt đầu bằng https://discord.com/api/webhooks/")?;
     let host_raw = &rest[..slash];
     let path_and_query = &rest[slash..];
     // Reject userinfo / ports / query-in-host tricks outright.
@@ -104,11 +104,11 @@ pub fn parse_webhook_url(raw: &str) -> Result<WebhookUrl, String> {
         || host_raw.contains(':')
         || host_raw.contains('?')
     {
-        return Err("webhook URL host must be discord.com".into());
+        return Err("host của webhook URL phải là discord.com".into());
     }
     let host = host_raw.to_ascii_lowercase();
     if host != "discord.com" && host != "discordapp.com" {
-        return Err("webhook URL host must be discord.com".into());
+        return Err("host của webhook URL phải là discord.com".into());
     }
     // Path: ignore any query string (we rebuild ?wait=true ourselves).
     let path = path_and_query.split('?').next().unwrap_or("");
@@ -117,16 +117,16 @@ pub fn parse_webhook_url(raw: &str) -> Result<WebhookUrl, String> {
     // ["", "api", "webhooks", id, token]
     if parts.len() != 5 || !parts[0].is_empty() || parts[1] != "api" || parts[2] != "webhooks" {
         return Err(
-            "webhook URL must look like https://discord.com/api/webhooks/{id}/{token}".into(),
+            "webhook URL phải có dạng https://discord.com/api/webhooks/{id}/{token}".into(),
         );
     }
     let id = parts[3];
     let token = parts[4];
     if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
-        return Err("webhook ID must be numeric".into());
+        return Err("ID webhook phải là số".into());
     }
     if token.is_empty() {
-        return Err("webhook URL is missing its token".into());
+        return Err("webhook URL thiếu token".into());
     }
     let base_url = format!("https://{host}/api/webhooks/{id}/{token}");
     let execute_url = format!("{base_url}?wait=true");
@@ -251,7 +251,7 @@ impl WebhookClient {
     ) -> Result<SentMessage, DiscordError> {
         if content.chars().count() > 2000 {
             return Err(DiscordError::Other(
-                "message is longer than Discord's 2000-character limit".into(),
+                "tin nhắn dài hơn giới hạn 2000 ký tự của Discord".into(),
             ));
         }
         let body = ExecuteBody {
@@ -277,12 +277,12 @@ impl WebhookClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| reqwest_error("network error", e))?;
+            .map_err(|e| reqwest_error("lỗi mạng", e))?;
         match resp.status() {
             StatusCode::OK | StatusCode::CREATED => resp
                 .json()
                 .await
-                .map_err(|e| reqwest_error("bad webhook send response", e)),
+                .map_err(|e| reqwest_error("phản hồi gửi webhook không hợp lệ", e)),
             // 204 should not happen with ?wait=true, but handle it:
             // sent, no message id to report.
             StatusCode::NO_CONTENT => Ok(SentMessage {
@@ -309,7 +309,7 @@ impl WebhookClient {
     ) -> Result<SentMessage, DiscordError> {
         if content.chars().count() > 2000 {
             return Err(DiscordError::Other(
-                "message is longer than Discord's 2000-character limit".into(),
+                "tin nhắn dài hơn giới hạn 2000 ký tự của Discord".into(),
             ));
         }
         let body = ExecuteBody {
@@ -338,12 +338,12 @@ impl WebhookClient {
             .multipart(form)
             .send()
             .await
-            .map_err(|e| reqwest_error("network error", e))?;
+            .map_err(|e| reqwest_error("lỗi mạng", e))?;
         match resp.status() {
             StatusCode::OK | StatusCode::CREATED => resp
                 .json()
                 .await
-                .map_err(|e| reqwest_error("bad webhook send response", e)),
+                .map_err(|e| reqwest_error("phản hồi gửi webhook không hợp lệ", e)),
             StatusCode::NO_CONTENT => Ok(SentMessage {
                 id: String::new(),
                 channel_id: String::new(),
@@ -367,7 +367,7 @@ impl WebhookClient {
         let id = message_id.trim();
         if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
             return Err(DiscordError::Other(
-                "message id must be a numeric Discord snowflake".into(),
+                "id tin nhắn phải là số snowflake của Discord".into(),
             ));
         }
         let mut url = format!("{}/messages/{id}", self.url.base_url);
@@ -379,7 +379,7 @@ impl WebhookClient {
             .delete(url)
             .send()
             .await
-            .map_err(|e| reqwest_error("network error", e))?;
+            .map_err(|e| reqwest_error("lỗi mạng", e))?;
         match resp.status() {
             StatusCode::NO_CONTENT | StatusCode::OK => Ok(()),
             s => Err(discord_error_from_status(
@@ -407,12 +407,12 @@ impl WebhookClient {
         let id = message_id.trim();
         if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
             return Err(DiscordError::Other(
-                "message id must be a numeric Discord snowflake".into(),
+                "id tin nhắn phải là số snowflake của Discord".into(),
             ));
         }
         if content.chars().count() > 2000 {
             return Err(DiscordError::Other(
-                "message is longer than Discord's 2000-character limit".into(),
+                "tin nhắn dài hơn giới hạn 2000 ký tự của Discord".into(),
             ));
         }
         let mut url = format!("{}/messages/{id}", self.url.base_url);
@@ -431,12 +431,12 @@ impl WebhookClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| reqwest_error("network error", e))?;
+            .map_err(|e| reqwest_error("lỗi mạng", e))?;
         match resp.status() {
             StatusCode::OK | StatusCode::CREATED => resp
                 .json()
                 .await
-                .map_err(|e| reqwest_error("bad webhook edit response", e)),
+                .map_err(|e| reqwest_error("phản hồi sửa webhook không hợp lệ", e)),
             // 204 should not happen for edits, but handle it: the
             // edit went through, no message body to report.
             StatusCode::NO_CONTENT => Ok(SentMessage {
@@ -457,12 +457,12 @@ impl WebhookClient {
             .get(&self.url.base_url)
             .send()
             .await
-            .map_err(|e| reqwest_error("network error", e))?;
+            .map_err(|e| reqwest_error("lỗi mạng", e))?;
         match resp.status() {
             StatusCode::OK => resp
                 .json()
                 .await
-                .map_err(|e| reqwest_error("bad webhook response", e)),
+                .map_err(|e| reqwest_error("phản hồi webhook không hợp lệ", e)),
             s => Err(discord_error_from_status(
                 s,
                 &resp.text().await.unwrap_or_default(),
@@ -694,8 +694,8 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("127.0.0.1"));
-        let msg = reqwest_error("network error", err).to_string();
-        assert!(msg.contains("network error"));
+        let msg = reqwest_error("lỗi mạng", err).to_string();
+        assert!(msg.contains("lỗi mạng"));
         assert!(!msg.contains("127.0.0.1"));
         assert!(!msg.contains("nicord-test"));
     }

@@ -41,12 +41,17 @@ pub enum Schedule {
 impl Schedule {
     pub fn label(&self) -> String {
         match self {
-            Schedule::Once { at } => format!("Once at {}", at.format("%Y-%m-%d %H:%M UTC")),
-            Schedule::EveryMinutes { minutes } => format!("Every {} min", minutes),
-            Schedule::EveryHours { hours } => format!("Every {} h", hours),
-            Schedule::Daily { time } => format!("Daily at {}", time.format("%H:%M")),
+            Schedule::Once { at } => format!("Một lần lúc {}", at.format("%Y-%m-%d %H:%M UTC")),
+            Schedule::EveryMinutes { minutes } => format!("Mỗi {} phút", minutes),
+            Schedule::EveryHours { hours } => format!("Mỗi {} giờ", hours),
+            Schedule::Daily { time } => format!("Hàng ngày lúc {}", time.format("%H:%M")),
             Schedule::Weekly { weekdays, time } => {
-                format!("Weekly {:?} at {}", weekdays, time.format("%H:%M"))
+                const NAMES: [&str; 7] = ["T2", "T3", "T4", "T5", "T6", "T7", "CN"];
+                let days: Vec<&str> = weekdays
+                    .iter()
+                    .map(|d| NAMES.get(*d as usize).copied().unwrap_or("?"))
+                    .collect();
+                format!("Hàng tuần {} lúc {}", days.join(", "), time.format("%H:%M"))
             }
             Schedule::Cron { expr } => format!("Cron `{}`", expr),
         }
@@ -137,16 +142,16 @@ impl Schedule {
     pub fn validate(&self) -> Result<(), String> {
         match self {
             Schedule::EveryMinutes { minutes } if *minutes == 0 => {
-                Err("interval must be >= 1 minute".into())
+                Err("khoảng cách phải >= 1 phút".into())
             }
             Schedule::EveryHours { hours } if *hours == 0 => {
-                Err("interval must be >= 1 hour".into())
+                Err("khoảng cách phải >= 1 giờ".into())
             }
             Schedule::Weekly { weekdays, .. } => {
                 if weekdays.is_empty() {
-                    Err("weekly schedule needs at least one weekday".into())
+                    Err("lịch hàng tuần cần ít nhất một ngày trong tuần".into())
                 } else if weekdays.iter().any(|w| *w > 6) {
-                    Err("weekly weekdays must be 0 (Mon) .. 6 (Sun)".into())
+                    Err("ngày trong tuần phải là 0 (T2) .. 6 (CN)".into())
                 } else {
                     Ok(())
                 }
@@ -183,19 +188,19 @@ fn parse_cron_field(field: &str, min: u32, max: u32) -> Result<Vec<bool>, String
     for part in field.split(',') {
         let part = part.trim();
         if part.is_empty() {
-            return Err("empty cron field part".into());
+            return Err("trường cron rỗng".into());
         }
         let (range, step, has_step) = match part.split_once('/') {
             Some((r, s)) => (
                 r,
                 s.parse::<u32>()
-                    .map_err(|_| format!("bad cron step '{s}'"))?,
+                    .map_err(|_| format!("bước nhảy cron '{s}' không hợp lệ"))?,
                 true,
             ),
             None => (part, 1, false),
         };
         if step == 0 {
-            return Err("cron step must be >= 1".into());
+            return Err("bước nhảy cron phải >= 1".into());
         }
         if range == "*" {
             let mut v = min;
@@ -206,10 +211,14 @@ fn parse_cron_field(field: &str, min: u32, max: u32) -> Result<Vec<bool>, String
                 v = v.saturating_add(step);
             }
         } else if let Some((a, b)) = range.split_once('-') {
-            let lo: u32 = a.parse().map_err(|_| format!("bad cron number '{a}'"))?;
-            let hi: u32 = b.parse().map_err(|_| format!("bad cron number '{b}'"))?;
+            let lo: u32 = a
+                .parse()
+                .map_err(|_| format!("số cron '{a}' không hợp lệ"))?;
+            let hi: u32 = b
+                .parse()
+                .map_err(|_| format!("số cron '{b}' không hợp lệ"))?;
             if lo > hi || lo < min || hi > max {
-                return Err(format!("cron range {lo}-{hi} out of bounds {min}-{max}"));
+                return Err(format!("khoảng cron {lo}-{hi} ngoài giới hạn {min}-{max}"));
             }
             let mut v = lo;
             while v <= hi {
@@ -219,9 +228,9 @@ fn parse_cron_field(field: &str, min: u32, max: u32) -> Result<Vec<bool>, String
         } else {
             let v: u32 = range
                 .parse()
-                .map_err(|_| format!("bad cron number '{range}'"))?;
+                .map_err(|_| format!("số cron '{range}' không hợp lệ"))?;
             if v < min || v > max {
-                return Err(format!("cron value {v} out of bounds {min}-{max}"));
+                return Err(format!("giá trị cron {v} ngoài giới hạn {min}-{max}"));
             }
             if has_step {
                 // `a/n` means a..max step n.
@@ -242,7 +251,7 @@ pub fn parse_cron(expr: &str) -> Result<CronFields, String> {
     let parts: Vec<&str> = expr.split_whitespace().collect();
     if parts.len() != 5 {
         return Err(format!(
-            "cron expression needs exactly 5 fields (minute hour dom month dow), got {}",
+            "biểu thức cron cần đúng 5 trường (phút giờ ngày tháng thứ), nhận được {}",
             parts.len()
         ));
     }
@@ -570,27 +579,27 @@ impl NodeKind {
     }
     pub fn label(&self) -> &'static str {
         match self {
-            NodeKind::TriggerSchedule => "Trigger: Schedule *",
-            NodeKind::TriggerManual => "Trigger: Manual *",
-            NodeKind::TriggerMessageReceived => "Trigger: Message Received",
-            NodeKind::TriggerMemberJoin => "Trigger: Member Join",
-            NodeKind::ActionSendMessage => "Action: Send Message *",
-            NodeKind::ActionSendEmbed => "Action: Send Embed *",
-            NodeKind::ActionSendCommand => "Action: Send Command *",
-            NodeKind::ActionSendFile => "Action: Send File",
-            NodeKind::ActionAddReaction => "Action: Add Reaction",
-            NodeKind::ActionReply => "Action: Reply",
-            NodeKind::ActionDeleteMessage => "Action: Delete Message",
-            NodeKind::ConditionKeyword => "Condition: Keyword *",
-            NodeKind::ConditionTimeWindow => "Condition: Time Window *",
-            NodeKind::ConditionRandom => "Condition: Random %",
-            NodeKind::ConditionRole => "Condition: Role",
-            NodeKind::ConditionVariable => "Condition: Variable",
-            NodeKind::UtilityWait => "Utility: Wait *",
-            NodeKind::UtilityRandomPick => "Utility: Random Pick *",
-            NodeKind::UtilitySetVariable => "Utility: Set Variable *",
-            NodeKind::UtilityLoop => "Utility: Loop",
-            NodeKind::UtilityCallApi => "Utility: Call API",
+            NodeKind::TriggerSchedule => "Kích hoạt: Theo lịch *",
+            NodeKind::TriggerManual => "Kích hoạt: Thủ công *",
+            NodeKind::TriggerMessageReceived => "Kích hoạt: Nhận tin nhắn",
+            NodeKind::TriggerMemberJoin => "Kích hoạt: Thành viên mới",
+            NodeKind::ActionSendMessage => "Hành động: Gửi tin nhắn *",
+            NodeKind::ActionSendEmbed => "Hành động: Gửi embed *",
+            NodeKind::ActionSendCommand => "Hành động: Gửi lệnh *",
+            NodeKind::ActionSendFile => "Hành động: Gửi file",
+            NodeKind::ActionAddReaction => "Hành động: Thêm reaction",
+            NodeKind::ActionReply => "Hành động: Trả lời",
+            NodeKind::ActionDeleteMessage => "Hành động: Xóa tin nhắn",
+            NodeKind::ConditionKeyword => "Điều kiện: Từ khóa *",
+            NodeKind::ConditionTimeWindow => "Điều kiện: Khung giờ *",
+            NodeKind::ConditionRandom => "Điều kiện: Ngẫu nhiên %",
+            NodeKind::ConditionRole => "Điều kiện: Vai trò",
+            NodeKind::ConditionVariable => "Điều kiện: Biến",
+            NodeKind::UtilityWait => "Tiện ích: Chờ *",
+            NodeKind::UtilityRandomPick => "Tiện ích: Chọn ngẫu nhiên *",
+            NodeKind::UtilitySetVariable => "Tiện ích: Đặt biến *",
+            NodeKind::UtilityLoop => "Tiện ích: Lặp",
+            NodeKind::UtilityCallApi => "Tiện ích: Call API",
         }
     }
     pub fn group(&self) -> &'static str {
@@ -612,6 +621,18 @@ impl NodeKind {
             | NodeKind::ConditionRole
             | NodeKind::ConditionVariable => "Condition",
             _ => "Utility",
+        }
+    }
+
+    /// Display group for the UI (Vietnamese). `group()` stays English:
+    /// validation matches on it (`== "Trigger"`), so it is an internal
+    /// key, not a display string.
+    pub fn group_label(&self) -> &'static str {
+        match self.group() {
+            "Trigger" => "Kích hoạt",
+            "Action" => "Hành động",
+            "Condition" => "Điều kiện",
+            _ => "Tiện ích",
         }
     }
 }
@@ -807,12 +828,10 @@ impl CommandConfig {
     /// Discord 400 for a malformed payload.
     pub fn validate(&self) -> Result<(), String> {
         if self.name.trim().is_empty() {
-            return Err("Send Command node needs a command name".into());
+            return Err("Node Gửi lệnh cần tên lệnh".into());
         }
         if self.is_slash() && self.application_id.trim().is_empty() {
-            return Err(
-                "Slash command needs the bot's Application ID (paste it in the node editor)".into(),
-            );
+            return Err("Lệnh slash cần Application ID của bot (dán vào phần sửa node)".into());
         }
         // Prefix commands ignore options, so stale options on a prefix
         // config must not fail it — only slash options are checked.
@@ -821,17 +840,19 @@ impl CommandConfig {
             for opt in &self.options {
                 let name = opt.name.trim();
                 if name.is_empty() {
-                    return Err("Slash command has an option with an empty name — fill it in or remove the row".into());
+                    return Err(
+                        "Lệnh slash có tham số tên trống — điền tên hoặc xóa hàng đó".into(),
+                    );
                 }
                 if !SLASH_OPTION_KINDS.iter().any(|(k, _)| *k == opt.kind) {
                     return Err(format!(
-                        "Slash option '{name}' has unsupported type code {}",
+                        "Tham số slash '{name}' có mã loại không hỗ trợ {}",
                         opt.kind
                     ));
                 }
                 let key = name.to_lowercase();
                 if seen.contains(&key) {
-                    return Err(format!("Slash command has duplicate option name '{name}'"));
+                    return Err(format!("Lệnh slash có tên tham số trùng '{name}'"));
                 }
                 seen.push(key);
             }
@@ -918,30 +939,31 @@ impl ApiCallConfig {
     pub fn validate(&self) -> Result<(), String> {
         if self.url_ref.trim().is_empty() {
             return Err(
-                "Call API node has no URL saved — paste an https URL in the node editor".into(),
+                "Node Call API chưa có địa chỉ đã lưu — dán địa chỉ https trong phần sửa node"
+                    .into(),
             );
         }
         if !valid_counter_name(self.variable.trim()) {
-            return Err("Call API variable name must be 1–64 letters, digits, '_' or '-'".into());
+            return Err("Tên biến Call API phải dài 1–64 ký tự: chữ, số, '_' hoặc '-'".into());
         }
         let path = self.field_path.trim();
         if path.is_empty() {
-            return Err("Call API field path is empty — e.g. weather.temp".into());
+            return Err("Đường dẫn trường Call API đang trống — vd: weather.temp".into());
         }
         if path.starts_with('.')
             || path.ends_with('.')
             || path.split('.').any(|seg| seg.trim().is_empty())
         {
             return Err(format!(
-                "Call API field path '{path}' is malformed — use dot-separated names like weather.temp"
+                "Đường dẫn trường Call API '{path}' sai định dạng — dùng tên cách nhau bằng dấu chấm như weather.temp"
             ));
         }
         if self.timeout_secs < 1 || self.timeout_secs > 60 {
-            return Err("Call API timeout must be 1–60 seconds".into());
+            return Err("Thời gian chờ Call API phải là 1–60 giây".into());
         }
         let policy = self.on_failure.trim();
         if !policy.is_empty() && policy != "skip" && policy != "empty" {
-            return Err("Call API failure policy must be 'skip' or 'empty'".into());
+            return Err("Chính sách lỗi Call API phải là 'skip' hoặc 'empty'".into());
         }
         Ok(())
     }
@@ -1204,7 +1226,7 @@ impl Scenario {
             edges: vec![],
             variables: serde_json::Map::new(),
             limits: ScenarioLimits::default(),
-            messages: vec!["Hello from Nicord!".to_string()],
+            messages: vec!["Xin chào từ Nicord!".to_string()],
             last_run_at: None,
             created_at: Some(Utc::now()),
         }
@@ -1234,23 +1256,24 @@ impl Scenario {
         require_destination: bool,
     ) -> Result<(), String> {
         if self.name.trim().is_empty() {
-            return Err("scenario name is empty".into());
+            return Err("tên kịch bản đang trống".into());
         }
         // Fail-closed: an unknown timezone must not silently run in
         // UTC (tz_from_name falls back). Reject it at validation.
         if self.timezone.parse::<chrono_tz::Tz>().is_err() {
             return Err(format!(
-                "unknown timezone '{}' — use an IANA name like Asia/Ho_Chi_Minh",
+                "múi giờ '{}' không rõ — dùng tên IANA như Asia/Ho_Chi_Minh",
                 self.timezone
             ));
         }
         if require_channel && self.channel_id.trim().is_empty() {
-            return Err("no destination channel selected".into());
+            return Err("chưa chọn kênh đích".into());
         }
         if require_destination {
             if !self.destination_ids.iter().any(|id| !id.trim().is_empty()) {
                 return Err(
-                    "no destination selected — pick at least one destination in the Builder".into(),
+                    "chưa chọn đích đến — chọn ít nhất một đích đến trong phần Soạn kịch bản"
+                        .into(),
                 );
             }
             // A duplicate id would send twice to one channel. The
@@ -1264,7 +1287,7 @@ impl Scenario {
                 }
                 if seen.contains(&id) {
                     return Err(
-                        "the same destination is selected twice — pick each destination once"
+                        "cùng một đích đến được chọn hai lần — mỗi đích đến chỉ chọn một lần"
                             .into(),
                     );
                 }
@@ -1278,41 +1301,41 @@ impl Scenario {
             .count();
         if triggers != 1 {
             return Err(format!(
-                "a scenario must start with exactly one Trigger, found {}",
+                "một kịch bản phải bắt đầu với đúng một Kích hoạt, đang có {}",
                 triggers
             ));
         }
         for node in &self.nodes {
             if !node.kind.is_executed() {
                 return Err(format!(
-                    "Node '{}' is not implemented in this version — remove it \
-                     (supported: Schedule/Manual trigger, Send Message, Send Embed, \
-                     Send Command, Time Window condition, Wait, Random Pick, Set Variable, Call API)",
+                    "Node '{}' chưa được làm trong phiên bản này — hãy xóa nó \
+                     (hỗ trợ: kích hoạt Theo lịch/Thủ công, Gửi tin nhắn, Gửi embed, \
+                     Gửi lệnh, điều kiện Khung giờ, Chờ, Chọn ngẫu nhiên, Đặt biến, Call API)",
                     node.kind.label()
                 ));
             }
             if node.kind == NodeKind::ActionSendCommand {
                 if !allow_commands {
                     return Err(
-                        "webhook mode does not support Send Command nodes — use Send Message, or switch back to account mode"
+                        "chế độ Webhook không hỗ trợ node Gửi lệnh — dùng Gửi tin nhắn, hoặc chuyển lại chế độ Tài khoản"
                             .into(),
                     );
                 }
                 CommandConfig::from_node(node)
                     .validate()
-                    .map_err(|e| format!("Send Command node {}: {e}", node.id))?;
+                    .map_err(|e| format!("Node Gửi lệnh {}: {e}", node.id))?;
             }
             // Time Window nodes fail CLOSED: a present-but-unparsable
             // start/end is a validation error, never a silent
             // whole-day default (which would send at any hour).
             if node.kind == NodeKind::ConditionTimeWindow {
                 validate_time_window(node)
-                    .map_err(|e| format!("Time Window node {}: {e}", node.id))?;
+                    .map_err(|e| format!("Node Khung giờ {}: {e}", node.id))?;
             }
             if node.kind == NodeKind::UtilityCallApi {
                 ApiCallConfig::from_node(node)
                     .validate()
-                    .map_err(|e| format!("Call API node {}: {e}", node.id))?;
+                    .map_err(|e| format!("Node Call API {}: {e}", node.id))?;
             }
         }
         // Two Call API nodes feeding the same variable would make
@@ -1329,7 +1352,7 @@ impl Scenario {
                 }
                 if seen.contains(&name) {
                     return Err(format!(
-                        "two Call API nodes feed the same variable '{{{name}}}' — rename one"
+                        "hai node Call API cùng đưa vào biến '{{{name}}}' — đổi tên một cái"
                     ));
                 }
                 seen.push(name);
@@ -1347,7 +1370,7 @@ impl Scenario {
         // combination is rejected instead of silently doing nothing.
         if self.edit_last_message && has_command {
             return Err(
-                "edit-in-place mode does not apply to Send Command nodes — remove the command node or turn the mode off"
+                "chế độ sửa tin nhắn cũ không áp dụng cho node Gửi lệnh — xóa node lệnh hoặc tắt chế độ này"
                     .into(),
             );
         }
@@ -1362,7 +1385,7 @@ impl Scenario {
                     && self.poll.is_none()
                 {
                     return Err(format!(
-                        "Send Message node {} has empty content and no message list",
+                        "Node Gửi tin nhắn {} không có nội dung và không có danh sách tin nhắn",
                         node.id
                     ));
                 }
@@ -1383,14 +1406,14 @@ impl Scenario {
         // path is missing.
         if self.attachments.len() > crate::discord::MAX_ATTACHMENTS {
             return Err(format!(
-                "{} attachments, over Discord's {}-file limit",
+                "{} tệp đính kèm, vượt giới hạn {} file của Discord",
                 self.attachments.len(),
                 crate::discord::MAX_ATTACHMENTS
             ));
         }
         for (idx, path) in self.attachments.iter().enumerate() {
             if path.trim().is_empty() {
-                return Err(format!("attachment {} has an empty path", idx + 1));
+                return Err(format!("tệp đính kèm {} có đường dẫn trống", idx + 1));
             }
         }
         // Discord rejects any message over 2000 characters, so fail fast
@@ -1402,11 +1425,11 @@ impl Scenario {
             // path rejects empty content after sanitising) and count
             // toward error pauses — reject it here, once, instead.
             if msg.trim().is_empty() {
-                return Err(format!("message {} is empty", idx + 1));
+                return Err(format!("tin nhắn {} đang trống", idx + 1));
             }
             if char_count(msg) > DISCORD_CONTENT_LIMIT {
                 return Err(format!(
-                    "message {} is {} characters, over Discord's 2000-character limit",
+                    "tin nhắn {} dài {} ký tự, vượt giới hạn 2000 ký tự của Discord",
                     idx + 1,
                     char_count(msg)
                 ));
@@ -1417,7 +1440,7 @@ impl Scenario {
                 let content = node_content(node);
                 if char_count(&content) > DISCORD_CONTENT_LIMIT {
                     return Err(format!(
-                        "Send Message node {} content is {} characters, over Discord's 2000-character limit",
+                        "nội dung node Gửi tin nhắn {} dài {} ký tự, vượt giới hạn 2000 ký tự của Discord",
                         node.id,
                         char_count(&content)
                     ));
@@ -1529,7 +1552,7 @@ impl Scenario {
             };
             if !inside {
                 return Err(format!(
-                    "outside Time Window node {} ({}–{}) — skipped",
+                    "ngoài khung giờ của node Khung giờ {} ({}–{}) — bỏ qua",
                     node.id,
                     fmt_mins(start),
                     fmt_mins(end)
@@ -1588,9 +1611,9 @@ fn validate_time_window(node: &Node) -> Result<(), String> {
         if let Some(v) = node.config.get(key) {
             let s = v
                 .as_str()
-                .ok_or_else(|| format!("'{key}' must be an \"HH:MM\" string"))?;
+                .ok_or_else(|| format!("'{key}' phải là chuỗi \"HH:MM\""))?;
             if parse_hhmm(s).is_none() {
-                return Err(format!("'{key}' must be HH:MM (24h), got '{s}'"));
+                return Err(format!("'{key}' phải là HH:MM (24h), nhận được '{s}'"));
             }
         }
     }
@@ -1598,9 +1621,9 @@ fn validate_time_window(node: &Node) -> Result<(), String> {
         if let Some(v) = node.config.get(key) {
             let h = v
                 .as_u64()
-                .ok_or_else(|| format!("'{key}' must be a whole hour 0..=23"))?;
+                .ok_or_else(|| format!("'{key}' phải là số giờ nguyên 0..=23"))?;
             if h > 23 {
-                return Err(format!("'{key}' must be 0..=23, got {h}"));
+                return Err(format!("'{key}' phải là 0..=23, nhận được {h}"));
             }
         }
     }
@@ -2621,7 +2644,7 @@ mod tests {
             ..Default::default()
         }];
         let err = cfg.validate().unwrap_err();
-        assert!(err.contains("empty name"), "unexpected error: {err}");
+        assert!(err.contains("tên trống"), "unexpected error: {err}");
         // Unsupported type codes (1/2 are subcommands, 0/9 invalid).
         for bad in [0u8, 1, 2, 9, 11] {
             cfg.options = vec![SlashOption {
@@ -2631,7 +2654,7 @@ mod tests {
             }];
             let err = cfg.validate().unwrap_err();
             assert!(
-                err.contains("unsupported type"),
+                err.contains("mã loại không hỗ trợ"),
                 "kind {bad}: unexpected error: {err}"
             );
         }
@@ -2649,7 +2672,7 @@ mod tests {
             },
         ];
         let err = cfg.validate().unwrap_err();
-        assert!(err.contains("duplicate"), "unexpected error: {err}");
+        assert!(err.contains("trùng"), "unexpected error: {err}");
         // Every supported kind passes together.
         cfg.options = vec![
             SlashOption {
@@ -2842,7 +2865,7 @@ mod tests {
         node.config = serde_json::json!({"kind": "prefix", "name": "rank"});
         cmd.nodes.push(node);
         let err = cmd.validate().unwrap_err();
-        assert!(err.contains("edit-in-place"), "unexpected error: {err}");
+        assert!(err.contains("sửa tin nhắn cũ"), "unexpected error: {err}");
         cmd.edit_last_message = false;
         assert!(cmd.validate().is_ok());
     }
@@ -2897,7 +2920,7 @@ mod tests {
         });
         s.nodes.push(second);
         let err = s.validate().unwrap_err();
-        assert!(err.contains("same variable"), "unexpected error: {err}");
+        assert!(err.contains("cùng đưa vào biến"), "unexpected error: {err}");
     }
 
     #[test]
@@ -2909,7 +2932,7 @@ mod tests {
         assert!(s.validate().is_err());
         s.attachments = (0..11).map(|i| format!("/tmp/f{i}.png")).collect();
         let err = s.validate().unwrap_err();
-        assert!(err.contains("11 attachments"), "unexpected error: {err}");
+        assert!(err.contains("11 tệp đính kèm"), "unexpected error: {err}");
         s.attachments = (0..10).map(|i| format!("/tmp/f{i}.png")).collect();
         assert!(s.validate().is_ok());
         // Paths round-trip through JSON (the files themselves are
@@ -2954,7 +2977,7 @@ mod tests {
         assert!(s.validate_for_webhook().is_err());
         s.destination_ids = vec!["a".to_string(), "a".to_string()];
         let err = s.validate_for_webhook().unwrap_err();
-        assert!(err.contains("twice"), "unexpected error: {err}");
+        assert!(err.contains("hai lần"), "unexpected error: {err}");
         s.destination_ids = vec!["a".to_string(), "b".to_string()];
         assert!(s.validate_for_webhook().is_ok());
         // User mode ignores the list entirely (channel governs).
@@ -2983,7 +3006,7 @@ mod tests {
         s2.nodes.push(node);
         assert!(s2.validate().is_ok());
         let err = s2.validate_for_webhook().unwrap_err();
-        assert!(err.contains("webhook mode"), "unexpected error: {err}");
+        assert!(err.contains("chế độ Webhook"), "unexpected error: {err}");
     }
 
     #[test]

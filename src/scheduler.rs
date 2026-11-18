@@ -61,7 +61,7 @@ pub fn channels_violation(scenarios: &[Scenario]) -> Option<String> {
     channels.dedup();
     if channels.len() > 1 {
         Some(format!(
-            "Nicord allows 1 channel, but enabled scenarios use {} distinct channels",
+            "Nicord cho phép 1 kênh, nhưng các kịch bản đang bật dùng {} kênh khác nhau",
             channels.len()
         ))
     } else {
@@ -185,21 +185,21 @@ fn load_attachments(paths: &[String]) -> (Vec<crate::discord::AttachedFile>, Vec
         let name = std::path::Path::new(path)
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "(unnamed file)".to_string());
+            .unwrap_or_else(|| "(file chưa đặt tên)".to_string());
         let meta = match std::fs::metadata(path) {
             Ok(m) => m,
             Err(_) => {
-                skipped.push(format!("{name} (missing)"));
+                skipped.push(format!("{name} (không tìm thấy)"));
                 continue;
             }
         };
         if !meta.is_file() {
-            skipped.push(format!("{name} (not a file)"));
+            skipped.push(format!("{name} (không phải file)"));
             continue;
         }
         if meta.len() > crate::discord::MAX_ATTACHMENT_BYTES {
             skipped.push(format!(
-                "{name} ({} over the 8 MB limit)",
+                "{name} (vượt giới hạn 8 MB: {})",
                 format_bytes(meta.len())
             ));
             continue;
@@ -210,7 +210,7 @@ fn load_attachments(paths: &[String]) -> (Vec<crate::discord::AttachedFile>, Vec
                 // between the metadata check and the read.
                 if bytes.len() as u64 > crate::discord::MAX_ATTACHMENT_BYTES {
                     skipped.push(format!(
-                        "{name} ({} over the 8 MB limit)",
+                        "{name} (vượt giới hạn 8 MB: {})",
                         format_bytes(bytes.len() as u64)
                     ));
                     continue;
@@ -221,7 +221,7 @@ fn load_attachments(paths: &[String]) -> (Vec<crate::discord::AttachedFile>, Vec
                     bytes,
                 });
             }
-            Err(e) => skipped.push(format!("{name} (unreadable: {e})")),
+            Err(e) => skipped.push(format!("{name} (không đọc được: {e})")),
         }
     }
     (files, skipped)
@@ -308,7 +308,7 @@ fn aggregate_broadcast(results: &[TargetResult]) -> BroadcastOutcome {
             .collect::<Vec<_>>()
             .join("; ");
         return BroadcastOutcome::Failed(format!(
-            "broadcast failed for {} target(s): {combined}",
+            "gửi tới nhiều đích đến thất bại cho {} đích: {combined}",
             results.len()
         ));
     }
@@ -321,7 +321,7 @@ fn aggregate_broadcast(results: &[TargetResult]) -> BroadcastOutcome {
     // Unreachable: every result is Err, and any Err is either
     // defer/skip/invalid or hard. Kept as a defensive fallback so a
     // future error prefix can never silently consume a run.
-    BroadcastOutcome::Failed("broadcast failed: unknown error".to_string())
+    BroadcastOutcome::Failed("gửi tới nhiều đích đến thất bại: lỗi không rõ".to_string())
 }
 
 impl Engine {
@@ -723,10 +723,10 @@ impl Engine {
             // validated the scenario; this guards direct callers
             // and config edits between validation and fetch.)
             if let Err(e) = cfg.validate() {
-                return Err(format!("invalid scenario: Call API node {}: {e}", node.id));
+                return Err(format!("invalid scenario: node Call API {}: {e}", node.id));
             }
             let host = if cfg.url_host.trim().is_empty() {
-                "the configured host".to_string()
+                "host đã cấu hình".to_string()
             } else {
                 cfg.url_host.trim().to_string()
             };
@@ -741,7 +741,7 @@ impl Engine {
                     )
                     .await
                 }
-                Err(e) => Err(format!("cannot load the saved URL ({e})")),
+                Err(e) => Err(format!("không tải được địa chỉ đã lưu ({e})")),
             };
             match fetched {
                 Ok(value) => {
@@ -750,14 +750,14 @@ impl Engine {
                 Err(e) => {
                     if cfg.effective_on_failure() == "empty" {
                         tracing::warn!(
-                            "scenario '{}': API fetch for {{{}}} (host {host}) failed: {e} — sending with an empty value",
+                            "kịch bản '{}': lấy dữ liệu API cho {{{}}} (host {host}) thất bại: {e} — gửi với giá trị rỗng",
                             scenario.name,
                             cfg.variable.trim()
                         );
                         out.insert(cfg.variable.trim().to_string(), String::new());
                     } else {
                         let detail = format!(
-                            "API fetch for {{{}}} (host {host}) failed: {e}",
+                            "lấy dữ liệu API cho {{{}}} (host {host}) thất bại: {e}",
                             cfg.variable.trim()
                         );
                         self.write_log(&SendLogEntry {
@@ -786,30 +786,27 @@ impl Engine {
         server_name: &str,
     ) -> Result<String, String> {
         if self.emergency_stop.load(Ordering::SeqCst) {
-            return Err("emergency stop is active".into());
+            return Err("dừng khẩn cấp đang bật".into());
         }
         // Global 429 pause blocks every send until it expires.
         if self.is_globally_paused() {
-            return Err("defer: Discord global rate-limit pause in effect".into());
+            return Err("defer: Discord đang tạm dừng toàn cục do giới hạn (429)".into());
         }
         // Destination pre-checks (webhook mode only).
         if let Some(dest) = destination {
             if !dest.enabled {
-                return Err(format!(
-                    "skip: destination '{}' is disabled",
-                    dest.display_name()
-                ));
+                return Err(format!("skip: đích đến '{}' đang tắt", dest.display_name()));
             }
             if dest.failure_state.is_paused() {
                 return Err(format!(
-                    "skip: destination '{}' is paused ({}) — resume it in Destinations",
+                    "skip: đích đến '{}' đang tạm dừng ({}) — tiếp tục trong màn hình Đích đến",
                     dest.display_name(),
                     dest.failure_state.label()
                 ));
             }
             if dest.encrypted_url.trim().is_empty() {
                 return Err(format!(
-                    "skip: destination '{}' has no webhook URL yet",
+                    "skip: đích đến '{}' chưa có webhook URL",
                     dest.display_name()
                 ));
             }
@@ -818,14 +815,14 @@ impl Engine {
             let minutes = now_local.hour() * 60 + now_local.minute();
             if dest.is_quiet_at(minutes) {
                 return Err(format!(
-                    "skip: destination '{}' is inside its quiet window",
+                    "skip: đích đến '{}' đang trong giờ yên tĩnh",
                     dest.display_name()
                 ));
             }
             // Per-destination 429 cooldown: defer, do not consume.
             if let Some(remaining) = self.cooldown_remaining(&dest.id) {
                 return Err(format!(
-                    "defer: destination '{}' cooling down for {}s (429)",
+                    "defer: đích đến '{}' đang chờ hết giới hạn {}s (429)",
                     dest.display_name(),
                     remaining.as_secs()
                 ));
@@ -842,7 +839,7 @@ impl Engine {
             let sent = self.store.count_sends_today_for_destination(&dest.id);
             if sent >= effective_cap {
                 return Err(format!(
-                    "skip: destination '{}' daily cap reached ({sent}/{effective_cap})",
+                    "skip: đích đến '{}' đã đạt giới hạn ngày ({sent}/{effective_cap})",
                     dest.display_name()
                 ));
             }
@@ -852,7 +849,7 @@ impl Engine {
         let antiban = self.antiban();
         // Layer 5: sleep window.
         if antiban.in_sleep_window(Local::now()) {
-            return Err("skip: inside night sleep window".into());
+            return Err("skip: đang trong khung giờ ngủ đêm".into());
         }
         // Mode-aware validation: webhook scenarios need no channel,
         // but command nodes are rejected (webhooks cannot send them).
@@ -896,7 +893,9 @@ impl Engine {
                     .load(Ordering::SeqCst)
                     .min(scenario_cap);
                 if sent >= eff {
-                    return Err(format!("skip: global daily cap reached ({sent}/{eff})"));
+                    return Err(format!(
+                        "skip: đã đạt giới hạn ngày toàn cục ({sent}/{eff})"
+                    ));
                 }
             } else {
                 let base_cap = antiban.daily_cap;
@@ -905,7 +904,7 @@ impl Engine {
                 let eff = account_eff.min(scenario_cap);
                 if sent >= eff {
                     return Err(format!(
-                        "skip: daily cap reached ({sent}/{eff}, warm-up age {age}d)"
+                        "skip: đã đạt giới hạn ngày ({sent}/{eff}, tài khoản đã làm quen {age} ngày)"
                     ));
                 }
             }
@@ -919,7 +918,7 @@ impl Engine {
         if let Some(cmd_node) = scenario.command_node() {
             if sender.is_webhook() {
                 return Err(
-                    "webhook mode cannot send commands — use a message scenario or switch back to account mode"
+                    "chế độ Webhook không gửi được lệnh — dùng kịch bản tin nhắn hoặc chuyển lại chế độ Tài khoản"
                         .into(),
                 );
             }
@@ -945,7 +944,7 @@ impl Engine {
             let last_idx = self.last_msg_index.lock().await.get(&scenario.id).copied();
             let (idx, msg) = scenario
                 .pick_message_with_index(last_idx, &mut rng)
-                .ok_or_else(|| "scenario has no messages".to_string())?;
+                .ok_or_else(|| "kịch bản không có tin nhắn".to_string())?;
             self.last_msg_index
                 .lock()
                 .await
@@ -970,7 +969,7 @@ impl Engine {
                 None if scenario.poll.is_some() => String::new(),
                 None => {
                     return Err(
-                            "scenario has no messages and the destination has no usable default messages"
+                            "kịch bản không có tin nhắn và đích đến không có tin nhắn mặc định dùng được"
                                 .to_string(),
                         );
                 }
@@ -978,7 +977,7 @@ impl Engine {
         } else if scenario.poll.is_some() {
             String::new()
         } else {
-            return Err("scenario has no messages".to_string());
+            return Err("kịch bản không có tin nhắn".to_string());
         };
         let mut vars: HashMap<String, String> = scenario
             .variables
@@ -1029,7 +1028,7 @@ impl Engine {
         }
         let has_embed = scenario.embeds.iter().any(|e| !e.is_empty());
         if clean.trim().is_empty() && !has_embed && scenario.poll.is_none() {
-            return Err("message is empty after sanitising".into());
+            return Err("tin nhắn rỗng sau khi làm sạch".into());
         }
 
         if wait_secs > 0 {
@@ -1037,7 +1036,7 @@ impl Engine {
                 .sleep_interruptible(Duration::from_secs(wait_secs))
                 .await;
             if self.emergency_stop.load(Ordering::SeqCst) {
-                return Err("emergency stop pressed while waiting".into());
+                return Err("đã bấm dừng khẩn cấp trong lúc chờ".into());
             }
         }
         // Minimum interval. User mode: sleep until the slot opens
@@ -1053,7 +1052,7 @@ impl Engine {
             };
             if too_soon {
                 return Err(format!(
-                    "defer: destination '{}' minimum interval not reached yet",
+                    "defer: đích đến '{}' chưa đủ khoảng cách tối thiểu",
                     dest.display_name()
                 ));
             }
@@ -1061,7 +1060,7 @@ impl Engine {
             self.wait_for_slot(&scenario.channel_id).await;
         }
         if self.emergency_stop.load(Ordering::SeqCst) {
-            return Err("emergency stop pressed while waiting".into());
+            return Err("đã bấm dừng khẩn cấp trong lúc chờ".into());
         }
 
         // Auto Typing: show "typing..." for a random
@@ -1074,7 +1073,7 @@ impl Engine {
             }
             let typing = Duration::from_secs(antiban.typing_secs(&mut rng));
             if self.sleep_interruptible(typing).await {
-                return Err("emergency stop pressed while typing".into());
+                return Err("đã bấm dừng khẩn cấp trong lúc đang gõ".into());
             }
         }
 
@@ -1231,12 +1230,15 @@ impl Engine {
                     }
                     // A webhook 204 has no message id: do not claim one.
                     let mut detail = if sent.id.is_empty() {
-                        "message sent (webhook, no id returned)".to_string()
+                        "đã gửi tin nhắn (webhook, không trả về id)".to_string()
                     } else {
-                        format!("message {}", sent.id)
+                        format!("tin nhắn {}", sent.id)
                     };
                     if !skipped.is_empty() {
-                        detail.push_str(&format!(" (attachment skipped: {})", skipped.join(", ")));
+                        detail.push_str(&format!(
+                            " (tệp đính kèm bị bỏ qua: {})",
+                            skipped.join(", ")
+                        ));
                     }
                     let entry = SendLogEntry {
                         scenario_id: scenario.id.clone(),
@@ -1270,7 +1272,7 @@ impl Engine {
                             self.set_cooldown(&dest.id, retry_after_secs);
                         }
                         return Err(format!(
-                            "defer: Discord rate limit, retry after {retry_after_secs}s (global={global})"
+                            "defer: Discord giới hạn, thử lại sau {retry_after_secs}s (toàn cục={global})"
                         ));
                     }
                     // User mode: same waits as before, but abort early
@@ -1284,11 +1286,11 @@ impl Engine {
                             .await
                     };
                     if paused {
-                        return Err("emergency stop pressed during rate-limit pause".into());
+                        return Err("đã bấm dừng khẩn cấp trong lúc chờ hết giới hạn".into());
                     }
                     if attempt >= 3 {
                         return Err(format!(
-                            "rate limited repeatedly (last retry_after {retry_after_secs}s)"
+                            "bị giới hạn liên tục (retry_after cuối {retry_after_secs}s)"
                         ));
                     }
                 }
@@ -1297,11 +1299,11 @@ impl Engine {
                         let _ = self.store.set_destination_failure(
                             &dest.id,
                             FailureState::Paused401,
-                            &format!("stopped immediately: {m}"),
+                            &format!("dừng ngay: {m}"),
                         );
                         crate::notify::play(crate::notify::SoundEvent::DestinationPaused);
                     }
-                    return Err(format!("stopped immediately: {m}"));
+                    return Err(format!("dừng ngay: {m}"));
                 }
                 Err(DiscordError::NotFound(m)) => {
                     // A gone webhook pauses the destination (persisted):
@@ -1311,19 +1313,19 @@ impl Engine {
                         let _ = self.store.set_destination_failure(
                             &dest.id,
                             FailureState::Paused404,
-                            &format!("stopped immediately: {m}"),
+                            &format!("dừng ngay: {m}"),
                         );
                         crate::notify::play(crate::notify::SoundEvent::DestinationPaused);
                     }
-                    return Err(format!("stopped immediately: {m}"));
+                    return Err(format!("dừng ngay: {m}"));
                 }
                 Err(DiscordError::Other(m)) => {
                     if attempt >= 3 {
-                        return Err(format!("failed after 3 attempts: {m}"));
+                        return Err(format!("thất bại sau 3 lần thử: {m}"));
                     }
                     let backoff = 2u64.pow(attempt) * 2;
                     if self.sleep_interruptible(Duration::from_secs(backoff)).await {
-                        return Err("emergency stop pressed during retry backoff".into());
+                        return Err("đã bấm dừng khẩn cấp trong lúc chờ thử lại".into());
                     }
                 }
             }
@@ -1387,7 +1389,7 @@ impl Engine {
                         scenario_name: scenario.name.clone(),
                         channel_id: log_channel.clone(),
                         status: "edited".into(),
-                        detail: format!("edited message {id}"),
+                        detail: format!("tin nhắn đã sửa {id}"),
                         message_id: id.clone(),
                         destination_id: destination.map(|d| d.id.clone()).unwrap_or_default(),
                     };
@@ -1408,7 +1410,7 @@ impl Engine {
                             self.set_cooldown(&dest.id, retry_after_secs);
                         }
                         return Err(format!(
-                            "defer: Discord rate limit, retry after {retry_after_secs}s (global={global})"
+                            "defer: Discord giới hạn, thử lại sau {retry_after_secs}s (toàn cục={global})"
                         ));
                     }
                     let paused = if global {
@@ -1418,11 +1420,11 @@ impl Engine {
                             .await
                     };
                     if paused {
-                        return Err("emergency stop pressed during rate-limit pause".into());
+                        return Err("đã bấm dừng khẩn cấp trong lúc chờ hết giới hạn".into());
                     }
                     if attempt >= 3 {
                         return Err(format!(
-                            "rate limited repeatedly (last retry_after {retry_after_secs}s)"
+                            "bị giới hạn liên tục (retry_after cuối {retry_after_secs}s)"
                         ));
                     }
                 }
@@ -1431,11 +1433,11 @@ impl Engine {
                         let _ = self.store.set_destination_failure(
                             &dest.id,
                             FailureState::Paused401,
-                            &format!("stopped immediately: {m}"),
+                            &format!("dừng ngay: {m}"),
                         );
                         crate::notify::play(crate::notify::SoundEvent::DestinationPaused);
                     }
-                    return Err(format!("stopped immediately: {m}"));
+                    return Err(format!("dừng ngay: {m}"));
                 }
                 Err(DiscordError::NotFound(_)) => {
                     // The message is gone (deleted in Discord). Not
@@ -1445,11 +1447,11 @@ impl Engine {
                 }
                 Err(DiscordError::Other(m)) => {
                     if attempt >= 3 {
-                        return Err(format!("failed after 3 attempts: {m}"));
+                        return Err(format!("thất bại sau 3 lần thử: {m}"));
                     }
                     let backoff = 2u64.pow(attempt) * 2;
                     if self.sleep_interruptible(Duration::from_secs(backoff)).await {
-                        return Err("emergency stop pressed during retry backoff".into());
+                        return Err("đã bấm dừng khẩn cấp trong lúc chờ thử lại".into());
                     }
                 }
             }
@@ -1481,7 +1483,7 @@ impl Engine {
             .sleep_interruptible(Duration::from_millis(antiban.delete_delay_ms))
             .await
         {
-            return Err("emergency stop pressed while waiting to delete".into());
+            return Err("đã bấm dừng khẩn cấp trong lúc chờ xóa".into());
         }
         match client
             .delete_message(&scenario.channel_id, message_id)
@@ -1496,7 +1498,7 @@ impl Engine {
                     scenario_name: scenario.name.clone(),
                     channel_id: scenario.channel_id.clone(),
                     status: "deleted".into(),
-                    detail: format!("deleted message {message_id}"),
+                    detail: format!("đã xóa tin nhắn {message_id}"),
                     message_id: message_id.to_string(),
                     destination_id: String::new(),
                 });
@@ -1542,7 +1544,7 @@ impl Engine {
                 reached
             );
             if self.sleep_interruptible(d).await {
-                return Err("emergency stop pressed during auto-break".into());
+                return Err("đã bấm dừng khẩn cấp trong lúc nghỉ".into());
             }
         }
         Ok(())
@@ -1565,12 +1567,12 @@ impl Engine {
     ) -> Result<String, String> {
         // Defensive: send_once already rejects commands in webhook mode.
         let MessageSender::User(client) = sender else {
-            return Err("webhook mode cannot send commands".into());
+            return Err("chế độ Webhook không gửi được lệnh".into());
         };
         // Defensive: send_once already validates the scenario, but a
         // direct caller must never send a malformed command (H-CMD).
         cfg.validate()
-            .map_err(|e| format!("invalid command: {e}"))?;
+            .map_err(|e| format!("lệnh không hợp lệ: {e}"))?;
         let mut rng = StdRng::from_os_rng();
         if cfg.is_slash() {
             return self.send_slash(scenario, cfg, sender, antiban).await;
@@ -1599,7 +1601,7 @@ impl Engine {
             tracing::warn!("anti-ban: {w}");
         }
         if clean.trim().is_empty() {
-            return Err("command is empty after sanitising".into());
+            return Err("lệnh rỗng sau khi làm sạch".into());
         }
         let wait_secs = scenario.wait_seconds();
         if wait_secs > 0 {
@@ -1607,18 +1609,18 @@ impl Engine {
                 .sleep_interruptible(Duration::from_secs(wait_secs))
                 .await;
             if self.emergency_stop.load(Ordering::SeqCst) {
-                return Err("emergency stop pressed while waiting".into());
+                return Err("đã bấm dừng khẩn cấp trong lúc chờ".into());
             }
         }
         self.wait_for_slot(&scenario.channel_id).await;
         if self.emergency_stop.load(Ordering::SeqCst) {
-            return Err("emergency stop pressed while waiting".into());
+            return Err("đã bấm dừng khẩn cấp trong lúc chờ".into());
         }
         if antiban.auto_typing {
             let _ = client.send_typing(&scenario.channel_id).await;
             let typing = Duration::from_secs(antiban.typing_secs(&mut rng));
             if self.sleep_interruptible(typing).await {
-                return Err("emergency stop pressed while typing".into());
+                return Err("đã bấm dừng khẩn cấp trong lúc đang gõ".into());
             }
         }
         // Prefix commands are user-mode only: no destination, no embed.
@@ -1640,7 +1642,7 @@ impl Engine {
     ) -> Result<String, String> {
         // Defensive: send_once already rejects commands in webhook mode.
         let MessageSender::User(client) = sender else {
-            return Err("webhook mode cannot send commands".into());
+            return Err("chế độ Webhook không gửi được lệnh".into());
         };
         let mut rng = StdRng::from_os_rng();
         let wait_secs = scenario.wait_seconds();
@@ -1649,18 +1651,18 @@ impl Engine {
                 .sleep_interruptible(Duration::from_secs(wait_secs))
                 .await;
             if self.emergency_stop.load(Ordering::SeqCst) {
-                return Err("emergency stop pressed while waiting".into());
+                return Err("đã bấm dừng khẩn cấp trong lúc chờ".into());
             }
         }
         self.wait_for_slot(&scenario.channel_id).await;
         if self.emergency_stop.load(Ordering::SeqCst) {
-            return Err("emergency stop pressed while waiting".into());
+            return Err("đã bấm dừng khẩn cấp trong lúc chờ".into());
         }
         // Guild of the channel (None for DMs — the payload omits it).
         let guild_id = match client.get_channel(&scenario.channel_id).await {
             Ok(ch) => ch.guild_id,
             Err(e) => {
-                return Err(format!("cannot read channel for slash command: {e}"));
+                return Err(format!("không đọc được kênh cho lệnh slash: {e}"));
             }
         };
         // Command ID / version: config first, else auto-resolve by name.
@@ -1681,7 +1683,7 @@ impl Engine {
                         Some(h) => (h.id.clone(), h.version.clone()),
                         None => {
                             return Err(format!(
-                                "slash command /{} not found in this channel — paste its Command ID manually in the node editor",
+                                "không tìm thấy lệnh slash /{} trong kênh này — dán Command ID thủ công trong phần sửa node",
                                 cfg.name.trim()
                             ));
                         }
@@ -1689,7 +1691,7 @@ impl Engine {
                 }
                 Err(e) => {
                     return Err(format!(
-                        "cannot search application commands ({e}) — paste the Command ID manually in the node editor"
+                        "không tìm được lệnh ứng dụng ({e}) — dán Command ID thủ công trong phần sửa node"
                     ));
                 }
             }
@@ -1740,19 +1742,19 @@ impl Engine {
                         scenario_name: scenario.name.clone(),
                         channel_id: scenario.channel_id.clone(),
                         status: "sent".into(),
-                        detail: format!("slash /{}", cfg.name.trim()),
+                        detail: format!("lệnh slash /{}", cfg.name.trim()),
                         message_id: String::new(),
                         destination_id: String::new(),
                     });
                     self.maybe_auto_break(antiban, &mut rng).await?;
-                    return Ok(format!("slash /{}", cfg.name.trim()));
+                    return Ok(format!("lệnh slash /{}", cfg.name.trim()));
                 }
                 Err(DiscordError::RateLimited {
                     retry_after_secs,
                     global,
                 }) => {
                     tracing::warn!(
-                        "Discord 429 on slash, waiting {retry_after_secs}s (global={global})"
+                        "Discord trả 429 cho lệnh slash, chờ {retry_after_secs}s (toàn cục={global})"
                     );
                     let paused = if global {
                         self.sleep_interruptible(Duration::from_secs(3600)).await
@@ -1761,26 +1763,26 @@ impl Engine {
                             .await
                     };
                     if paused {
-                        return Err("emergency stop pressed during rate-limit pause".into());
+                        return Err("đã bấm dừng khẩn cấp trong lúc chờ hết giới hạn".into());
                     }
                     if attempt >= 3 {
                         return Err(format!(
-                            "rate limited repeatedly (last retry_after {retry_after_secs}s)"
+                            "bị giới hạn liên tục (retry_after cuối {retry_after_secs}s)"
                         ));
                     }
                 }
                 Err(DiscordError::Unauthorized(m))
                 | Err(DiscordError::Forbidden(m))
                 | Err(DiscordError::NotFound(m)) => {
-                    return Err(format!("stopped immediately: {m}"));
+                    return Err(format!("dừng ngay: {m}"));
                 }
                 Err(DiscordError::Other(m)) => {
                     if attempt >= 3 {
-                        return Err(format!("failed after 3 attempts: {m}"));
+                        return Err(format!("thất bại sau 3 lần thử: {m}"));
                     }
                     let backoff = 2u64.pow(attempt) * 2;
                     if self.sleep_interruptible(Duration::from_secs(backoff)).await {
-                        return Err("emergency stop pressed during retry backoff".into());
+                        return Err("đã bấm dừng khẩn cấp trong lúc chờ thử lại".into());
                     }
                 }
             }
@@ -2156,7 +2158,7 @@ mod tests {
             BroadcastOutcome::Failed(detail) => {
                 assert!(detail.contains("a:"), "detail: {detail}");
                 assert!(detail.contains("b:"), "detail: {detail}");
-                assert!(detail.contains("2 target"), "detail: {detail}");
+                assert!(detail.contains("cho 2 đích"), "detail: {detail}");
             }
             other => panic!(
                 "expected Failed, got {}",

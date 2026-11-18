@@ -56,33 +56,33 @@ impl Default for Poll {
 impl Poll {
     pub fn validate(&self) -> Result<(), String> {
         if self.question.trim().is_empty() {
-            return Err("poll needs a question".into());
+            return Err("bình chọn cần một câu hỏi".into());
         }
         if self.question.chars().count() > POLL_QUESTION_LIMIT {
             return Err(format!(
-                "poll question is over the {POLL_QUESTION_LIMIT}-character limit"
+                "câu hỏi bình chọn vượt giới hạn {POLL_QUESTION_LIMIT} ký tự"
             ));
         }
         if self.answers.len() < POLL_MIN_ANSWERS {
-            return Err(format!("poll needs at least {POLL_MIN_ANSWERS} answers"));
+            return Err(format!("bình chọn cần ít nhất {POLL_MIN_ANSWERS} đáp án"));
         }
         if self.answers.len() > POLL_MAX_ANSWERS {
-            return Err(format!("poll has more than {POLL_MAX_ANSWERS} answers"));
+            return Err(format!("bình chọn có nhiều hơn {POLL_MAX_ANSWERS} đáp án"));
         }
         for (idx, answer) in self.answers.iter().enumerate() {
             if answer.trim().is_empty() {
-                return Err(format!("poll answer {} is empty", idx + 1));
+                return Err(format!("đáp án bình chọn {} đang trống", idx + 1));
             }
             if answer.chars().count() > POLL_ANSWER_LIMIT {
                 return Err(format!(
-                    "poll answer {} is over the {POLL_ANSWER_LIMIT}-character limit",
+                    "đáp án bình chọn {} vượt giới hạn {POLL_ANSWER_LIMIT} ký tự",
                     idx + 1
                 ));
             }
         }
         if !(POLL_MIN_DURATION_HOURS..=POLL_MAX_DURATION_HOURS).contains(&self.duration_hours) {
             return Err(format!(
-                "poll duration must be {POLL_MIN_DURATION_HOURS}–{POLL_MAX_DURATION_HOURS} hours"
+                "thời hạn bình chọn phải là {POLL_MIN_DURATION_HOURS}–{POLL_MAX_DURATION_HOURS} giờ"
             ));
         }
         Ok(())

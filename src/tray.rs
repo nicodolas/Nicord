@@ -2,8 +2,8 @@
 //!
 //! When enabled in Settings, closing the window hides Nicord to the
 //! tray instead of quitting; the tray menu offers "Hiện Nicord",
-//! "Mở Dashboard", an engine pause/resume item whose label follows
-//! the engine state ("Dừng engine" / "Tiếp tục engine"), and
+//! "Mở Tổng quan", an engine pause/resume item whose label follows
+//! the engine state ("Dừng gửi tin" / "Tiếp tục gửi tin"), and
 //! "Thoát". A left-click (or double-click) on the icon shows the
 //! window again. The icon is the same embedded PNG as the window icon
 //! (assets/icon-256.b64), decoded at runtime.
@@ -46,8 +46,8 @@ impl Tray {
         let icon = Icon::from_rgba(rgba, width, height).ok()?;
         let menu = Menu::new();
         let show = MenuItem::with_id("nicord-show", "Hiện Nicord", true, None);
-        let dashboard = MenuItem::with_id("nicord-dashboard", "Mở Dashboard", true, None);
-        let engine = MenuItem::with_id("nicord-engine", "Dừng engine", true, None);
+        let dashboard = MenuItem::with_id("nicord-dashboard", "Mở Tổng quan", true, None);
+        let engine = MenuItem::with_id("nicord-engine", "Dừng gửi tin", true, None);
         let quit = MenuItem::with_id("nicord-quit", "Thoát", true, None);
         menu.append(&show).ok()?;
         menu.append(&dashboard).ok()?;
@@ -73,15 +73,15 @@ impl Tray {
         })
     }
 
-    /// Keep the engine menu label truthful: "Dừng engine" while the
-    /// engine runs, "Tiếp tục engine" while it is stopped. Only
+    /// Keep the engine menu label truthful: "Dừng gửi tin" while the
+    /// engine runs, "Tiếp tục gửi tin" while it is stopped. Only
     /// touches the menu when the state changed (called every frame).
     pub fn set_engine_running(&self, running: bool) {
         if self.engine_running.swap(running, Ordering::Relaxed) != running {
             self.engine_item.set_text(if running {
-                "Dừng engine"
+                "Dừng gửi tin"
             } else {
-                "Tiếp tục engine"
+                "Tiếp tục gửi tin"
             });
         }
     }

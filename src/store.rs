@@ -326,7 +326,7 @@ pub struct Store {
 impl Store {
     pub fn open() -> Result<Self, String> {
         let dir = config_dir();
-        std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {dir:?}: {e}"))?;
+        std::fs::create_dir_all(&dir).map_err(|e| format!("không tạo được {dir:?}: {e}"))?;
         Self::open_at(&db_path())
     }
 
@@ -334,7 +334,8 @@ impl Store {
     /// column migration. Split out so tests can open a throwaway
     /// file database (e.g. to verify the busy timeout).
     fn open_at(path: &std::path::Path) -> Result<Self, String> {
-        let conn = Connection::open(path).map_err(|e| format!("cannot open database: {e}"))?;
+        let conn =
+            Connection::open(path).map_err(|e| format!("không mở được cơ sở dữ liệu: {e}"))?;
         // The database holds encrypted secrets and log details: keep
         // it owner-only on Unix, including WAL sidecars when present
         // (a -wal file created mid-session keeps default permissions
@@ -350,7 +351,7 @@ impl Store {
         // database must not make every write fail instantly with
         // "database is locked": wait up to 5 s for the lock instead.
         conn.busy_timeout(std::time::Duration::from_secs(5))
-            .map_err(|e| format!("cannot set busy timeout: {e}"))?;
+            .map_err(|e| format!("không đặt được thời gian chờ busy: {e}"))?;
         // WAL + FULL durability: each `log_send` commit no longer
         // fsyncs the whole database file (measured ~90 ms per
         // insert on slow storage in DELETE mode), while FULL
@@ -361,7 +362,7 @@ impl Store {
         // Export/import never copy the raw DB file (SQL + JSON),
         // so the -wal/-shm sidecars are safe.
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
-            .map_err(|e| format!("cannot set WAL mode: {e}"))?;
+            .map_err(|e| format!("không đặt được chế độ WAL: {e}"))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS scenarios (
                 id TEXT PRIMARY KEY,
@@ -395,7 +396,7 @@ impl Store {
                 updated_at TEXT NOT NULL
             );",
         )
-        .map_err(|e| format!("cannot create tables: {e}"))?;
+        .map_err(|e| format!("không tạo được bảng: {e}"))?;
         // Migration: databases created before Q13 lack the
         // message_id/destination_id columns (CREATE TABLE IF NOT
         // EXISTS never adds them). Guarded by a PRAGMA check, so
@@ -453,7 +454,7 @@ impl Store {
              CREATE INDEX IF NOT EXISTS idx_send_logs_scenario_id
                  ON send_logs (scenario_id, id);",
         )
-        .map_err(|e| format!("cannot create send_logs indexes: {e}"))?;
+        .map_err(|e| format!("không tạo được chỉ mục send_logs: {e}"))?;
         Ok(())
     }
 

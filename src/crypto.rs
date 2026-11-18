@@ -44,7 +44,7 @@ pub fn encrypt_with_key(key_bytes: &[u8; 32], plaintext: &str) -> Result<String,
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ct = cipher
         .encrypt(nonce, plaintext.as_bytes())
-        .map_err(|e| format!("encryption failed: {e}"))?;
+        .map_err(|e| format!("mã hóa thất bại: {e}"))?;
     let mut blob = nonce_bytes.to_vec();
     blob.extend_from_slice(&ct);
     Ok(B64.encode(blob))
@@ -56,17 +56,17 @@ pub fn encrypt_with_key(key_bytes: &[u8; 32], plaintext: &str) -> Result<String,
 pub fn decrypt_with_key(key_bytes: &[u8; 32], blob_b64: &str) -> Result<String, String> {
     let blob = B64
         .decode(blob_b64)
-        .map_err(|e| format!("invalid encrypted value: {e}"))?;
+        .map_err(|e| format!("giá trị mã hóa không hợp lệ: {e}"))?;
     if blob.len() < 12 {
-        return Err("encrypted value too short".into());
+        return Err("giá trị mã hóa quá ngắn".into());
     }
     let (nonce_bytes, ct) = blob.split_at(12);
     let key = Key::<Aes256Gcm>::from_slice(key_bytes);
     let cipher = Aes256Gcm::new(key);
     let pt = cipher
         .decrypt(Nonce::from_slice(nonce_bytes), ct)
-        .map_err(|_| "decryption failed — wrong key or corrupt data".to_string())?;
-    String::from_utf8(pt).map_err(|_| "decrypted value is not valid UTF-8".to_string())
+        .map_err(|_| "giải mã thất bại — sai khóa hoặc dữ liệu hỏng".to_string())?;
+    String::from_utf8(pt).map_err(|_| "giá trị đã giải mã không phải UTF-8 hợp lệ".to_string())
 }
 
 /// Encrypt a token with the machine key. Output: base64(nonce[12] || ciphertext).
@@ -77,8 +77,8 @@ pub fn encrypt_token(token: &str) -> Result<String, String> {
 /// Decrypt a token produced by `encrypt_token`.
 pub fn decrypt_token(blob_b64: &str) -> Result<String, String> {
     decrypt_with_key(&machine_key(), blob_b64).map_err(|e| {
-        if e.contains("decryption failed") {
-            "decryption failed — token was encrypted on another machine".to_string()
+        if e.contains("giải mã thất bại") {
+            "giải mã thất bại — token đã được mã hóa trên máy khác".to_string()
         } else {
             e
         }
@@ -127,7 +127,7 @@ pub fn pbkdf2_hmac_sha256(
     iterations: u32,
     out_len: usize,
 ) -> Vec<u8> {
-    assert!(iterations > 0, "PBKDF2 iterations must be > 0");
+    assert!(iterations > 0, "số vòng lặp PBKDF2 phải > 0");
     let mut out = Vec::with_capacity(out_len);
     let mut block_index: u32 = 1;
     while out.len() < out_len {

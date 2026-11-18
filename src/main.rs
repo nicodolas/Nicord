@@ -89,7 +89,7 @@ fn main() -> eframe::Result<()> {
         .init();
 
     let store = Arc::new(store::Store::open().unwrap_or_else(|e| {
-        eprintln!("cannot open local store: {e}");
+        eprintln!("không mở được bộ nhớ cục bộ: {e}");
         std::process::exit(1);
     }));
 

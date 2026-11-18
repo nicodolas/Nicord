@@ -65,7 +65,7 @@ pub fn startup_checks(
         } else if destinations.iter().all(|d| !d.enabled) {
             issues.push(HealthIssue {
                 severity: Severity::Warning,
-                message: "Tất cả đích đến đang tắt — engine sẽ không gửi tin nào.".to_string(),
+                message: "Tất cả đích đến đang tắt — Nicord sẽ không gửi tin nào.".to_string(),
                 target: Some(HealthTarget::Destinations),
             });
         }
@@ -156,7 +156,7 @@ pub fn startup_checks(
     if scenarios.is_empty() {
         issues.push(HealthIssue {
             severity: Severity::Info,
-            message: "Chưa có kịch bản nào — tạo kịch bản đầu tiên trong màn hình Soạn."
+            message: "Chưa có kịch bản nào — tạo kịch bản đầu tiên trong màn hình Soạn kịch bản."
                 .to_string(),
             target: Some(HealthTarget::Builder),
         });

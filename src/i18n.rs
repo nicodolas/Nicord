@@ -1,215 +1,121 @@
-//! Minimal i18n (Q9): Vietnamese (default) + English, switched
-//! instantly from Settings (no restart). Coverage is the core UI:
-//! navigation, screen titles, section titles, and common buttons.
-//! Body copy, warnings, and status messages stay Vietnamese until
-//! their keys are added — translating them is incremental work:
-//! add a key here, then use `t()` at the call site. Unknown keys
-//! return the key itself, so a missing translation is visible
-//! instead of silently wrong.
+//! UI strings, Vietnamese only.
+//!
+//! The interface is 100% Vietnamese: every string the user can see is
+//! written here (for the keyed core UI) or inline in Vietnamese at the
+//! call site. There is no language switch — a second language would
+//! only reintroduce the mixed-language UI the keyed table once had
+//! (Vietnamese keys that still carried English text).
+//!
+//! `Lang` and `from_code` are kept so old configs (which stored a
+//! `language` field) still parse, and so the `t()` call sites keep
+//! compiling unchanged. They always resolve to Vietnamese. Unknown
+//! keys return "???" so a missing translation is visible instead of
+//! silently wrong.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Lang {
     #[default]
     Vi,
-    En,
 }
 
 impl Lang {
-    pub fn from_code(code: &str) -> Self {
-        match code.trim().to_ascii_lowercase().as_str() {
-            "en" | "english" => Lang::En,
-            _ => Lang::Vi,
-        }
-    }
-
-    pub fn code(&self) -> &'static str {
-        match self {
-            Lang::Vi => "vi",
-            Lang::En => "en",
-        }
+    pub fn from_code(_code: &str) -> Self {
+        Lang::Vi
     }
 }
 
-/// Translate a UI key. Vietnamese is the source language; English
-/// is the translation. Unknown keys return the key unchanged.
-pub fn t(lang: Lang, key: &str) -> &'static str {
-    match (lang, key) {
+/// Translate a UI key. Vietnamese is the only language.
+pub fn t(_lang: Lang, key: &str) -> &'static str {
+    match key {
         // Navigation.
-        (Lang::En, "nav.dashboard") => "Dashboard",
-        (Lang::En, "nav.builder") => "Builder",
-        (Lang::En, "nav.destinations") => "Destinations",
-        (Lang::En, "nav.logs") => "Logs",
-        (Lang::En, "nav.settings") => "Settings",
+        "nav.dashboard" => "Tổng quan",
+        "nav.builder" => "Kịch bản",
+        "nav.destinations" => "Đích đến",
+        "nav.logs" => "Lịch sử",
+        "nav.settings" => "Cài đặt",
         // Screen titles / subtitles.
-        (Lang::En, "title.dashboard") => "Dashboard",
-        (Lang::En, "subtitle.dashboard") => "Overview",
-        (Lang::En, "title.builder") => "Scenario Builder",
-        (Lang::En, "subtitle.builder") => "Create and edit scenarios",
-        (Lang::En, "title.destinations") => "Destinations",
-        (Lang::En, "subtitle.destinations") => "One webhook per channel",
-        (Lang::En, "title.logs") => "Logs",
-        (Lang::En, "subtitle.logs") => "Send history",
-        (Lang::En, "title.settings") => "Settings",
-        (Lang::En, "subtitle.settings") => "Settings",
+        "title.dashboard" => "Tổng quan",
+        "subtitle.dashboard" => "Tổng quan hoạt động",
+        "title.builder" => "Soạn kịch bản",
+        "subtitle.builder" => "Tạo và chỉnh sửa kịch bản",
+        "title.destinations" => "Đích đến",
+        "subtitle.destinations" => "Webhook cho từng kênh",
+        "title.logs" => "Lịch sử",
+        "subtitle.logs" => "Lịch sử gửi tin",
+        "title.settings" => "Cài đặt",
+        "subtitle.settings" => "Cài đặt chung",
         // Common buttons.
-        (Lang::En, "btn.save") => "Save",
-        (Lang::En, "btn.save_settings") => "Save settings",
-        (Lang::En, "btn.cancel") => "Cancel",
-        (Lang::En, "btn.delete") => "Delete",
-        (Lang::En, "btn.add") => "Add",
-        (Lang::En, "btn.check") => "Check",
-        (Lang::En, "btn.enable") => "Enable",
-        (Lang::En, "btn.disable") => "Disable",
-        (Lang::En, "btn.test") => "Test",
-        (Lang::En, "btn.refresh") => "Refresh",
-        (Lang::En, "btn.clone") => "Clone",
-        (Lang::En, "btn.edit") => "Edit",
+        "btn.save" => "Lưu",
+        "btn.save_settings" => "Lưu cài đặt",
+        "btn.cancel" => "Hủy",
+        "btn.delete" => "Xóa",
+        "btn.add" => "Thêm",
+        "btn.check" => "Kiểm tra",
+        "btn.enable" => "Bật",
+        "btn.disable" => "Tắt",
+        "btn.test" => "Gửi thử",
+        "btn.refresh" => "Làm mới",
+        "btn.clone" => "Nhân bản",
+        "btn.edit" => "Sửa",
         // Dashboard.
-        (Lang::En, "dash.start_engine") => "Start engine",
-        (Lang::En, "dash.stop") => "Stop",
-        (Lang::En, "dash.emergency_stop") => "EMERGENCY STOP",
-        (Lang::En, "dash.scenarios") => "Scenarios",
-        (Lang::En, "dash.sent_today") => "Sent today",
-        (Lang::En, "dash.next_run") => "Next run",
-        (Lang::En, "dash.destination") => "Destination",
-        (Lang::En, "dash.timeline") => "Upcoming sends (7 days)",
-        (Lang::En, "dash.week_chart") => "Last 7 days",
-        (Lang::En, "dash.timeline_edit") => "Edit",
-        (Lang::En, "builder.simulation") => "Preview: next 10 runs",
-        (Lang::En, "builder.poll") => "Poll (optional)",
-        (Lang::En, "logs.detail_title") => "Log detail",
-        (Lang::En, "logs.detail_btn") => "Details",
-        (Lang::En, "logs.close") => "Close",
-        (Lang::En, "settings.maintenance") => "Automatic backups & log retention",
-        (Lang::En, "settings.auto_backup") => "Back up configuration automatically",
-        (Lang::En, "settings.every") => "Every",
-        (Lang::En, "settings.days") => "days",
-        (Lang::En, "settings.keep") => "keep",
-        (Lang::En, "settings.copies") => "copies",
-        (Lang::En, "settings.backup_now") => "Back up now",
-        (Lang::En, "settings.retention") => "Keep send history:",
-        (Lang::En, "settings.forever") => "Forever",
-        (Lang::En, "settings.prune_now") => "Clean up old logs now",
+        "dash.start_engine" => "Chạy",
+        "dash.stop" => "Dừng",
+        "dash.emergency_stop" => "DỪNG KHẨN CẤP",
+        "dash.scenarios" => "Kịch bản",
+        "dash.sent_today" => "Đã gửi hôm nay",
+        "dash.next_run" => "Lịch tới",
+        "dash.destination" => "Đích đến",
+        "dash.timeline" => "Lịch gửi sắp tới (7 ngày)",
+        "dash.week_chart" => "7 ngày qua",
+        "dash.timeline_edit" => "Sửa",
+        "builder.simulation" => "Xem trước: 10 lần chạy tới",
+        "builder.poll" => "Bình chọn (tùy chọn)",
+        "logs.detail_title" => "Chi tiết lịch sử",
+        "logs.detail_btn" => "Chi tiết",
+        "logs.close" => "Đóng",
+        "settings.maintenance" => "Sao lưu tự động & lưu trữ lịch sử",
+        "settings.auto_backup" => "Tự động sao lưu cấu hình",
+        "settings.every" => "Mỗi",
+        "settings.days" => "ngày",
+        "settings.keep" => "giữ lại",
+        "settings.copies" => "bản",
+        "settings.backup_now" => "Sao lưu ngay",
+        "settings.retention" => "Giữ lịch sử gửi:",
+        "settings.forever" => "Mãi mãi",
+        "settings.prune_now" => "Dọn lịch sử cũ ngay",
         // Builder sections.
-        (Lang::En, "builder.editor") => "Editor",
-        (Lang::En, "builder.schedule") => "Schedule",
-        (Lang::En, "builder.templates") => "Template library",
-        (Lang::En, "builder.embed") => "Embed (optional)",
-        (Lang::En, "builder.messages") => "Messages",
-        (Lang::En, "builder.your_scenarios") => "Your scenarios",
-        (Lang::En, "builder.search_hint") => "Search scenarios…",
-        (Lang::En, "builder.enable_all") => "Enable all",
-        (Lang::En, "builder.disable_all") => "Disable all",
+        "builder.editor" => "Soạn thảo",
+        "builder.schedule" => "Lịch chạy",
+        "builder.templates" => "Thư viện mẫu",
+        "builder.embed" => "Embed (tùy chọn)",
+        "builder.messages" => "Tin nhắn",
+        "builder.your_scenarios" => "Kịch bản của bạn",
+        "builder.search_hint" => "Tìm kịch bản…",
+        "builder.enable_all" => "Bật tất cả",
+        "builder.disable_all" => "Tắt tất cả",
         // Destinations.
-        (Lang::En, "dest.list") => "Destination list",
-        (Lang::En, "dest.new") => "+ Add destination",
-        (Lang::En, "dest.edit") => "Edit destination",
-        (Lang::En, "dest.create") => "New destination",
-        (Lang::En, "dest.save") => "Save destination",
-        (Lang::En, "dest.test") => "Send test",
+        "dest.list" => "Danh sách đích đến",
+        "dest.new" => "+ Thêm đích đến",
+        "dest.edit" => "Sửa đích đến",
+        "dest.create" => "Đích đến mới",
+        "dest.save" => "Lưu đích đến",
+        "dest.test" => "Gửi thử",
         // Settings sections.
-        (Lang::En, "settings.send_mode") => "Send mode",
-        (Lang::En, "settings.webhook") => "Webhook",
-        (Lang::En, "settings.limits") => "Destination limits",
-        (Lang::En, "settings.account") => "Account",
-        (Lang::En, "settings.general") => "General",
-        (Lang::En, "settings.updates") => "Updates",
-        (Lang::En, "settings.language") => "Language",
-        (Lang::En, "settings.font_size") => "Font size",
-        (Lang::En, "settings.font_small") => "Small",
-        (Lang::En, "settings.font_medium") => "Medium",
-        (Lang::En, "settings.font_large") => "Large",
-        (Lang::En, "settings.start_minimized") => "Start minimized",
-        (Lang::En, "settings.shortcuts") => "Keyboard shortcuts",
-        (Lang::En, "settings.reset_window") => "Reset window size",
-        // Vietnamese (source strings).
-        (Lang::Vi, "nav.dashboard") => "Dashboard",
-        (Lang::Vi, "nav.builder") => "Builder",
-        (Lang::Vi, "nav.destinations") => "Đích đến",
-        (Lang::Vi, "nav.logs") => "Logs",
-        (Lang::Vi, "nav.settings") => "Settings",
-        (Lang::Vi, "title.dashboard") => "Dashboard",
-        (Lang::Vi, "subtitle.dashboard") => "Tổng quan",
-        (Lang::Vi, "title.builder") => "Scenario Builder",
-        (Lang::Vi, "subtitle.builder") => "Tạo và chỉnh sửa kịch bản",
-        (Lang::Vi, "title.destinations") => "Đích đến",
-        (Lang::Vi, "subtitle.destinations") => "Webhook cho từng kênh",
-        (Lang::Vi, "title.logs") => "Logs",
-        (Lang::Vi, "subtitle.logs") => "Lịch sử gửi tin",
-        (Lang::Vi, "title.settings") => "Settings",
-        (Lang::Vi, "subtitle.settings") => "Cài đặt",
-        (Lang::Vi, "btn.save") => "Lưu",
-        (Lang::Vi, "btn.save_settings") => "Save settings",
-        (Lang::Vi, "btn.cancel") => "Hủy",
-        (Lang::Vi, "btn.delete") => "Xóa",
-        (Lang::Vi, "btn.add") => "Thêm",
-        (Lang::Vi, "btn.check") => "Kiểm tra",
-        (Lang::Vi, "btn.enable") => "Bật",
-        (Lang::Vi, "btn.disable") => "Tắt",
-        (Lang::Vi, "btn.test") => "Gửi thử",
-        (Lang::Vi, "btn.refresh") => "Refresh",
-        (Lang::Vi, "btn.clone") => "Nhân bản",
-        (Lang::Vi, "btn.edit") => "Sửa",
-        (Lang::Vi, "dash.start_engine") => "Start engine",
-        (Lang::Vi, "dash.stop") => "Stop",
-        (Lang::Vi, "dash.emergency_stop") => "DỪNG KHẨN CẤP",
-        (Lang::Vi, "dash.scenarios") => "Kịch bản",
-        (Lang::Vi, "dash.sent_today") => "Đã gửi hôm nay",
-        (Lang::Vi, "dash.next_run") => "Lịch tới",
-        (Lang::Vi, "dash.destination") => "Đích đến",
-        (Lang::Vi, "dash.timeline") => "Lịch gửi sắp tới (7 ngày)",
-        (Lang::Vi, "dash.week_chart") => "7 ngày qua",
-        (Lang::Vi, "dash.timeline_edit") => "Sửa",
-        (Lang::Vi, "builder.simulation") => "Xem trước: 10 lần chạy tới",
-        (Lang::Vi, "builder.poll") => "Bình chọn (tùy chọn)",
-        (Lang::Vi, "logs.detail_title") => "Chi tiết log",
-        (Lang::Vi, "logs.detail_btn") => "Chi tiết",
-        (Lang::Vi, "logs.close") => "Đóng",
-        (Lang::Vi, "settings.maintenance") => "Sao lưu tự động & lưu trữ log",
-        (Lang::Vi, "settings.auto_backup") => "Tự động sao lưu cấu hình",
-        (Lang::Vi, "settings.every") => "Mỗi",
-        (Lang::Vi, "settings.days") => "ngày",
-        (Lang::Vi, "settings.keep") => "giữ lại",
-        (Lang::Vi, "settings.copies") => "bản",
-        (Lang::Vi, "settings.backup_now") => "Sao lưu ngay",
-        (Lang::Vi, "settings.retention") => "Giữ lịch sử gửi:",
-        (Lang::Vi, "settings.forever") => "Mãi mãi",
-        (Lang::Vi, "settings.prune_now") => "Dọn dẹp log cũ ngay",
-        (Lang::Vi, "builder.editor") => "Editor",
-        (Lang::Vi, "builder.schedule") => "Lịch chạy",
-        (Lang::Vi, "builder.templates") => "Thư viện mẫu",
-        (Lang::Vi, "builder.embed") => "Embed (tùy chọn)",
-        (Lang::Vi, "builder.messages") => "Messages",
-        (Lang::Vi, "builder.your_scenarios") => "Your scenarios",
-        (Lang::Vi, "builder.search_hint") => "Tìm kịch bản…",
-        (Lang::Vi, "builder.enable_all") => "Bật tất cả",
-        (Lang::Vi, "builder.disable_all") => "Tắt tất cả",
-        (Lang::Vi, "dest.list") => "Danh sách đích đến",
-        (Lang::Vi, "dest.new") => "+ Thêm đích đến",
-        (Lang::Vi, "dest.edit") => "Sửa đích đến",
-        (Lang::Vi, "dest.create") => "Đích đến mới",
-        (Lang::Vi, "dest.save") => "Lưu đích đến",
-        (Lang::Vi, "dest.test") => "Gửi thử",
-        (Lang::Vi, "settings.send_mode") => "Chế độ gửi",
-        (Lang::Vi, "settings.webhook") => "Webhook",
-        (Lang::Vi, "settings.limits") => "Giới hạn đích đến",
-        (Lang::Vi, "settings.account") => "Tài khoản",
-        (Lang::Vi, "settings.general") => "General",
-        (Lang::Vi, "settings.updates") => "Cập nhật",
-        (Lang::Vi, "settings.language") => "Ngôn ngữ",
-        (Lang::Vi, "settings.font_size") => "Cỡ chữ",
-        (Lang::Vi, "settings.font_small") => "Nhỏ",
-        (Lang::Vi, "settings.font_medium") => "Vừa",
-        (Lang::Vi, "settings.font_large") => "Lớn",
-        (Lang::Vi, "settings.start_minimized") => "Mở thu nhỏ khi khởi động",
-        (Lang::Vi, "settings.shortcuts") => "Phím tắt",
-        (Lang::Vi, "settings.reset_window") => "Đặt lại kích thước cửa sổ",
+        "settings.send_mode" => "Chế độ gửi",
+        "settings.webhook" => "Webhook",
+        "settings.limits" => "Giới hạn đích đến",
+        "settings.account" => "Tài khoản",
+        "settings.general" => "Chung",
+        "settings.updates" => "Cập nhật",
+        "settings.font_size" => "Cỡ chữ",
+        "settings.font_small" => "Nhỏ",
+        "settings.font_medium" => "Vừa",
+        "settings.font_large" => "Lớn",
+        "settings.start_minimized" => "Mở thu nhỏ khi khởi động",
+        "settings.shortcuts" => "Phím tắt",
+        "settings.reset_window" => "Đặt lại kích thước cửa sổ",
         // Unknown key: visible, not silent.
-        (_, key) => {
-            // `key` is not 'static, so return a fixed marker.
-            let _ = key;
-            "???"
-        }
+        _ => "???",
     }
 }
 
@@ -218,29 +124,88 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lang_from_code_defaults_to_vietnamese() {
-        assert_eq!(Lang::from_code("en"), Lang::En);
-        assert_eq!(Lang::from_code("EN"), Lang::En);
+    fn lang_from_code_always_vietnamese() {
+        assert_eq!(Lang::from_code("en"), Lang::Vi);
+        assert_eq!(Lang::from_code("EN"), Lang::Vi);
         assert_eq!(Lang::from_code("vi"), Lang::Vi);
         assert_eq!(Lang::from_code(""), Lang::Vi);
         assert_eq!(Lang::from_code("fr"), Lang::Vi);
     }
 
     #[test]
-    fn core_keys_translate_both_ways() {
+    fn core_keys_are_vietnamese() {
         assert_eq!(t(Lang::Vi, "nav.destinations"), "Đích đến");
-        assert_eq!(t(Lang::En, "nav.destinations"), "Destinations");
-        assert_eq!(t(Lang::En, "settings.language"), "Language");
+        assert_eq!(t(Lang::Vi, "nav.dashboard"), "Tổng quan");
+        assert_eq!(t(Lang::Vi, "nav.builder"), "Kịch bản");
+        assert_eq!(t(Lang::Vi, "nav.logs"), "Lịch sử");
+        assert_eq!(t(Lang::Vi, "nav.settings"), "Cài đặt");
+        assert_eq!(t(Lang::Vi, "title.builder"), "Soạn kịch bản");
+        assert_eq!(t(Lang::Vi, "btn.save_settings"), "Lưu cài đặt");
+        assert_eq!(t(Lang::Vi, "btn.refresh"), "Làm mới");
+        assert_eq!(t(Lang::Vi, "dash.start_engine"), "Chạy");
+        assert_eq!(t(Lang::Vi, "dash.stop"), "Dừng");
+        assert_eq!(t(Lang::Vi, "builder.editor"), "Soạn thảo");
+        assert_eq!(t(Lang::Vi, "builder.messages"), "Tin nhắn");
+        assert_eq!(t(Lang::Vi, "builder.your_scenarios"), "Kịch bản của bạn");
+        assert_eq!(t(Lang::Vi, "settings.general"), "Chung");
         assert_eq!(t(Lang::Vi, "builder.enable_all"), "Bật tất cả");
-        assert_eq!(t(Lang::En, "settings.font_size"), "Font size");
         assert_eq!(t(Lang::Vi, "dash.timeline"), "Lịch gửi sắp tới (7 ngày)");
-        assert_eq!(t(Lang::En, "builder.simulation"), "Preview: next 10 runs");
         assert_eq!(
             t(Lang::Vi, "settings.maintenance"),
-            "Sao lưu tự động & lưu trữ log"
+            "Sao lưu tự động & lưu trữ lịch sử"
         );
-        assert_eq!(t(Lang::En, "settings.prune_now"), "Clean up old logs now");
+        assert_eq!(t(Lang::Vi, "settings.prune_now"), "Dọn lịch sử cũ ngay");
         assert_eq!(t(Lang::Vi, "logs.detail_btn"), "Chi tiết");
+        assert_eq!(t(Lang::Vi, "logs.detail_title"), "Chi tiết lịch sử");
         assert_eq!(t(Lang::Vi, "no.such.key"), "???");
+    }
+
+    #[test]
+    fn no_keyed_string_is_english() {
+        // Guard against the mixed-language regression: every keyed
+        // string must be Vietnamese. Keys whose value legitimately
+        // contains a Latin product term (Webhook, Embed, Call API)
+        // are covered by the explicit assertions above; this test
+        // pins the historically-English keys to their Vietnamese
+        // values so a reverted translation fails loudly.
+        for key in [
+            "nav.dashboard",
+            "nav.builder",
+            "nav.logs",
+            "nav.settings",
+            "title.dashboard",
+            "title.builder",
+            "title.logs",
+            "title.settings",
+            "btn.save_settings",
+            "btn.refresh",
+            "dash.start_engine",
+            "dash.stop",
+            "builder.editor",
+            "builder.messages",
+            "builder.your_scenarios",
+            "settings.general",
+        ] {
+            let v = t(Lang::Vi, key);
+            assert!(
+                !matches!(
+                    v,
+                    "Dashboard"
+                        | "Builder"
+                        | "Logs"
+                        | "Settings"
+                        | "Scenario Builder"
+                        | "Save settings"
+                        | "Refresh"
+                        | "Start engine"
+                        | "Stop"
+                        | "Editor"
+                        | "Messages"
+                        | "Your scenarios"
+                        | "General"
+                ),
+                "key {key} still English: {v}"
+            );
+        }
     }
 }

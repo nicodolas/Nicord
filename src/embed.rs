@@ -96,51 +96,51 @@ impl Embed {
 
     pub fn validate(&self) -> Result<(), String> {
         if self.is_empty() {
-            return Err("embed is empty — add a title, description, or field".into());
+            return Err("embed đang trống — thêm tiêu đề, mô tả hoặc trường".into());
         }
         if self.title.chars().count() > EMBED_TITLE_LIMIT {
             return Err(format!(
-                "embed title is over the {EMBED_TITLE_LIMIT}-character limit"
+                "tiêu đề embed vượt giới hạn {EMBED_TITLE_LIMIT} ký tự"
             ));
         }
         if self.description.chars().count() > EMBED_DESCRIPTION_LIMIT {
             return Err(format!(
-                "embed description is over the {EMBED_DESCRIPTION_LIMIT}-character limit"
+                "mô tả embed vượt giới hạn {EMBED_DESCRIPTION_LIMIT} ký tự"
             ));
         }
         if self.author_name.chars().count() > EMBED_AUTHOR_LIMIT {
             return Err(format!(
-                "embed author is over the {EMBED_AUTHOR_LIMIT}-character limit"
+                "tác giả embed vượt giới hạn {EMBED_AUTHOR_LIMIT} ký tự"
             ));
         }
         if self.footer_text.chars().count() > EMBED_FOOTER_LIMIT {
             return Err(format!(
-                "embed footer is over the {EMBED_FOOTER_LIMIT}-character limit"
+                "chân trang embed vượt giới hạn {EMBED_FOOTER_LIMIT} ký tự"
             ));
         }
         if self.fields.len() > EMBED_MAX_FIELDS {
-            return Err(format!("embed has more than {EMBED_MAX_FIELDS} fields"));
+            return Err(format!("embed có nhiều hơn {EMBED_MAX_FIELDS} trường"));
         }
         for (idx, f) in self.fields.iter().enumerate() {
             if f.name.trim().is_empty() || f.value.trim().is_empty() {
-                return Err(format!("embed field {} needs a name and a value", idx + 1));
+                return Err(format!("trường {} của embed cần tên và giá trị", idx + 1));
             }
             if f.name.chars().count() > EMBED_FIELD_NAME_LIMIT {
                 return Err(format!(
-                    "embed field {} name is over the {EMBED_FIELD_NAME_LIMIT}-character limit",
+                    "tên trường {} của embed vượt giới hạn {EMBED_FIELD_NAME_LIMIT} ký tự",
                     idx + 1
                 ));
             }
             if f.value.chars().count() > EMBED_FIELD_VALUE_LIMIT {
                 return Err(format!(
-                    "embed field {} value is over the {EMBED_FIELD_VALUE_LIMIT}-character limit",
+                    "giá trị trường {} của embed vượt giới hạn {EMBED_FIELD_VALUE_LIMIT} ký tự",
                     idx + 1
                 ));
             }
         }
         if let Some(color) = self.color {
             if color > 0xFF_FFFF {
-                return Err("embed color must be 0x000000..0xFFFFFF".into());
+                return Err("màu embed phải là 0x000000..0xFFFFFF".into());
             }
         }
         // URLs: https only, and more than the bare scheme (the
@@ -154,12 +154,12 @@ impl Embed {
             if !trimmed.is_empty()
                 && (!trimmed.starts_with("https://") || trimmed.len() <= "https://".len())
             {
-                return Err(format!("embed {what} URL must start with https://"));
+                return Err(format!("URL {what} của embed phải bắt đầu bằng https://"));
             }
         }
         if self.total_chars() > EMBED_TOTAL_LIMIT {
             return Err(format!(
-                "embed total is {} characters, over Discord's {EMBED_TOTAL_LIMIT}-character limit",
+                "tổng số ký tự của embed là {}, vượt giới hạn {EMBED_TOTAL_LIMIT} ký tự của Discord",
                 self.total_chars()
             ));
         }
@@ -243,7 +243,7 @@ impl Embed {
 pub fn validate_embeds(embeds: &[Embed]) -> Result<(), String> {
     if embeds.len() > EMBED_MAX_COUNT {
         return Err(format!(
-            "message has {} embeds, over Discord's {EMBED_MAX_COUNT}-embed limit",
+            "tin nhắn có {} embed, vượt giới hạn {EMBED_MAX_COUNT} embed của Discord",
             embeds.len()
         ));
     }
@@ -256,7 +256,7 @@ pub fn validate_embeds(embeds: &[Embed]) -> Result<(), String> {
     }
     if total > EMBED_TOTAL_LIMIT {
         return Err(format!(
-            "embeds total {total} characters, over Discord's {EMBED_TOTAL_LIMIT}-character limit"
+            "tổng số ký tự các embed là {total}, vượt giới hạn {EMBED_TOTAL_LIMIT} ký tự của Discord"
         ));
     }
     Ok(())

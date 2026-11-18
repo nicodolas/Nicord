@@ -210,10 +210,10 @@ impl Destination {
     /// problem found.
     pub fn validate(&self) -> Result<(), String> {
         if self.name.trim().is_empty() {
-            return Err("destination name is empty".into());
+            return Err("tên đích đến đang trống".into());
         }
         if self.username_override.chars().count() > MAX_USERNAME_OVERRIDE_CHARS {
-            return Err("display name must be at most 80 characters".into());
+            return Err("tên hiển thị tối đa 80 ký tự".into());
         }
         if !self.avatar_url_override.trim().is_empty() {
             let url = self.avatar_url_override.trim();
@@ -224,39 +224,39 @@ impl Destination {
                 || url.contains(char::is_whitespace)
                 || url.len() > 2048
             {
-                return Err("avatar URL must be an https URL without spaces".into());
+                return Err("avatar URL phải là URL https không có khoảng trắng".into());
             }
         }
         if !self.thread_id.trim().is_empty()
             && !self.thread_id.trim().chars().all(|c| c.is_ascii_digit())
         {
-            return Err("thread ID must contain only digits".into());
+            return Err("thread ID chỉ được chứa chữ số".into());
         }
         if self.daily_cap > 300 {
-            return Err("daily cap must be 0 (global) or 1..=300".into());
+            return Err("giới hạn ngày phải là 0 (toàn cục) hoặc 1..=300".into());
         }
         if self.min_interval_secs < MIN_INTERVAL_FLOOR_SECS {
             return Err(format!(
-                "minimum interval must be at least {MIN_INTERVAL_FLOOR_SECS} seconds"
+                "khoảng cách tối thiểu phải ít nhất {MIN_INTERVAL_FLOOR_SECS} giây"
             ));
         }
         match (&self.quiet_start, &self.quiet_end) {
             (None, None) => {}
             (Some(s), Some(e)) => {
-                parse_hhmm(s).ok_or("quiet start must be HH:MM (24h)")?;
-                parse_hhmm(e).ok_or("quiet end must be HH:MM (24h)")?;
+                parse_hhmm(s).ok_or("giờ bắt đầu yên tĩnh phải là HH:MM (24h)")?;
+                parse_hhmm(e).ok_or("giờ kết thúc yên tĩnh phải là HH:MM (24h)")?;
             }
             _ => {
-                return Err("quiet window needs both a start and an end time".into());
+                return Err("khung giờ yên tĩnh cần cả giờ bắt đầu và giờ kết thúc".into());
             }
         }
         for (idx, msg) in self.default_messages.iter().enumerate() {
             if msg.trim().is_empty() {
-                return Err(format!("default message {} is empty", idx + 1));
+                return Err(format!("tin nhắn mặc định {} đang trống", idx + 1));
             }
             if crate::preview::over_limit(msg) {
                 return Err(format!(
-                    "default message {} is over Discord's 2000-character limit",
+                    "tin nhắn mặc định {} vượt giới hạn 2000 ký tự của Discord",
                     idx + 1
                 ));
             }
