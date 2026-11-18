@@ -501,7 +501,7 @@ impl DiscordClient {
         self.handle_response(resp).await
     }
 
-    /// Auto Typing (Discord-BLUE): show "typing..." in the channel.
+    /// Auto Typing: show "typing..." in the channel.
     /// Discord answers 204 with an empty body; any error is returned so
     /// the caller can decide (the send path ignores typing failures).
     pub async fn send_typing(&self, channel_id: &str) -> Result<(), DiscordError> {
@@ -518,7 +518,7 @@ impl DiscordClient {
         }
     }
 
-    /// Auto Delete (Discord-BLUE): delete a message the app just sent.
+    /// Auto Delete: delete a message the app just sent.
     /// Discord answers 204 with an empty body.
     pub async fn delete_message(
         &self,

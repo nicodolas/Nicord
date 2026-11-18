@@ -829,7 +829,7 @@ impl NicordApp {
         });
     }
 
-    /// Token Validator (Discord-BLUE): check the stored token with
+    /// Token Validator: check the stored token with
     /// `GET /users/@me` in a background thread and show the account
     /// (username, id, email, 2FA, Nitro). The token itself is never shown.
     fn check_token(&self) {
@@ -6431,7 +6431,7 @@ impl NicordApp {
             });
             ui.add_space(12.0);
         }
-        // Token Validator (Discord-BLUE): check the stored token and
+        // Token Validator: check the stored token and
         // show the account behind it. The token itself is never shown.
         theme::card(ui, |ui| {
             theme::section_title(ui, t(self.lang(), "settings.account"));
@@ -6467,7 +6467,7 @@ impl NicordApp {
             }
         });
         ui.add_space(12.0);
-        // Anti-ban (Discord-BLUE): Smart Templates, Auto Typing,
+        // Anti-ban: Smart Templates, Auto Typing,
         // Auto Break, Auto Delete. Saved to config.json and applied to
         // the running engine on Save.
         theme::card(ui, |ui| {

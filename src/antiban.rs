@@ -29,16 +29,16 @@ pub struct AntiBanConfig {
     pub sleep_end_hour: u32,
     /// Block @everyone / @here unless the user explicitly confirms.
     pub block_everyone: bool,
-    /// Smart Templates (Discord-BLUE): Spintax `{a|b}` + random message
+    /// Smart Templates: Spintax `{a|b}` + random message
     /// variation, applied after template vars are resolved (default off).
     pub smart_templates: bool,
-    /// Auto Typing (Discord-BLUE): show "typing..." before sending
+    /// Auto Typing: show "typing..." before sending
     /// (default off).
     pub auto_typing: bool,
     /// Typing indicator duration, random seconds in this range.
     pub typing_min_sec: u64,
     pub typing_max_sec: u64,
-    /// Auto Break (Discord-BLUE): long rest after N sends (default off).
+    /// Auto Break: long rest after N sends (default off).
     pub auto_break: bool,
     /// Rest after a random count in this range of sends.
     pub break_after_min: u32,
@@ -46,7 +46,7 @@ pub struct AntiBanConfig {
     /// Rest duration, random minutes in this range.
     pub break_duration_min: u32,
     pub break_duration_max: u32,
-    /// Auto Delete (Discord-BLUE): delete the message after sending
+    /// Auto Delete: delete the message after sending
     /// (default off).
     pub auto_delete: bool,
     /// Delay before deleting, milliseconds (0 = immediately).

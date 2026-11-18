@@ -1,17 +1,13 @@
-//! Spintax + message variation — the "Smart Templates" feature from
-//! Discord-BLUE, ported to Rust.
+//! Spintax + message variation — the "Smart Templates" feature.
 //!
 //! `{a|b|c}` picks one option at random. A `{...}` group only counts as
 //! spintax when it contains `|` and no nested braces: `{{username}}`
-//! template vars and single `{time}`-style tokens pass through untouched
-//! (the same rule as BLUE's `process_spintax` regex). An unclosed `{`
-//! is copied verbatim, never dropped.
+//! template vars and single `{time}`-style tokens pass through untouched.
+//! An unclosed `{` is copied verbatim, never dropped.
 //!
-//! Variation (`vary_message`, BLUE's `randomize_content`) randomly
-//! inserts an emoji, doubles a space, or flips the case of one word —
-//! each with a small probability, so most messages stay natural.
-//! BLUE's abbreviation mutation is deliberately NOT ported: it is
-//! Vietnamese-slang specific and would mangle ordinary words.
+//! Variation (`vary_message`) randomly inserts an emoji, doubles a
+//! space, or flips the case of one word — each with a small
+//! probability, so most messages stay natural.
 //!
 //! Applied in the send path AFTER template vars are resolved and
 //! BEFORE sending, only when Smart Templates is on.

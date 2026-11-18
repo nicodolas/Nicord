@@ -94,19 +94,16 @@ internal/dev mechanisms; they only receive the finished product.
 
 There is no captcha solving, detection evasion, or bulk proxy rotation.
 
-## Discord-BLUE features (ported, all optional, all off by default)
+## Optional sending behaviors (all optional, all off by default)
 
-Ported from bluemanhst/Discord-BLUE (Python/tkinter) into Rust. The
-multi-account / multi-channel model was NOT ported — Nicord stays
-1 account, 1 channel, 300 messages/day.
+Nicord stays 1 account, 1 channel, 300 messages/day. The behaviors
+below are all opt-in and default off.
 
 - **Smart Templates** (`src/spintax.rs`): Spintax `{a|b|c}` picks one
   option at random; `{...}` groups without `|` and `{{template}}` vars
   pass through untouched. Variation randomly inserts an emoji, doubles
   a space, or flips one word's case (each ~15%, so most messages stay
   natural). Applied after template vars are resolved, before sending.
-  BLUE's abbreviation mutation was not ported (Vietnamese-slang
-  specific, would mangle ordinary words).
 - **Auto Typing** (`DiscordClient::send_typing`): POST
   `/channels/{id}/typing`, then wait a random 2–5s before sending.
   A typing failure never blocks the send; the wait aborts on

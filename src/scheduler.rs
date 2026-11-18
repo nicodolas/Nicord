@@ -130,7 +130,7 @@ pub struct Engine {
     /// when that call fails, and the failure is logged.
     identity: Mutex<(String, String)>,
     identity_last_try: Mutex<Option<Instant>>,
-    /// Auto Break progress (Discord-BLUE).
+    /// Auto Break progress.
     break_state: Mutex<BreakState>,
     /// Gateway client for slash commands (lazy: connects only when a
     /// slash command actually fires).
@@ -1007,7 +1007,7 @@ impl Engine {
             &vars,
             &counters,
         );
-        // Smart Templates (Discord-BLUE): Spintax + variation are applied
+        // Smart Templates: Spintax + variation are applied
         // AFTER template vars are resolved — so `{{username}}` is never
         // mangled — and only when the toggle is on. Webhook mode never
         // varies content: webhook sends are plain scheduled messages.
@@ -1064,7 +1064,7 @@ impl Engine {
             return Err("emergency stop pressed while waiting".into());
         }
 
-        // Auto Typing (Discord-BLUE): show "typing..." for a random
+        // Auto Typing: show "typing..." for a random
         // 2–5s before sending. A typing failure never blocks the send.
         // Webhooks have no typing endpoint, so this is skipped entirely
         // in webhook mode.
@@ -1456,7 +1456,7 @@ impl Engine {
         }
     }
 
-    /// Auto Delete (Discord-BLUE): delete the message after the
+    /// Auto Delete: delete the message after the
     /// configured delay. A delete failure is only logged — the send
     /// already succeeded. Err only when Emergency Stop interrupts the
     /// wait (the message stays up in that case).
@@ -1508,7 +1508,7 @@ impl Engine {
         Ok(())
     }
 
-    /// Auto Break (Discord-BLUE): after a random 15–25 sends, rest for
+    /// Auto Break: after a random 15–25 sends, rest for
     /// a random 10–30 minutes. Err only when Emergency Stop interrupts
     /// the rest.
     async fn maybe_auto_break(
