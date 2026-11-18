@@ -1388,3 +1388,88 @@ Found by running the real binary under Xvfb and driving it
   dispatch (distinct `id_salt`s); Builder and Logs already
   scroll internally, and Onboarding is left unwrapped because
   it centers from `available_height`.
+
+## UI/UX redesign (2026-11-18)
+
+Display-only: no business logic, data structure, database
+schema, or sending behavior changed. The interface is 100%
+Vietnamese (product terms Webhook/Embed/Slash/Cron kept, as
+in the Vietnamese-only sweep); the language selector was
+already removed.
+
+- **Design system (`src/theme.rs`):** semantic tokens added to
+  both palettes (`surface_2`, `divider`, `info`,
+  `accent_hover`); reusable components `badge`/`BadgeKind`,
+  `section_header`, `empty_state`, `kv_row`, `divider`,
+  `metric_card`, `inspector_frame`, `group_label`,
+  `nav_section_label`. `nav_button` uses a subtle fill + 3 px
+  accent bar when active instead of a full blurple fill.
+  `apply_theme` still installs the style into both egui theme
+  slots and pins the theme (the Windows startup-crash fix).
+- **Shell:** sidebar groups (KHÔNG GIAN LÀM VIỆC: Dashboard /
+  Builder / Destinations / Logs; HỆ THỐNG: Settings), 208 px,
+  Emergency Stop pinned at the bottom. The navigation block
+  scrolls within the space left after a 240 px footer reserve,
+  so Emergency Stop stays reachable at a 600 px window height
+  (verified at 900x600). No separate status bar (engine/mode
+  already live in the sidebar + banner) and no collapsible
+  sidebar, per the redesign audit.
+- **Dashboard:** engine-control card first (status badge,
+  Start/Stop/Test/Minimize/Export, mode line, next run +
+  uptime), health card second (severity badges, jump buttons
+  on their own row), four metric cards, destination card,
+  timeline, and a recent-activity card (5 newest log rows,
+  refreshed at most every 30 s, secret-scrubbed).
+- **Builder:** compose card, then a "Quy trình" workflow card
+  (node rows with kind badges + short names; command nodes
+  show `Lệnh: {name}`), then a context inspector
+  ("Thuộc tính node", only for command / Call API nodes),
+  then grouped sections (LỊCH & MẪU, NÂNG CAO). The action
+  bar is two explicit rows; the editor ScrollArea insets its
+  content 14 px so the scroll bar never covers card borders
+  or wrapped text. No node reordering exists (the old header
+  text falsely claimed it did; fixed).
+- **Destinations:** list rows carry status badges mapped from
+  `FailureState`; the editor is grouped (KẾT NỐI / HIỂN THỊ /
+  GIỚI HẠN / TIN MẶC ĐỊNH) with labels above long fields.
+  Secret handling unchanged (the URL is never shown back).
+- **Logs:** filters in three explicit rows (search; three
+  dropdowns with truncated selected texts; actions), status
+  badges on rows, a row-count line, an empty state, and the
+  delete confirmation on its own row. Log-row scenario names
+  truncate at 30 chars (full name on hover + in detail).
+- **Settings:** grouped cards (GỬI TIN / GIAO DIỆN & HÀNH VI /
+  HỆ THỐNG / DỮ LIỆU) with a pinned save bar; the update
+  status line sits below its button.
+- **Onboarding:** step indicator, a mode comparison with the
+  Webhook "Khuyến nghị" badge, `selectable_label` mode
+  toggles, and a scrollable card so the token path fits a
+  700 px window. The ToS warning and acknowledgment checkbox
+  are verbatim.
+
+**ScrollArea content-width feedback loop (the redesign's
+main bug class, found by debug probe + screenshots):** a
+vertical-only `ScrollArea` with default `auto_shrink`
+follows its content's width, so ONE non-wrapping row wider
+than the viewport widens the whole screen on the next frame
+— the Dashboard metric `columns(4)` then divided the widened
+width and the 4th card slid off-screen (probe: content
+`min_rect` reached x=1233 on a 1100 px window). Every
+overflowing row was bounded instead: wrapping button rows,
+wrapped labels, labels above fields, truncated user content
+(`truncate_display`), two-row list rows, and explicit
+filter rows (a `ComboBox` lives in a `Frame` whose size is
+fixed before the wrap check, so ComboBoxes do not wrap).
+After the fixes the probe reads 1082.0 at every Dashboard
+section. Rule for future UI work: no unbounded horizontal
+row inside a vertical ScrollArea — wrap it, split it, or
+truncate it.
+
+**Known remaining UI issues:** the message-content emoji
+preview and the emoji-picker grid render tofu boxes (the
+bundled Inter subset has no emoji glyphs; the sent message
+still carries the real emoji). A real fix needs a bundled
+emoji font (a new asset), which is out of scope for this
+redesign. No release has been cut yet, so the light theme +
+large text combination was verified only under Xvfb, not on
+a real Windows/macOS desktop.

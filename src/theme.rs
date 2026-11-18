@@ -15,6 +15,14 @@
 //!   no hinting — egui rasterizes its own glyphs). Source: the official
 //!   rsms/inter GitHub release (Inter 4.1), SIL OFL 1.1.
 //!
+//!   GLYPH BUDGET (verified by screenshot, 2026-11-18): the subset has
+//!   NO arrows, checkmarks, or emoji — `→` and `✓` render as tofu boxes
+//!   (egui's fallback fonts don't cover them either). UI strings must
+//!   use only these non-alphanumeric marks: `•` (U+2022), `·` (U+00B7),
+//!   `—` (em dash), `…` (ellipsis), and ASCII (`->`, `*`, `/`). The
+//!   font test pins coverage for the safe set; never add a new symbol
+//!   to a UI string without checking it renders.
+//!
 //! Palette: Discord blurple accent (#5865F2 → #7B61FF, matching the app
 //! icon) on Discord-like dark surfaces. No extra images, no animations,
 //! so the app stays fast and light.
@@ -43,8 +51,12 @@ pub struct Palette {
     pub sidebar_bg: Color32,
     /// Card / panel surface.
     pub card: Color32,
+    /// Secondary surface: nested cards, inspector panels, hover rows.
+    pub surface_2: Color32,
     /// Subtle card border.
     pub card_border: Color32,
+    /// Divider / separator line.
+    pub divider: Color32,
     /// Default button background.
     pub btn_bg: Color32,
     /// Default button background on hover.
@@ -63,6 +75,10 @@ pub struct Palette {
     pub success: Color32,
     /// Warning (status banner, caution text).
     pub warning: Color32,
+    /// Info / accent-tinted text (hints, links, info badges).
+    pub info: Color32,
+    /// Primary accent on hover (darker blurple).
+    pub accent_hover: Color32,
 }
 
 /// Discord-like dark palette (the original look).
@@ -70,7 +86,9 @@ pub const DARK_PALETTE: Palette = Palette {
     bg: Color32::from_rgb(0x1E, 0x1F, 0x22),
     sidebar_bg: Color32::from_rgb(0x16, 0x17, 0x19),
     card: Color32::from_rgb(0x2B, 0x2D, 0x31),
+    surface_2: Color32::from_rgb(0x31, 0x33, 0x38),
     card_border: Color32::from_rgb(0x3F, 0x41, 0x47),
+    divider: Color32::from_rgb(0x3A, 0x3C, 0x41),
     btn_bg: Color32::from_rgb(0x35, 0x37, 0x3C),
     btn_hover: Color32::from_rgb(0x40, 0x42, 0x49),
     input_bg: Color32::from_rgb(0x11, 0x12, 0x14),
@@ -80,6 +98,8 @@ pub const DARK_PALETTE: Palette = Palette {
     danger: Color32::from_rgb(0xED, 0x42, 0x45),
     success: Color32::from_rgb(0x57, 0xF2, 0x87),
     warning: Color32::from_rgb(0xFA, 0xA8, 0x1A),
+    info: Color32::from_rgb(0x7B, 0x61, 0xFF),
+    accent_hover: Color32::from_rgb(0x47, 0x52, 0xC4),
 };
 
 /// Light palette (Discord light surfaces, dark text). The status
@@ -88,7 +108,9 @@ pub const LIGHT_PALETTE: Palette = Palette {
     bg: Color32::from_rgb(0xF2, 0xF3, 0xF5),
     sidebar_bg: Color32::from_rgb(0xE3, 0xE5, 0xE8),
     card: Color32::from_rgb(0xFF, 0xFF, 0xFF),
+    surface_2: Color32::from_rgb(0xEB, 0xED, 0xEF),
     card_border: Color32::from_rgb(0xC9, 0xCD, 0xD2),
+    divider: Color32::from_rgb(0xD4, 0xD7, 0xDC),
     btn_bg: Color32::from_rgb(0xE3, 0xE5, 0xE8),
     btn_hover: Color32::from_rgb(0xD4, 0xD7, 0xDC),
     input_bg: Color32::from_rgb(0xE3, 0xE5, 0xE8),
@@ -98,6 +120,8 @@ pub const LIGHT_PALETTE: Palette = Palette {
     danger: Color32::from_rgb(0xD9, 0x2D, 0x20),
     success: Color32::from_rgb(0x24, 0x80, 0x46),
     warning: Color32::from_rgb(0x9A, 0x6A, 0x00),
+    info: Color32::from_rgb(0x58, 0x65, 0xF2),
+    accent_hover: Color32::from_rgb(0x47, 0x52, 0xC4),
 };
 
 /// Discord blurple — primary accent (matches the app icon).
@@ -476,30 +500,158 @@ pub fn ghost_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     )
 }
 
-/// Full-width sidebar navigation button. Active item is blurple with white
-/// SemiBold text; inactive items are transparent with secondary text.
+/// Full-width sidebar navigation button. The active item gets a subtle
+/// surface fill, SemiBold text, and a 3 px accent bar on its left edge
+/// (a glyph icon set is not available — the bundled font subset only
+/// covers Latin + Vietnamese + common punctuation, so the bar is the
+/// active indicator). Inactive items are transparent with secondary
+/// text; hover uses the standard widget hover fill.
 pub fn nav_button(ui: &mut egui::Ui, label: &str, active: bool) -> egui::Response {
+    let p = palette();
     let btn = if active {
-        egui::Button::new(semibold(label, 15.0).color(WHITE)).fill(ACCENT)
+        egui::Button::new(semibold(label, 15.0).color(p.text)).fill(p.btn_hover)
     } else {
-        egui::Button::new(RichText::new(label).color(palette().text_secondary))
-            .fill(Color32::TRANSPARENT)
+        egui::Button::new(RichText::new(label).color(p.text_secondary)).fill(Color32::TRANSPARENT)
     };
-    ui.add_sized([ui.available_width(), 36.0], btn)
+    let resp = ui.add_sized([ui.available_width(), 36.0], btn);
+    if active {
+        let bar = egui::Rect::from_min_size(
+            egui::pos2(resp.rect.left() + 2.0, resp.rect.top() + 8.0),
+            egui::vec2(3.0, resp.rect.height() - 16.0),
+        );
+        ui.painter().rect_filled(bar, CornerRadius::same(2), ACCENT);
+    }
+    resp
 }
 
-/// Big-number stat card (value on top, muted label below).
-pub fn stat_card(ui: &mut egui::Ui, label: &str, value: &str) {
-    card_frame().show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.label(RichText::new(value).text_style(TextStyle::Name("BigNumber".into())));
-        ui.label(RichText::new(label).small().color(palette().text_muted));
-    });
+/// Small muted group label above a block of related content
+/// ("KHÔNG GIAN LÀM VIỆC", "LỊCH & MẪU", "NÂNG CAO").
+pub fn group_label(ui: &mut egui::Ui, text: &str) {
+    ui.label(
+        RichText::new(text)
+            .size(11.0)
+            .color(palette().text_muted)
+            .strong(),
+    );
+}
+
+/// Sidebar navigation group label (same rendering as `group_label`).
+pub fn nav_section_label(ui: &mut egui::Ui, text: &str) {
+    group_label(ui, text);
 }
 
 /// Colored bullet "•" (U+2022 is in the bundled font) for status dots.
 pub fn dot(color: Color32) -> RichText {
     RichText::new("•").size(18.0).color(color)
+}
+
+/// Semantic badge kinds. Colors come from the palette so badges stay
+/// readable in both themes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BadgeKind {
+    Success,
+    Warning,
+    Danger,
+    Info,
+    Muted,
+}
+
+impl BadgeKind {
+    pub fn color(self) -> Color32 {
+        let p = palette();
+        match self {
+            Self::Success => p.success,
+            Self::Warning => p.warning,
+            Self::Danger => p.danger,
+            Self::Info => p.info,
+            Self::Muted => p.text_muted,
+        }
+    }
+}
+
+/// Small pill badge: colored text + matching border on a transparent
+/// fill. Used for row states (Bật/Tắt/Lỗi), log statuses, and node
+/// kinds. Not clickable.
+pub fn badge(ui: &mut egui::Ui, text: &str, kind: BadgeKind) {
+    let color = kind.color();
+    egui::Frame::new()
+        .stroke(Stroke::new(1.0_f32, color))
+        .corner_radius(6)
+        .inner_margin(egui::Margin {
+            left: 7,
+            right: 7,
+            top: 2,
+            bottom: 2,
+        })
+        .show(ui, |ui| {
+            ui.label(RichText::new(text).small().color(color));
+        });
+}
+
+/// Section header with a title and a one-line muted description.
+/// Standard opener for grouped content inside a screen.
+pub fn section_header(ui: &mut egui::Ui, title: &str, description: &str) {
+    section_title(ui, title);
+    if !description.is_empty() {
+        muted(ui, description);
+    }
+    ui.add_space(6.0);
+}
+
+/// Empty state: a centered title + hint for lists with no rows.
+/// Callers add their own action button underneath when one exists.
+pub fn empty_state(ui: &mut egui::Ui, title: &str, hint: &str) {
+    ui.vertical_centered(|ui| {
+        ui.add_space(10.0);
+        ui.label(semibold(title, 15.0).color(palette().text_secondary));
+        ui.add_space(2.0);
+        ui.label(RichText::new(hint).small().color(palette().text_muted));
+        ui.add_space(10.0);
+    });
+}
+
+/// One key/value row: muted label on the left, value on the right.
+/// Used by inspectors and detail views.
+pub fn kv_row(ui: &mut egui::Ui, key: &str, value: &str) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(key).small().color(palette().text_muted));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(RichText::new(value).small());
+        });
+    });
+}
+
+/// Thin divider line in the divider token color.
+pub fn divider(ui: &mut egui::Ui) {
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+    ui.painter()
+        .rect_filled(rect, CornerRadius::ZERO, palette().divider);
+}
+
+/// Metric card with the label on top (small, muted), the value in the
+/// middle (BigNumber), and an optional sub-line below. Label-first
+/// reads better than value-first when several metrics sit in a row.
+pub fn metric_card(ui: &mut egui::Ui, label: &str, value: &str, sub: &str) {
+    card_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(RichText::new(label).small().color(palette().text_muted));
+        ui.label(RichText::new(value).text_style(TextStyle::Name("BigNumber".into())));
+        if !sub.is_empty() {
+            ui.label(RichText::new(sub).small().color(palette().text_secondary));
+        }
+    });
+}
+
+/// Frame for contextual inspector panels: the secondary surface, so
+/// the inspector reads as one level above the card it sits beside.
+pub fn inspector_frame() -> egui::Frame {
+    let p = palette();
+    egui::Frame::new()
+        .fill(p.surface_2)
+        .stroke(Stroke::new(1.0_f32, p.card_border))
+        .corner_radius(10)
+        .inner_margin(12)
 }
 
 /// Daily-cap progress bar, drawn by hand.
@@ -584,6 +736,29 @@ mod tests {
         assert!(DARK_PALETTE.bg.r() < 60);
         assert!(LIGHT_PALETTE.text.r() < 60);
         assert!(DARK_PALETTE.text.r() > 200);
+    }
+
+    #[test]
+    fn semantic_tokens_are_distinct() {
+        // The redesign's secondary surface, divider, info, and hover
+        // tokens must differ from the surfaces they sit on, in both
+        // themes — otherwise inspector panels and dividers vanish.
+        for p in [DARK_PALETTE, LIGHT_PALETTE] {
+            assert_ne!(p.surface_2, p.card);
+            assert_ne!(p.surface_2, p.bg);
+            assert_ne!(p.divider, p.card);
+            assert_ne!(p.info, p.text_muted);
+            assert_ne!(p.accent_hover, ACCENT);
+        }
+        // Badge kinds must map to distinct colors in both themes.
+        for p in [DARK_PALETTE, LIGHT_PALETTE] {
+            let colors = [p.success, p.warning, p.danger, p.info, p.text_muted];
+            for (i, a) in colors.iter().enumerate() {
+                for b in &colors[i + 1..] {
+                    assert_ne!(a, b);
+                }
+            }
+        }
     }
 
     #[test]
@@ -712,8 +887,12 @@ mod tests {
                 (&prop, 'ỗ'),
                 (&prop, 'ư'),
                 (&prop, '•'),
+                (&prop, '·'),
+                (&prop, '—'),
+                (&prop, '…'),
                 (&semi, 'ệ'),
                 (&semi, 'Đ'),
+                (&semi, '•'),
             ] {
                 assert!(
                     ctx.fonts(|f| f.has_glyph(font_id, ch)),

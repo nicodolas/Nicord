@@ -95,6 +95,11 @@ pub struct NicordApp {
     /// at most every 30 s. Session-only: recomputed, never saved.
     pub timeline_cache: Vec<crate::timeline::UpcomingRun>,
     pub timeline_updated: std::time::Instant,
+    /// Dashboard "Hoạt động gần đây": the 5 newest log rows,
+    /// refreshed at most every 30 s (same cadence as the
+    /// timeline). Session-only: recomputed, never saved.
+    pub activity_cache: Vec<crate::store::LogRow>,
+    pub activity_updated: std::time::Instant,
     /// Builder schedule simulation, keyed by the draft schedule +
     /// timezone + destination so it recomputes only when the draft
     /// changes. Session-only.
@@ -359,6 +364,20 @@ fn log_status_label(status: &str) -> &'static str {
     }
 }
 
+/// Display-truncate user content to `max` chars with an ellipsis, so a
+/// long name can never widen its row past the viewport (ScrollArea
+/// content-width feedback loop). The full value stays in tooltips,
+/// detail views, and popup lists.
+fn truncate_display(value: &str, max: usize) -> String {
+    if value.chars().count() > max {
+        let mut s: String = value.chars().take(max).collect();
+        s.push('…');
+        s
+    } else {
+        value.to_string()
+    }
+}
+
 fn resolve_senders_for_scenario(
     store: &Store,
     config: &AppConfig,
@@ -550,6 +569,8 @@ impl NicordApp {
             timeline_cache: Vec::new(),
             // Ancient: the first Dashboard frame computes it.
             timeline_updated: std::time::Instant::now() - std::time::Duration::from_secs(3600),
+            activity_cache: Vec::new(),
+            activity_updated: std::time::Instant::now() - std::time::Duration::from_secs(3600),
             sim_cache: None,
             guilds: Arc::new(Mutex::new(Vec::new())),
             channels: Arc::new(Mutex::new(Vec::new())),
@@ -1837,15 +1858,16 @@ impl eframe::App for NicordApp {
                         });
                     ui.add_space(10.0);
                 }
-                // F-GUI-5: Dashboard, Destinations, and Settings
-                // have no ScrollArea of their own, so at the default
-                // 1100x700 window their lower content (Actions row,
-                // timeline, lower Settings cards) was unreachable
-                // without resizing. Wrap those three here; Builder
-                // and Logs already scroll internally, and Onboarding
-                // centers from available_height (a ScrollArea would
-                // break its layout). Distinct id_salts keep each
-                // screen's scroll state separate.
+                // F-GUI-5: Dashboard and Destinations have no
+                // ScrollArea of their own, so at the default 1100x700
+                // window their lower content (timeline, lower cards)
+                // was unreachable without resizing. Wrap those two
+                // here; Builder, Logs, and Settings scroll
+                // internally (Settings owns its scroll so its save
+                // bar stays pinned), and Onboarding centers from
+                // available_height (a ScrollArea would break its
+                // layout). Distinct id_salts keep each screen's
+                // scroll state separate.
                 match self.screen {
                     Screen::Onboarding => self.show_onboarding(ui),
                     Screen::Dashboard => {
@@ -1860,11 +1882,7 @@ impl eframe::App for NicordApp {
                             .show(ui, |ui| self.show_destinations(ui));
                     }
                     Screen::Logs => self.show_logs(ui),
-                    Screen::Settings => {
-                        egui::ScrollArea::vertical()
-                            .id_salt("scroll_settings")
-                            .show(ui, |ui| self.show_settings(ui));
-                    }
+                    Screen::Settings => self.show_settings(ui),
                 }
             });
         // Auto-update dialog (only when a newer release was found, or
@@ -1935,6 +1953,20 @@ impl NicordApp {
             20,
         );
         self.timeline_updated = std::time::Instant::now();
+    }
+
+    /// Recompute the Dashboard "recent activity" list at most
+    /// every 30 s (same cadence as the timeline): one small
+    /// indexed query (`ORDER BY id DESC LIMIT 5`), never per frame.
+    fn refresh_activity(&mut self) {
+        if self.activity_updated.elapsed() < std::time::Duration::from_secs(30) {
+            return;
+        }
+        self.activity_cache = self
+            .store
+            .query_logs(5, "", None, None, None)
+            .unwrap_or_default();
+        self.activity_updated = std::time::Instant::now();
     }
 
     /// 7-day sent/failed bar chart, hand-drawn with the egui
@@ -2041,26 +2073,55 @@ impl NicordApp {
                 .color(theme::palette().text_muted),
         );
         ui.add_space(12.0);
-        if self.screen != Screen::Onboarding {
-            for (label, screen) in [
-                (t(self.lang(), "nav.dashboard"), Screen::Dashboard),
-                (t(self.lang(), "nav.builder"), Screen::Builder),
-                (t(self.lang(), "nav.destinations"), Screen::Destinations),
-                (t(self.lang(), "nav.logs"), Screen::Logs),
-                (t(self.lang(), "nav.settings"), Screen::Settings),
-            ] {
-                if theme::nav_button(ui, label, self.screen == screen).clicked() {
-                    self.screen = screen;
+        // The navigation block scrolls within the space left after
+        // reserving the footer: at a 600 px window the brand + nav
+        // + footer exceed the panel height and the bottom-up
+        // footer pushed Emergency Stop below the window edge
+        // (verified by screenshot). The reserve (240 px) covers
+        // the today card + gap + 40 px button with margin; at
+        // normal heights the nav fits and nothing scrolls.
+        let nav_max_height = (ui.available_height() - 240.0).max(120.0);
+        egui::ScrollArea::vertical()
+            .id_salt("scroll_sidebar_nav")
+            .max_height(nav_max_height)
+            .show(ui, |ui| {
+                if self.screen != Screen::Onboarding {
+                    // Navigation groups: the daily workspace first, system
+                    // settings separated below — the information
+                    // architecture from the redesign audit.
+                    theme::nav_section_label(ui, "KHÔNG GIAN LÀM VIỆC");
+                    ui.add_space(4.0);
+                    for (label, screen) in [
+                        (t(self.lang(), "nav.dashboard"), Screen::Dashboard),
+                        (t(self.lang(), "nav.builder"), Screen::Builder),
+                        (t(self.lang(), "nav.destinations"), Screen::Destinations),
+                        (t(self.lang(), "nav.logs"), Screen::Logs),
+                    ] {
+                        if theme::nav_button(ui, label, self.screen == screen).clicked() {
+                            self.screen = screen;
+                        }
+                        ui.add_space(4.0);
+                    }
+                    ui.add_space(8.0);
+                    theme::nav_section_label(ui, "HỆ THỐNG");
+                    ui.add_space(4.0);
+                    if theme::nav_button(
+                        ui,
+                        t(self.lang(), "nav.settings"),
+                        self.screen == Screen::Settings,
+                    )
+                    .clicked()
+                    {
+                        self.screen = Screen::Settings;
+                    }
+                } else {
+                    ui.label(
+                        RichText::new("Hoàn tất thiết lập để tiếp tục")
+                            .small()
+                            .color(theme::palette().text_muted),
+                    );
                 }
-                ui.add_space(4.0);
-            }
-        } else {
-            ui.label(
-                RichText::new("Hoàn tất thiết lập để tiếp tục")
-                    .small()
-                    .color(theme::palette().text_muted),
-            );
-        }
+            });
         // Bottom of the sidebar: today status, then Emergency Stop last.
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
             if ui
@@ -2138,47 +2199,113 @@ impl NicordApp {
     }
 
     fn show_onboarding(&mut self, ui: &mut egui::Ui) {
-        // Center the card vertically: the panel is ~640 px tall and the
-        // card ~470 px, so a top spacer balances the empty space below it.
-        let top = ((ui.available_height() - 470.0) / 2.0).max(8.0);
+        // Center the card vertically, and scroll when it does not
+        // fit: the token path (comparison + ToS warning + form) is
+        // taller than a 700 px window, and a fixed spacer estimate
+        // cannot cover every UI scale. The ScrollArea only scrolls
+        // when the content overflows, so the webhook path looks
+        // exactly as before.
+        let est = if self.onboarding_mode == SendMode::Webhook {
+            540.0
+        } else {
+            640.0
+        };
+        let top = ((ui.available_height() - est) / 2.0).max(8.0);
         ui.add_space(top);
-        ui.vertical_centered(|ui| {
-            theme::card_frame().show(ui, |ui| {
-                ui.set_max_width(620.0);
-                ui.heading("Chào mừng bạn đến với Nicord");
-                theme::muted(ui, "Gửi tin nhắn Discord tự động, theo lịch của bạn");
-                ui.add_space(10.0);
-                theme::section_title(ui, "Chọn cách gửi");
-                ui.horizontal(|ui| {
-                    ui.radio_value(
-                        &mut self.onboarding_mode,
-                        SendMode::Webhook,
-                        "Webhook (khuyến nghị)",
-                    );
-                    ui.radio_value(
-                        &mut self.onboarding_mode,
-                        SendMode::UserToken,
-                        "Tài khoản Discord",
-                    );
+        egui::ScrollArea::vertical()
+            .id_salt("scroll_onboarding")
+            .max_height((ui.available_height() - 8.0).max(140.0))
+            .show(ui, |ui| {
+                ui.vertical_centered(|ui| {
+                    theme::card_frame().show(ui, |ui| {
+                        ui.set_max_width(620.0);
+                        ui.heading("Chào mừng bạn đến với Nicord");
+                        theme::muted(ui, "Gửi tin nhắn Discord tự động, theo lịch của bạn");
+                        ui.add_space(6.0);
+                        // Step indicator: both steps live on this one screen
+                        // (pick a mode, then connect below) — the indicator
+                        // describes the flow, not a wizard page.
+                        ui.horizontal(|ui| {
+                            ui.label(theme::semibold("1 · Chọn cách gửi", 13.0));
+                            ui.label(RichText::new("->").color(theme::palette().text_muted));
+                            ui.label(
+                                RichText::new("2 · Kết nối")
+                                    .size(13.0)
+                                    .color(theme::palette().text_muted),
+                            );
+                        });
+                        ui.add_space(10.0);
+                        theme::section_title(ui, "Chọn cách gửi");
+                        // Mode toggle as selectable labels, NOT radio_value:
+                        // the labels are a larger click target with a
+                        // clear selected state, and the GUI session
+                        // verified the toggle works on the first click
+                        // at the painted position. (An earlier
+                        // radio_value version was replaced during QA:
+                        // its small targets were repeatedly missed in
+                        // GUI testing. No egui bug is claimed — the
+                        // misses traced to imprecise click coordinates
+                        // in the test harness, and the checkbox in this
+                        // same card was verified working.)
+                        ui.horizontal(|ui| {
+                            if ui
+                                .selectable_label(
+                                    self.onboarding_mode == SendMode::Webhook,
+                                    "Webhook",
+                                )
+                                .clicked()
+                            {
+                                self.onboarding_mode = SendMode::Webhook;
+                            }
+                            theme::badge(ui, "Khuyến nghị", theme::BadgeKind::Success);
+                            ui.add_space(16.0);
+                            if ui
+                                .selectable_label(
+                                    self.onboarding_mode == SendMode::UserToken,
+                                    "Tài khoản Discord",
+                                )
+                                .clicked()
+                            {
+                                self.onboarding_mode = SendMode::UserToken;
+                            }
+                        });
+                        ui.add_space(4.0);
+                        // Mode comparison: the trade-off in plain language,
+                        // so the choice is informed. Labels only.
+                        ui.columns(2, |cols| {
+                            cols[0].vertical(|ui| {
+                                theme::muted(ui, "• Cách chính thức của Discord");
+                                theme::muted(ui, "• Không lo bị khóa vì self-bot");
+                                theme::muted(ui, "• Chỉ gửi tin nhắn, không gửi lệnh");
+                            });
+                            cols[1].vertical(|ui| {
+                                theme::muted(ui, "• Gửi như chính bạn, kèm lệnh Discord");
+                                theme::muted(ui, "• Cần token tài khoản");
+                                theme::muted(
+                                    ui,
+                                    "• Có nguy cơ khóa vĩnh viễn (xem cảnh báo bên dưới)",
+                                );
+                            });
+                        });
+                        ui.add_space(10.0);
+                        if self.onboarding_mode == SendMode::Webhook {
+                            self.show_onboarding_webhook(ui);
+                        } else {
+                            self.show_onboarding_token(ui);
+                        }
+                        ui.add_space(10.0);
+                        if theme::ghost_button(ui, "Để sau -> Tổng quan").clicked() {
+                            self.config.tos_accepted = self.tos_checked;
+                            let _ = save_config(&self.config);
+                            // F-GUI-1: the health card was computed at startup
+                            // (before this choice); refresh so Dashboard does
+                            // not show stale issues for the other mode.
+                            self.refresh_health();
+                            self.screen = Screen::Dashboard;
+                        }
+                    });
                 });
-                ui.add_space(10.0);
-                if self.onboarding_mode == SendMode::Webhook {
-                    self.show_onboarding_webhook(ui);
-                } else {
-                    self.show_onboarding_token(ui);
-                }
-                ui.add_space(10.0);
-                if theme::ghost_button(ui, "Để sau -> Tổng quan").clicked() {
-                    self.config.tos_accepted = self.tos_checked;
-                    let _ = save_config(&self.config);
-                    // F-GUI-1: the health card was computed at startup
-                    // (before this choice); refresh so Dashboard does
-                    // not show stale issues for the other mode.
-                    self.refresh_health();
-                    self.screen = Screen::Dashboard;
-                }
             });
-        });
     }
 
     /// Onboarding — Webhook path (official, recommended). The URL is
@@ -2434,79 +2561,9 @@ impl NicordApp {
 
     fn show_dashboard(&mut self, ui: &mut egui::Ui) {
         let next_runs = self.cached_next_runs();
-        // M2: a failed last-run save is surfaced live — the
-        // engine remembers the last persistence error, and it
-        // joins the startup issues in this card until a save
-        // succeeds. (Startup issues refresh only on events;
-        // this one must appear within a frame of the failure.)
-        let persist_issue = self.engine.last_persist_error().map(|e| {
-            crate::health::HealthIssue {
-                severity: crate::health::Severity::Warning,
-                message: format!(
-                    "Không lưu được trạng thái gửi ({e}) — nếu app tắt đột ngột, một lịch có thể gửi lặp lại. Kiểm tra ổ đĩa và quyền ghi."
-                ),
-                target: None,
-            }
-        });
-        // Startup health report (Q15): shown until dismissed.
-        if !self.health_dismissed && (!self.health_issues.is_empty() || persist_issue.is_some()) {
-            let mut jump_to: Option<Screen> = None;
-            let mut dismiss = false;
-            let mut recheck = false;
-            theme::card(ui, |ui| {
-                theme::section_title(ui, "Tình trạng khởi động");
-                for issue in self.health_issues.iter().chain(persist_issue.iter()) {
-                    let (dot, label) = match issue.severity {
-                        crate::health::Severity::Error => {
-                            (theme::dot(theme::palette().danger), "Lỗi")
-                        }
-                        crate::health::Severity::Warning => {
-                            (theme::dot(theme::palette().warning), "Chú ý")
-                        }
-                        crate::health::Severity::Info => (theme::dot(theme::ACCENT_LIGHT), "Gợi ý"),
-                    };
-                    ui.horizontal(|ui| {
-                        ui.label(dot);
-                        ui.label(format!("[{label}] {}", issue.message));
-                        if let Some(target) = issue.target {
-                            let (screen, text) = match target {
-                                crate::health::HealthTarget::Destinations => {
-                                    (Screen::Destinations, "Đi tới Đích đến")
-                                }
-                                crate::health::HealthTarget::Builder => {
-                                    (Screen::Builder, "Đi tới Soạn kịch bản")
-                                }
-                                crate::health::HealthTarget::Settings => {
-                                    (Screen::Settings, "Đi tới Cài đặt")
-                                }
-                            };
-                            if theme::ghost_button(ui, text).clicked() {
-                                jump_to = Some(screen);
-                            }
-                        }
-                    });
-                }
-                ui.horizontal(|ui| {
-                    if theme::ghost_button(ui, "Đã hiểu").clicked() {
-                        dismiss = true;
-                    }
-                    if theme::ghost_button(ui, "Kiểm tra lại").clicked() {
-                        recheck = true;
-                    }
-                });
-            });
-            ui.add_space(12.0);
-            if dismiss {
-                self.health_dismissed = true;
-            }
-            if recheck {
-                self.refresh_health();
-            }
-            if let Some(screen) = jump_to {
-                self.screen = screen;
-            }
-        }
-        // Stat cards: scenarios, running, sent today.
+        // Dashboard figures, computed once up front: the engine
+        // card, the metric row, and the export action all read
+        // these. (count_status_today is one indexed scan.)
         let count = self.scenarios.lock().map(|l| l.len()).unwrap_or(0);
         let running = self
             .engine
@@ -2553,41 +2610,7 @@ impl NicordApp {
         } else {
             "Đã dừng".to_string()
         };
-        ui.columns(3, |cols| {
-            theme::stat_card(&mut cols[0], "Kịch bản", &count.to_string());
-            theme::stat_card(&mut cols[1], "Trạng thái", &engine_status);
-            theme::stat_card(
-                &mut cols[2],
-                "Đã gửi hôm nay (giới hạn 300)",
-                &format!("{} / 300", self.sent_today),
-            );
-        });
-        ui.add_space(4.0);
-        ui.columns(3, |cols| {
-            theme::stat_card(
-                &mut cols[0],
-                "Tỉ lệ thành công",
-                &success_pct
-                    .map(|p| format!("{p:.0}%"))
-                    .unwrap_or_else(|| "—".to_string()),
-            );
-            theme::stat_card(
-                &mut cols[1],
-                "Tốc độ gửi",
-                &format!("{rate_per_min:.1}/phút"),
-            );
-            theme::stat_card(&mut cols[2], "Đã xóa (phiên này)", &deleted.to_string());
-        });
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.label(theme::dot(theme::palette().text_muted));
-            ui.label(
-                RichText::new(format!("Lần chạy tới: {next_text}"))
-                    .small()
-                    .color(theme::palette().text_muted),
-            );
-        });
-        ui.add_space(4.0);
+
         // Send mode + destination, so the user always knows how sends go out.
         let mode_text = match self.config.send_mode {
             SendMode::Webhook => format!(
@@ -2600,23 +2623,42 @@ impl NicordApp {
                 mask_token(&self.config.token_last4)
             ),
         };
-        ui.horizontal(|ui| {
-            ui.label(theme::dot(theme::palette().text_muted));
-            ui.label(
-                RichText::new(mode_text)
-                    .small()
-                    .color(theme::palette().text_muted),
-            );
-        });
-        ui.add_space(12.0);
-        // Destination card (QoL Q2/Q4): health, last check, last send,
-        // and persisted failure count for the active destination.
-        self.show_destination_card(ui, &next_text, &next_runs);
-        ui.add_space(12.0);
-        // Actions.
+
+        // SECTION 1 — Engine control, first on the Dashboard:
+        // status, start/stop, and how sends go out. (Redesign: the
+        // old "Hành động" card sat fourth, below the fold.)
         theme::card(ui, |ui| {
-            theme::section_title(ui, "Hành động");
+            theme::section_header(
+                ui,
+                "Điều khiển gửi tin",
+                "Trạng thái hệ thống gửi tin và cách tin nhắn được gửi đi.",
+            );
             ui.horizontal(|ui| {
+                let kind = if self.error_pause_label().is_some() {
+                    theme::BadgeKind::Warning
+                } else if running {
+                    theme::BadgeKind::Success
+                } else {
+                    theme::BadgeKind::Muted
+                };
+                theme::badge(ui, &engine_status, kind);
+                ui.label(
+                    RichText::new(&mode_text)
+                        .small()
+                        .color(theme::palette().text_secondary),
+                );
+            });
+            ui.add_space(6.0);
+            // Wrapped, NOT plain horizontal: a vertical-only
+            // ScrollArea follows its content's width (egui
+            // auto_shrink), so one row wider than the viewport
+            // widens the whole Dashboard — the metric columns
+            // below then divide the widened width and the 4th
+            // card slides off-screen (verified by debug probe:
+            // content min_rect reached x=1233 on a 1100 px
+            // window). The test-send label carries up to 24
+            // chars of scenario name, so this row must wrap.
+            ui.horizontal_wrapped(|ui| {
                 if theme::primary_button(ui, "Chạy").clicked() {
                     self.start_engine();
                 }
@@ -2674,7 +2716,150 @@ impl NicordApp {
             #[cfg(not(target_os = "windows"))]
             let tray_note = "Lưu ý: nền tảng này không có biểu tượng khay hệ thống — hãy để cửa sổ mở (thu nhỏ cũng được). Đóng cửa sổ sẽ dừng việc chạy.";
             theme::muted(ui, tray_note);
+            theme::divider(ui);
+            ui.add_space(6.0);
+            theme::kv_row(ui, "Lần chạy tới", &next_text);
+            if running {
+                let up = self.engine.started_at.elapsed();
+                let up_text = if up.as_secs() >= 3600 {
+                    format!(
+                        "{} giờ {} phút",
+                        up.as_secs() / 3600,
+                        (up.as_secs() % 3600) / 60
+                    )
+                } else if up.as_secs() >= 60 {
+                    format!("{} phút", up.as_secs() / 60)
+                } else {
+                    format!("{} giây", up.as_secs())
+                };
+                theme::kv_row(ui, "Đang chạy được", &up_text);
+            }
         });
+        ui.add_space(12.0);
+        // M2: a failed last-run save is surfaced live — the
+        // engine remembers the last persistence error, and it
+        // joins the startup issues in this card until a save
+        // succeeds. (Startup issues refresh only on events;
+        // this one must appear within a frame of the failure.)
+        let persist_issue = self.engine.last_persist_error().map(|e| {
+            crate::health::HealthIssue {
+                severity: crate::health::Severity::Warning,
+                message: format!(
+                    "Không lưu được trạng thái gửi ({e}) — nếu app tắt đột ngột, một lịch có thể gửi lặp lại. Kiểm tra ổ đĩa và quyền ghi."
+                ),
+                target: None,
+            }
+        });
+        // Startup health report (Q15): shown until dismissed.
+        if !self.health_dismissed && (!self.health_issues.is_empty() || persist_issue.is_some()) {
+            let mut jump_to: Option<Screen> = None;
+            let mut dismiss = false;
+            let mut recheck = false;
+            theme::card(ui, |ui| {
+                theme::section_title(ui, "Tình trạng khởi động");
+                for issue in self.health_issues.iter().chain(persist_issue.iter()) {
+                    let (label, kind) = match issue.severity {
+                        crate::health::Severity::Error => ("Lỗi", theme::BadgeKind::Danger),
+                        crate::health::Severity::Warning => ("Chú ý", theme::BadgeKind::Warning),
+                        crate::health::Severity::Info => ("Gợi ý", theme::BadgeKind::Info),
+                    };
+                    // Badge + message on one row (the message wraps
+                    // at the remaining width), the jump button on
+                    // its own row below: badge + message + button in
+                    // one horizontal overflowed the viewport and —
+                    // via the ScrollArea content-width feedback
+                    // loop — pushed the metric cards off-screen
+                    // (verified by debug probe).
+                    ui.horizontal(|ui| {
+                        theme::badge(ui, label, kind);
+                        ui.add(egui::Label::new(&issue.message).wrap());
+                    });
+                    if let Some(target) = issue.target {
+                        let (screen, text) = match target {
+                            crate::health::HealthTarget::Destinations => {
+                                (Screen::Destinations, "Đi tới Đích đến")
+                            }
+                            crate::health::HealthTarget::Builder => {
+                                (Screen::Builder, "Đi tới Soạn kịch bản")
+                            }
+                            crate::health::HealthTarget::Settings => {
+                                (Screen::Settings, "Đi tới Cài đặt")
+                            }
+                        };
+                        ui.horizontal(|ui| {
+                            ui.add_space(52.0);
+                            if theme::ghost_button(ui, text).clicked() {
+                                jump_to = Some(screen);
+                            }
+                        });
+                    }
+                }
+                ui.horizontal(|ui| {
+                    if theme::ghost_button(ui, "Đã hiểu").clicked() {
+                        dismiss = true;
+                    }
+                    if theme::ghost_button(ui, "Kiểm tra lại").clicked() {
+                        recheck = true;
+                    }
+                });
+            });
+            ui.add_space(12.0);
+            if dismiss {
+                self.health_dismissed = true;
+            }
+            if recheck {
+                self.refresh_health();
+            }
+            if let Some(screen) = jump_to {
+                self.screen = screen;
+            }
+        }
+        // SECTION 3 — Key metrics: the four numbers that answer
+        // "how is today going". (The old six-card grid duplicated
+        // the sidebar's sent-today count and hid failures.)
+        let enabled_count = self
+            .scenarios
+            .lock()
+            .map(|l| l.iter().filter(|s| s.enabled).count())
+            .unwrap_or(0);
+        ui.columns(4, |cols| {
+            theme::metric_card(
+                &mut cols[0],
+                "Đã gửi hôm nay",
+                &format!("{} / 300", self.sent_today),
+                "đặt lại lúc 00:00 UTC",
+            );
+            theme::metric_card(
+                &mut cols[1],
+                "Thất bại hôm nay",
+                &failed.to_string(),
+                "từ lịch sử gửi",
+            );
+            theme::metric_card(
+                &mut cols[2],
+                "Tỉ lệ thành công",
+                &success_pct
+                    .map(|p| format!("{p:.0}%"))
+                    .unwrap_or_else(|| "—".to_string()),
+                "đã gửi / tổng số lần gửi",
+            );
+            theme::metric_card(
+                &mut cols[3],
+                "Kịch bản đang bật",
+                &format!("{enabled_count} / {count}"),
+                "kịch bản",
+            );
+        });
+        ui.add_space(4.0);
+        theme::muted(
+            ui,
+            &format!("Tốc độ gửi {rate_per_min:.1}/phút • Đã xóa {deleted} (phiên này)"),
+        );
+        ui.add_space(12.0);
+        // Destination card (QoL Q2/Q4): health, last check, last send,
+        // and persisted failure count for the active destination.
+        self.show_destination_card(ui, &next_text, &next_runs);
+        ui.add_space(12.0);
         ui.add_space(12.0);
         // Upcoming-sends timeline (Group 1): the next 20 runs
         // across enabled scenarios, with blocked-run warnings.
@@ -2694,7 +2879,7 @@ impl NicordApp {
                         ui.label(run.at.format("%d/%m %H:%M").to_string());
                         ui.label(&run.scenario_name);
                         if !run.destination_name.is_empty() {
-                            theme::muted(ui, &format!("→ {}", run.destination_name));
+                            theme::muted(ui, &format!("tới {}", run.destination_name));
                         }
                         if let Some(reason) = &run.blocked {
                             ui.label(
@@ -2726,6 +2911,49 @@ impl NicordApp {
             }
         }
         ui.add_space(12.0);
+        // SECTION 5 — Recent activity: the 5 newest log rows, from
+        // the 30 s activity cache. Same data as Logs, newest first;
+        // details stay secret-scrubbed exactly like the Logs screen.
+        self.refresh_activity();
+        let activity = self.activity_cache.clone();
+        theme::card(ui, |ui| {
+            theme::section_header(
+                ui,
+                "Hoạt động gần đây",
+                "5 lần gửi mới nhất. Xem đầy đủ trong Lịch sử.",
+            );
+            if activity.is_empty() {
+                theme::empty_state(
+                    ui,
+                    "Chưa có hoạt động nào",
+                    "Lịch sử gửi sẽ hiện ở đây sau lần gửi đầu tiên.",
+                );
+            } else {
+                for row in &activity {
+                    ui.horizontal(|ui| {
+                        let kind = match row.status.as_str() {
+                            "sent" | "edited" => theme::BadgeKind::Success,
+                            "failed" => theme::BadgeKind::Danger,
+                            "deleted" => theme::BadgeKind::Muted,
+                            _ => theme::BadgeKind::Muted,
+                        };
+                        theme::badge(ui, log_status_label(&row.status), kind);
+                        ui.label(
+                            RichText::new(&row.created_at)
+                                .small()
+                                .color(theme::palette().text_muted),
+                        );
+                        ui.label(&row.scenario_name);
+                        theme::muted(ui, &scrub_secrets(&row.detail));
+                    });
+                }
+            }
+            ui.add_space(4.0);
+            if theme::ghost_button(ui, "Xem tất cả trong Lịch sử").clicked() {
+                self.screen = Screen::Logs;
+            }
+        });
+        ui.add_space(12.0);
         // Scenario list.
         theme::card(ui, |ui| {
             theme::section_title(ui, "Kịch bản");
@@ -2752,7 +2980,7 @@ impl NicordApp {
                 })
                 .unwrap_or_default();
             if rows.is_empty() {
-                ui.label("Chưa có kịch bản nào. Vào Soạn kịch bản → Kịch bản mới.");
+                ui.label("Chưa có kịch bản nào. Vào Soạn kịch bản -> Kịch bản mới.");
                 ui.add_space(8.0);
                 if theme::primary_button(ui, "Tạo kịch bản").clicked() {
                     self.screen = Screen::Builder;
@@ -2761,25 +2989,20 @@ impl NicordApp {
                 let mut edit: Option<usize> = None;
                 for (i, name, enabled, schedule, next) in &rows {
                     ui.horizontal(|ui| {
-                        ui.label(theme::dot(if *enabled {
-                            theme::palette().success
-                        } else {
-                            theme::palette().text_muted
-                        }));
-                        ui.label(theme::semibold(name, 15.0));
-                        ui.label(
-                            RichText::new(if *enabled {
-                                "đang bật"
+                        theme::badge(
+                            ui,
+                            if *enabled {
+                                "Đang bật"
                             } else {
-                                "đang tắt"
-                            })
-                            .small()
-                            .color(if *enabled {
-                                theme::palette().success
+                                "Đang tắt"
+                            },
+                            if *enabled {
+                                theme::BadgeKind::Success
                             } else {
-                                theme::palette().text_muted
-                            }),
+                                theme::BadgeKind::Muted
+                            },
                         );
+                        ui.label(theme::semibold(name, 15.0));
                         ui.label(
                             RichText::new(format!("{schedule}  {next}"))
                                 .small()
@@ -2808,7 +3031,7 @@ impl NicordApp {
     }
 
     fn show_builder(&mut self, ui: &mut egui::Ui) {
-        ui.label("Thêm node, di chuyển lên/xuống, sửa kịch bản đã chọn. Chạy thử chỉ kiểm tra, không gửi.");
+        ui.label("Thêm node, bấm vào node để sửa thuộc tính. Chạy thử chỉ kiểm tra, không gửi.");
         ui.add_space(12.0);
         // Two columns: scenario list | editor for the selected scenario.
         // The editor content scrolls, but the action bar (Validate, node
@@ -2833,6 +3056,12 @@ impl NicordApp {
                         .id_salt("builder_editor")
                         .max_height((avail - action_h).max(140.0))
                         .show(&mut cols[1], |ui| {
+                            // Inset: the scroll bar overlays the
+                            // content's right edge, so full-width
+                            // cards hid their border and the last
+                            // glyphs of wrapped lines under it
+                            // (verified by screenshot).
+                            ui.set_max_width((ui.available_width() - 14.0).max(200.0));
                             self.show_builder_editor(ui, i);
                         });
                     cols[1].add_space(8.0);
@@ -2925,33 +3154,40 @@ impl NicordApp {
                 }
                 for &i in &visible {
                     let s = &list[i];
+                    // Two rows: the name alone on the first row, the
+                    // actions below it. Name + right-aligned actions
+                    // in one row squeezed the name text at narrow
+                    // windows (verified at 900 px: "Kich ban thu"
+                    // rendered as "Kich ban"); a wrapping row did not
+                    // help because the right-to-left action group
+                    // reserves its width first.
+                    if ui
+                        .selectable_label(selected == Some(i), &s.name)
+                        .on_hover_text(&s.name)
+                        .clicked()
+                    {
+                        selected = Some(i);
+                    }
                     ui.horizontal(|ui| {
-                        if ui.selectable_label(selected == Some(i), &s.name).clicked() {
-                            selected = Some(i);
+                        if ui.button("Nhân bản").clicked() {
+                            to_clone = Some(i);
                         }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            // Delete is destructive: red text so it can
-                            // never be confused with Enable at a glance.
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        RichText::new("Xóa").color(theme::palette().danger),
-                                    )
-                                    .fill(theme::palette().btn_bg),
+                        if ui.button(if s.enabled { "Tắt" } else { "Bật" }).clicked() {
+                            to_toggle = Some(i);
+                        }
+                        // Delete is destructive: red text so it can
+                        // never be confused with Enable at a glance.
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Xóa").color(theme::palette().danger),
                                 )
-                                .clicked()
-                            {
-                                to_delete = Some(i);
-                            }
-                            ui.add_space(6.0);
-                            if ui.button(if s.enabled { "Tắt" } else { "Bật" }).clicked() {
-                                to_toggle = Some(i);
-                            }
-                            ui.add_space(6.0);
-                            if ui.button("Nhân bản").clicked() {
-                                to_clone = Some(i);
-                            }
-                        });
+                                .fill(theme::palette().btn_bg),
+                            )
+                            .clicked()
+                        {
+                            to_delete = Some(i);
+                        }
                     });
                     if !s.channel_id.is_empty() {
                         theme::muted(ui, &format!("kênh: {}", s.channel_id));
@@ -3315,69 +3551,113 @@ impl NicordApp {
             ui.add_space(4.0);
             self.show_content_source(ui, i);
             ui.add_space(6.0);
-            ui.label("Node (theo thứ tự — bấm vào node lệnh hoặc Call API để sửa):");
             // Q1 preview: live Discord-style preview of the text
             // being composed, with a 2000-character counter.
             self.show_message_preview(ui);
             ui.add_space(6.0);
-            // Schedule editor (Q7) + template library (Q6) + embed (Q8).
-            self.show_schedule_editor(ui, i);
-            ui.add_space(6.0);
-            self.show_template_library(ui, i);
-            ui.add_space(6.0);
-            self.show_embed_composer(ui, i);
-            ui.add_space(6.0);
-            self.show_poll_composer(ui, i);
-            ui.add_space(6.0);
-            self.show_edit_mode_section(ui, i);
-            ui.add_space(6.0);
-            self.show_attachments_section(ui, i);
-            ui.add_space(6.0);
-            // Import warnings from the last import (Q3), if any.
-            if !self.import_warnings.is_empty() {
-                theme::card(ui, |ui| {
-                    theme::section_title(ui, "Cảnh báo import");
-                    for w in &self.import_warnings {
-                        theme::muted(ui, &format!("• {w}"));
+        });
+        ui.add_space(6.0);
+        // Workflow overview (redesign): the node list sits right
+        // after the compose area, so the scenario's shape is visible
+        // without scrolling through every section. Order is the
+        // execution order; creation order is fixed (no reordering
+        // control exists — the list is honest about that).
+        theme::card(ui, |ui| {
+            theme::section_header(
+                ui,
+                "Quy trình",
+                "Các node theo thứ tự chạy. Bấm vào node lệnh hoặc Call API để sửa thuộc tính.",
+            );
+            for (kind, id, cmd_name) in &nodes {
+                // Labels already carry the group prefix
+                // ("Hành động: Gửi tin nhắn *"); the badge shows the
+                // group, so the row shows the short name only.
+                let short = if kind == &NodeKind::ActionSendCommand {
+                    format!("Lệnh: {cmd_name}")
+                } else {
+                    kind.label()
+                        .split(": ")
+                        .nth(1)
+                        .unwrap_or(kind.label())
+                        .to_string()
+                };
+                let group_kind = match kind.group() {
+                    "Trigger" => theme::BadgeKind::Info,
+                    "Action" => theme::BadgeKind::Success,
+                    "Condition" => theme::BadgeKind::Warning,
+                    _ => theme::BadgeKind::Muted,
+                };
+                ui.horizontal(|ui| {
+                    theme::badge(ui, kind.group_label(), group_kind);
+                    if ui
+                        .selectable_label(self.selected_node.as_deref() == Some(id.as_str()), short)
+                        .clicked()
+                    {
+                        self.selected_node = Some(id.clone());
                     }
                 });
-                ui.add_space(6.0);
-            }
-            for (kind, id, cmd_name) in &nodes {
-                let label = if kind == &NodeKind::ActionSendCommand {
-                    format!("• {} — Lệnh: {cmd_name}", kind.group_label())
-                } else {
-                    format!("• {} — {}", kind.group_label(), kind.label())
-                };
-                if ui
-                    .selectable_label(self.selected_node.as_deref() == Some(id.as_str()), label)
-                    .clicked()
-                {
-                    self.selected_node = Some(id.clone());
-                }
-            }
-            self.show_command_editor(ui, i);
-            self.show_api_editor(ui, i);
-            // Node buttons + Validate + Export/Import live in the pinned
-            // action bar below the editor (show_builder_actions), so they
-            // are always visible without scrolling.
-            // Persist channel_id edits (1 distinct channel).
-            if let Ok(mut list) = self.scenarios.lock() {
-                let cur = list.get(i).map(|s| s.channel_id.clone());
-                if cur.as_deref() != Some(channel_id.as_str()) {
-                    let mut hypo = list.clone();
-                    if let Some(h) = hypo.get_mut(i) {
-                        h.channel_id = channel_id.clone();
-                    }
-                    if let Some(v) = channels_violation(&hypo) {
-                        self.set_status(&v);
-                    } else if let Some(s) = list.get_mut(i) {
-                        s.channel_id = channel_id;
-                        let _ = self.store.save_scenario(s);
-                    }
-                }
             }
         });
+        ui.add_space(6.0);
+        // Context inspector: the selected command / Call API node's
+        // editor, in the secondary surface, directly under the list.
+        // Other node kinds have no editor, so no empty panel shows.
+        let inspector_open = nodes.iter().any(|(kind, id, _)| {
+            self.selected_node.as_deref() == Some(id.as_str())
+                && matches!(kind, NodeKind::ActionSendCommand | NodeKind::UtilityCallApi)
+        });
+        if inspector_open {
+            theme::inspector_frame().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                theme::section_title(ui, "Thuộc tính node");
+                self.show_command_editor(ui, i);
+                self.show_api_editor(ui, i);
+            });
+            ui.add_space(6.0);
+        }
+        theme::group_label(ui, "LỊCH & MẪU");
+        ui.add_space(4.0);
+        self.show_schedule_editor(ui, i);
+        ui.add_space(6.0);
+        self.show_template_library(ui, i);
+        ui.add_space(6.0);
+        theme::group_label(ui, "NÂNG CAO");
+        ui.add_space(4.0);
+        self.show_embed_composer(ui, i);
+        ui.add_space(6.0);
+        self.show_poll_composer(ui, i);
+        ui.add_space(6.0);
+        self.show_edit_mode_section(ui, i);
+        ui.add_space(6.0);
+        self.show_attachments_section(ui, i);
+        ui.add_space(6.0);
+        // Import warnings from the last import (Q3), if any.
+        if !self.import_warnings.is_empty() {
+            theme::card(ui, |ui| {
+                theme::section_title(ui, "Cảnh báo import");
+                for w in &self.import_warnings {
+                    theme::muted(ui, &format!("• {w}"));
+                }
+            });
+            ui.add_space(6.0);
+        }
+
+        // Persist channel_id edits (1 distinct channel).
+        if let Ok(mut list) = self.scenarios.lock() {
+            let cur = list.get(i).map(|s| s.channel_id.clone());
+            if cur.as_deref() != Some(channel_id.as_str()) {
+                let mut hypo = list.clone();
+                if let Some(h) = hypo.get_mut(i) {
+                    h.channel_id = channel_id.clone();
+                }
+                if let Some(v) = channels_violation(&hypo) {
+                    self.set_status(&v);
+                } else if let Some(s) = list.get_mut(i) {
+                    s.channel_id = channel_id;
+                    let _ = self.store.save_scenario(s);
+                }
+            }
+        }
     }
 
     /// Content source line (Q6): which messages will actually send,
@@ -3925,9 +4205,9 @@ impl NicordApp {
     fn show_emoji_picker(&mut self, ui: &mut egui::Ui) {
         if ui
             .button(if self.show_emoji_picker {
-                "😀 Đóng bảng emoji"
+                "Đóng bảng emoji"
             } else {
-                "😀 Emoji"
+                "Emoji"
             })
             .clicked()
         {
@@ -4402,7 +4682,7 @@ impl NicordApp {
                         }
                         AttachmentStatus::Empty => {}
                     }
-                    if ui.button("✕").clicked() {
+                    if ui.button("x").clicked() {
                         remove = Some(idx);
                     }
                 });
@@ -4557,7 +4837,10 @@ impl NicordApp {
             ui.label("Tham số:");
             let mut opt_remove: Option<usize> = None;
             for (oi, opt) in cfg.options.iter_mut().enumerate() {
-                ui.horizontal(|ui| {
+                // Wrapped: name + kind + value + remove exceeds
+                // the editor column at narrow windows (same
+                // ScrollArea feedback-loop class).
+                ui.horizontal_wrapped(|ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut opt.name)
                             .hint_text("tên")
@@ -4577,7 +4860,7 @@ impl NicordApp {
                             .hint_text("giá trị")
                             .desired_width(110.0),
                     );
-                    if ui.button("✕").clicked() {
+                    if ui.button("x").clicked() {
                         opt_remove = Some(oi);
                     }
                 });
@@ -4606,7 +4889,7 @@ impl NicordApp {
             for (ai, arg) in cfg.args.iter_mut().enumerate() {
                 ui.horizontal(|ui| {
                     ui.add(egui::TextEdit::singleline(arg).hint_text("tham số"));
-                    if ui.button("✕").clicked() {
+                    if ui.button("x").clicked() {
                         arg_remove = Some(ai);
                     }
                 });
@@ -4804,7 +5087,7 @@ impl NicordApp {
                     }
                 }
                 // Short labels so Validate + both node buttons fit on one
-                // row in the narrow column (no wrap = no extra height).
+                // row in the narrow column.
                 if ui.button("+ Gửi tin nhắn").clicked() {
                     if let Ok(mut list) = self.scenarios.lock() {
                         if let Some(s) = list.get_mut(i) {
@@ -4821,6 +5104,13 @@ impl NicordApp {
                     }
                     self.save_scenarios();
                 }
+            });
+            // Second row, explicit: all five buttons in one wrapped
+            // row left "+ Chờ" half off-screen at 1100 px (verified
+            // by screenshot) — the wrap heuristic placed it past
+            // the visible edge. Two fixed rows are deterministic.
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
                 if ui.button("+ Chờ").clicked() {
                     if let Ok(mut list) = self.scenarios.lock() {
                         if let Some(s) = list.get_mut(i) {
@@ -5086,23 +5376,43 @@ impl NicordApp {
                     }
                     ui.add_space(6.0);
                     if dests.is_empty() {
-                        theme::muted(ui, "Chưa có đích đến nào — thêm webhook đầu tiên của bạn.");
+                        theme::empty_state(
+                            ui,
+                            "Chưa có đích đến nào",
+                            "Thêm webhook đầu tiên của bạn để gửi tới nhiều kênh.",
+                        );
                     }
                     for dest in &dests {
                         let selected = self.dest_selected_id.as_deref() == Some(dest.id.as_str());
-                        let state_text = if dest.encrypted_url.trim().is_empty() {
-                            "chưa có URL"
+                        let (state_text, state_kind) = if dest.encrypted_url.trim().is_empty() {
+                            ("Chưa có URL", theme::BadgeKind::Warning)
                         } else if !dest.enabled {
-                            "đã tắt"
+                            ("Đã tắt", theme::BadgeKind::Muted)
                         } else {
-                            dest.failure_state.label()
+                            match dest.failure_state {
+                                crate::destination::FailureState::Ok => {
+                                    ("Đang chạy", theme::BadgeKind::Success)
+                                }
+                                crate::destination::FailureState::Paused404
+                                | crate::destination::FailureState::Paused401 => {
+                                    (dest.failure_state.label(), theme::BadgeKind::Danger)
+                                }
+                                crate::destination::FailureState::PausedErrors => {
+                                    (dest.failure_state.label(), theme::BadgeKind::Warning)
+                                }
+                            }
                         };
+                        // Two rows, like the scenario rows: badge +
+                        // name on the first, actions below. Badge +
+                        // name + right-aligned actions in one row
+                        // squeezed the name at narrow windows
+                        // (verified at 900 px: "Đích đến mới"
+                        // rendered as "Đích đ").
                         ui.horizontal(|ui| {
+                            theme::badge(ui, state_text, state_kind);
                             if ui
-                                .selectable_label(
-                                    selected,
-                                    format!("{} — {state_text}", dest.display_name()),
-                                )
+                                .selectable_label(selected, dest.display_name())
+                                .on_hover_text(dest.display_name())
                                 .clicked()
                             {
                                 self.dest_selected_id = Some(dest.id.clone());
@@ -5111,35 +5421,28 @@ impl NicordApp {
                                 self.dest_new_message.clear();
                                 self.dest_delete_confirm = None;
                             }
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui.button("Gửi thử").clicked() {
-                                        self.test_destination(&dest.id);
+                        });
+                        ui.horizontal(|ui| {
+                            if ui.button("Gửi thử").clicked() {
+                                self.test_destination(&dest.id);
+                            }
+                            let toggle = if dest.enabled { "Tắt" } else { "Bật" };
+                            if ui.button(toggle).clicked() {
+                                let mut updated = dest.clone();
+                                updated.enabled = !dest.enabled;
+                                if updated.enabled && updated.encrypted_url.trim().is_empty() {
+                                    self.set_status(
+                                        "Không bật được: đích đến chưa có webhook URL.",
+                                    );
+                                } else if let Err(e) = updated.validate() {
+                                    self.set_status(&format!("Không bật được: {e}"));
+                                } else {
+                                    let _ = self.store.save_destination(&updated);
+                                    if self.dest_selected_id.as_deref() == Some(dest.id.as_str()) {
+                                        self.dest_draft = Some(updated);
                                     }
-                                    let toggle = if dest.enabled { "Tắt" } else { "Bật" };
-                                    if ui.button(toggle).clicked() {
-                                        let mut updated = dest.clone();
-                                        updated.enabled = !dest.enabled;
-                                        if updated.enabled
-                                            && updated.encrypted_url.trim().is_empty()
-                                        {
-                                            self.set_status(
-                                                "Không bật được: đích đến chưa có webhook URL.",
-                                            );
-                                        } else if let Err(e) = updated.validate() {
-                                            self.set_status(&format!("Không bật được: {e}"));
-                                        } else {
-                                            let _ = self.store.save_destination(&updated);
-                                            if self.dest_selected_id.as_deref()
-                                                == Some(dest.id.as_str())
-                                            {
-                                                self.dest_draft = Some(updated);
-                                            }
-                                        }
-                                    }
-                                },
-                            );
+                                }
+                            }
                         });
                         if !dest.channel_id.is_empty() {
                             theme::muted(ui, &format!("kênh: {}", dest.channel_id));
@@ -5173,6 +5476,8 @@ impl NicordApp {
                     t(self.lang(), "dest.edit")
                 },
             );
+            theme::group_label(ui, "KẾT NỐI");
+            ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.label("Tên thân thiện:");
                 ui.text_edit_singleline(&mut draft.name);
@@ -5230,31 +5535,33 @@ impl NicordApp {
                     ui.label(check_msg);
                 }
             });
-            theme::muted(ui, "Tạo webhook trong Discord: Cài đặt kênh → Tích hợp → Webhook. URL là mật khẩu — đừng chia sẻ.");
-            ui.separator();
+            theme::muted(ui, "Tạo webhook trong Discord: Cài đặt kênh -> Tích hợp -> Webhook. URL là mật khẩu — đừng chia sẻ.");
+            ui.add_space(8.0);
+            theme::group_label(ui, "HIỂN THỊ");
+            ui.add_space(4.0);
             ui.checkbox(&mut draft.enabled, "Bật đích đến này");
-            ui.horizontal(|ui| {
-                ui.label("Tên hiển thị khi gửi (để trống = tên webhook):");
-                ui.text_edit_singleline(&mut draft.username_override);
-                crate::destination::truncate_username_override(&mut draft.username_override);
-            });
-            ui.horizontal(|ui| {
-                ui.label("Avatar URL (https, để trống = avatar webhook):");
-                ui.text_edit_singleline(&mut draft.avatar_url_override);
-            });
-            ui.horizontal(|ui| {
-                ui.label("Thread ID (chỉ số, để trống = gửi vào kênh):");
-                ui.text_edit_singleline(&mut draft.thread_id);
-            });
+            // Label above the field: the long labels squeezed the
+            // fields to ~55 px in the narrow editor column.
+            ui.label("Tên hiển thị khi gửi (để trống = tên webhook):");
+            ui.text_edit_singleline(&mut draft.username_override);
+            crate::destination::truncate_username_override(&mut draft.username_override);
+            ui.label("Avatar URL (https, để trống = avatar webhook):");
+            ui.text_edit_singleline(&mut draft.avatar_url_override);
+            ui.label("Thread ID (chỉ số, để trống = gửi vào kênh):");
+            ui.text_edit_singleline(&mut draft.thread_id);
             theme::muted(ui, "Thread phải thuộc kênh của webhook (Discord sẽ tự mở lại thread đã lưu trữ). Hành vi với thread bị khóa chưa được kiểm chứng — hãy thử trên thread thật trước khi dựa vào nó.");
-            ui.horizontal(|ui| {
-                ui.label("Giới hạn tin/ngày (0 = dùng giới hạn toàn cục, tối đa 300):");
-                ui.add(egui::DragValue::new(&mut draft.daily_cap).range(0..=300));
-            });
-            ui.horizontal(|ui| {
-                ui.label("Khoảng cách tối thiểu giữa 2 lần gửi (giây, tối thiểu 5):");
-                ui.add(egui::DragValue::new(&mut draft.min_interval_secs).range(5..=3600));
-            });
+            ui.add_space(8.0);
+            theme::group_label(ui, "GIỚI HẠN");
+            ui.add_space(4.0);
+            // Label above the value: label + DragValue in one
+            // horizontal overflowed the narrow editor column and
+            // — via the ScrollArea content-width feedback loop —
+            // widened the whole screen (same class of bug as the
+            // Dashboard metric clip).
+            ui.label("Giới hạn tin/ngày (0 = dùng giới hạn toàn cục, tối đa 300):");
+            ui.add(egui::DragValue::new(&mut draft.daily_cap).range(0..=300));
+            ui.label("Khoảng cách tối thiểu giữa 2 lần gửi (giây, tối thiểu 5):");
+            ui.add(egui::DragValue::new(&mut draft.min_interval_secs).range(5..=3600));
             // Quiet window.
             let mut quiet_enabled = draft.quiet_start.is_some();
             ui.checkbox(
@@ -5272,26 +5579,32 @@ impl NicordApp {
                     .unwrap_or_else(|| "06:00".to_string());
                 ui.horizontal(|ui| {
                     ui.label("Từ (HH:MM):");
-                    ui.text_edit_singleline(&mut start);
+                    ui.add(egui::TextEdit::singleline(&mut start).desired_width(70.0));
                     ui.label("đến (HH:MM):");
-                    ui.text_edit_singleline(&mut end);
+                    ui.add(egui::TextEdit::singleline(&mut end).desired_width(70.0));
                 });
-                theme::muted(ui, "Hỗ trợ qua đêm (vd: 22:00 → 06:00). Giờ địa phương.");
+                theme::muted(ui, "Hỗ trợ qua đêm (vd: 22:00 -> 06:00). Giờ địa phương.");
                 draft.quiet_start = Some(start);
                 draft.quiet_end = Some(end);
             } else {
                 draft.quiet_start = None;
                 draft.quiet_end = None;
             }
-            ui.separator();
+            ui.add_space(8.0);
+            theme::group_label(ui, "TIN MẶC ĐỊNH");
+            ui.add_space(4.0);
             ui.label("Bộ tin mặc định (dùng khi kịch bản không có tin riêng):");
             let mut to_remove: Option<usize> = None;
             for (idx, msg) in draft.default_messages.iter().enumerate() {
+                // Button first: a long message + button in one
+                // horizontal would overflow the column (same
+                // ScrollArea feedback-loop class). The message
+                // wraps at the remaining width.
                 ui.horizontal(|ui| {
-                    ui.label(format!("• {msg}"));
                     if ui.button("Xóa").clicked() {
                         to_remove = Some(idx);
                     }
+                    ui.add(egui::Label::new(format!("• {msg}")).wrap());
                 });
             }
             if let Some(idx) = to_remove {
@@ -5507,12 +5820,23 @@ impl NicordApp {
             Vec::new()
         };
         theme::card(ui, |ui| {
+            // Three explicit rows: a ComboBox lives in a Frame whose
+            // size is fixed before the wrap check, so ComboBoxes in
+            // a wrapping row do not wrap — at 900 px the scenario
+            // dropdown clipped and the destination dropdown slid
+            // off-screen (verified by screenshot). Row 1: search.
             ui.horizontal(|ui| {
                 ui.label("Lọc:");
                 ui.add(
                     egui::TextEdit::singleline(&mut self.log_filter)
                         .hint_text("từ khóa (tên, trạng thái, chi tiết)"),
                 );
+            });
+            ui.add_space(4.0);
+            // Row 2: the filter dropdowns. Selected texts are
+            // truncated: a long scenario/destination name would
+            // otherwise widen its dropdown without bound.
+            ui.horizontal(|ui| {
                 // Status filter (QoL Q4).
                 let status_label = log_status_label(&self.log_status_filter);
                 egui::ComboBox::from_id_salt("log_status_filter")
@@ -5548,7 +5872,7 @@ impl NicordApp {
                 let scenario_label = scenario_options
                     .iter()
                     .find(|(id, _)| *id == self.log_scenario_filter)
-                    .map(|(_, name)| name.clone())
+                    .map(|(_, name)| truncate_display(name, 20))
                     .unwrap_or_else(|| "Tất cả kịch bản".to_string());
                 egui::ComboBox::from_id_salt("log_scenario_filter")
                     .selected_text(scenario_label)
@@ -5569,7 +5893,7 @@ impl NicordApp {
                     let dest_label = log_dests
                         .iter()
                         .find(|d| d.channel_id == self.log_channel_filter)
-                        .map(|d| d.display_name())
+                        .map(|d| truncate_display(&d.display_name(), 20))
                         .unwrap_or_else(|| "Tất cả đích đến".to_string());
                     egui::ComboBox::from_id_salt("log_channel_filter")
                         .selected_text(dest_label)
@@ -5590,6 +5914,10 @@ impl NicordApp {
                             }
                         });
                 }
+            });
+            ui.add_space(4.0);
+            // Row 3: actions.
+            ui.horizontal(|ui| {
                 if ui.button("Xuất lịch sử (CSV)").clicked() {
                     let path = config_dir().join("nicord-logs.csv");
                     let status = if self.log_status_filter.is_empty() {
@@ -5711,7 +6039,11 @@ impl NicordApp {
                 }
                 if rows.is_empty() {
                     theme::card(ui, |ui| {
-                        theme::muted(ui, "Chưa có lịch sử — lịch sử gửi sẽ hiện ở đây.");
+                        theme::empty_state(
+                            ui,
+                            "Chưa có lịch sử",
+                            "Lịch sử gửi sẽ hiện ở đây sau lần gửi đầu tiên.",
+                        );
                     });
                 } else {
                     // Destinations for manual delete (Q13): a row is
@@ -5723,17 +6055,23 @@ impl NicordApp {
                         .filter(|d| !d.encrypted_url.trim().is_empty())
                         .map(|d| d.id.clone())
                         .collect();
+                    theme::muted(
+                        ui,
+                        &format!("Hiển thị {} dòng (mới nhất trước).", rows.len()),
+                    );
+                    ui.add_space(4.0);
                     theme::card(ui, |ui| {
                         egui::ScrollArea::vertical().show(ui, |ui| {
                             for row in rows {
-                                let status_color = if row.status == "sent" {
-                                    theme::palette().success
+                                let status_kind = if row.status == "sent" || row.status == "edited"
+                                {
+                                    theme::BadgeKind::Success
                                 } else if row.status.contains("fail")
                                     || row.status.contains("error")
                                 {
-                                    theme::palette().danger
+                                    theme::BadgeKind::Danger
                                 } else {
-                                    theme::palette().text_secondary
+                                    theme::BadgeKind::Muted
                                 };
                                 ui.horizontal(|ui| {
                                     ui.label(
@@ -5741,11 +6079,17 @@ impl NicordApp {
                                             .monospace()
                                             .color(theme::palette().text_muted),
                                     );
-                                    ui.label(theme::semibold(&row.scenario_name, 15.0));
-                                    ui.label(
-                                        RichText::new(log_status_label(&row.status))
-                                            .color(status_color),
-                                    );
+                                    // Truncated: a long scenario name in
+                                    // this row overflowed narrow windows
+                                    // (same feedback-loop class); the
+                                    // full name is on hover + in the
+                                    // detail view.
+                                    ui.label(theme::semibold(
+                                        &truncate_display(&row.scenario_name, 30),
+                                        15.0,
+                                    ))
+                                    .on_hover_text(&row.scenario_name);
+                                    theme::badge(ui, log_status_label(&row.status), status_kind);
                                     if theme::ghost_button(ui, t(self.lang(), "logs.detail_btn"))
                                         .clicked()
                                     {
@@ -5757,25 +6101,33 @@ impl NicordApp {
                                     let can_delete = row.status == "sent"
                                         && !row.message_id.is_empty()
                                         && deletable.contains(&row.destination_id);
-                                    if can_delete {
-                                        if self.pending_delete_log == Some(row.id) {
-                                            ui.label(
-                                                RichText::new("Xóa tin này khỏi Discord? Không hoàn tác được.")
-                                                    .color(theme::palette().danger),
-                                            );
-                                            if theme::danger_button(ui, "Xóa").clicked() {
-                                                self.pending_delete_log = None;
-                                                self.delete_log_message(row.clone());
-                                            }
-                                            if theme::ghost_button(ui, "Hủy").clicked() {
-                                                self.pending_delete_log = None;
-                                            }
-                                        } else if theme::ghost_button(ui, "Xóa tin").clicked()
-                                        {
-                                            self.pending_delete_log = Some(row.id);
-                                        }
+                                    if can_delete
+                                        && self.pending_delete_log != Some(row.id)
+                                        && theme::ghost_button(ui, "Xóa tin").clicked()
+                                    {
+                                        self.pending_delete_log = Some(row.id);
                                     }
                                 });
+                                // The delete confirmation lives on its
+                                // own row: label + two buttons in the
+                                // row above overflowed narrow windows.
+                                if self.pending_delete_log == Some(row.id) {
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new(
+                                                "Xóa tin này khỏi Discord? Không hoàn tác được.",
+                                            )
+                                            .color(theme::palette().danger),
+                                        );
+                                        if theme::danger_button(ui, "Xóa").clicked() {
+                                            self.pending_delete_log = None;
+                                            self.delete_log_message(row.clone());
+                                        }
+                                        if theme::ghost_button(ui, "Hủy").clicked() {
+                                            self.pending_delete_log = None;
+                                        }
+                                    });
+                                }
                                 // Scrub on display: rows written before
                                 // the scheduler scrub boundary may still
                                 // hold a leaked URL.
@@ -6264,9 +6616,71 @@ impl NicordApp {
         }
     }
 
+    /// Save every Settings change and live-apply it (engine
+    /// anti-ban / allowlist / caps, autostart hook, tray). Called
+    /// from the pinned save bar at the bottom of Settings.
+    fn save_settings(&mut self) {
+        // Clamp destination limits to their documented bounds.
+        self.config.max_destinations = self
+            .config
+            .max_destinations
+            .clamp(1, crate::destination::MAX_DESTINATIONS_HARD as u32);
+        self.config.consecutive_error_limit = self.config.consecutive_error_limit.clamp(3, 10);
+        let _ = save_config(&self.config);
+        // Live-apply the anti-ban settings to the running engine.
+        self.engine.set_antiban(self.config.antiban.clone());
+        // Live-apply the API host allowlist (no restart needed).
+        self.engine
+            .set_api_allowlist(self.config.api_allowed_hosts.clone());
+        // Live-apply the destination caps (no restart needed).
+        self.engine
+            .set_global_daily_cap(self.config.global_daily_cap);
+        self.engine
+            .set_dest_error_limit(self.config.consecutive_error_limit);
+        // Apply the real OS autostart hook.
+        match crate::autostart::set_enabled(self.config.autostart) {
+            Ok(()) => self.set_status("Đã lưu cài đặt."),
+            Err(e) => self.set_status(&format!(
+                "Đã lưu cài đặt, nhưng không bật được khởi động cùng máy: {e}"
+            )),
+        }
+        #[cfg(target_os = "windows")]
+        self.sync_tray();
+    }
+
     fn show_settings(&mut self, ui: &mut egui::Ui) {
+        // Settings owns its scroll area plus a pinned save bar
+        // (same pattern as the Builder's pinned action bar): the
+        // save button used to sit mid-page and required scrolling
+        // to find at the default window size.
+        let bar_h = 64.0;
+        let avail = ui.available_height();
+        egui::ScrollArea::vertical()
+            .id_salt("scroll_settings")
+            .max_height((avail - bar_h).max(140.0))
+            .show(ui, |ui| {
+                self.show_settings_cards(ui);
+            });
+        ui.add_space(8.0);
+        theme::slim_card_frame().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                if theme::primary_button(ui, t(self.lang(), "btn.save_settings")).clicked() {
+                    self.save_settings();
+                }
+                theme::muted(
+                    ui,
+                    "Lưu mọi thay đổi trên trang này, áp dụng ngay mà không cần khởi động lại.",
+                );
+            });
+        });
+    }
+
+    fn show_settings_cards(&mut self, ui: &mut egui::Ui) {
         // Send mode: Webhook (official, recommended) or user-token
         // account mode. Switching never deletes the other credential.
+        theme::group_label(ui, "GỬI TIN");
+        ui.add_space(4.0);
         theme::card(ui, |ui| {
             theme::section_title(ui, t(self.lang(), "settings.send_mode"));
             ui.horizontal(|ui| {
@@ -6590,7 +7004,7 @@ impl NicordApp {
                     {
                         changed = true;
                     }
-                    if ui.button("✕").clicked() {
+                    if ui.button("x").clicked() {
                         remove = Some(idx);
                     }
                 });
@@ -6610,6 +7024,8 @@ impl NicordApp {
             }
         });
         ui.add_space(12.0);
+        theme::group_label(ui, "GIAO DIỆN & HÀNH VI");
+        ui.add_space(4.0);
         theme::card(ui, |ui| {
             theme::section_title(ui, "Giới hạn");
             ui.label("Giới hạn: 1 kênh • 300 tin nhắn/ngày (đặt lại lúc 00:00 UTC)");
@@ -6749,56 +7165,37 @@ impl NicordApp {
                     t(self.lang(), "settings.shortcuts")
                 ),
             );
-            ui.add_space(8.0);
-            if theme::primary_button(ui, t(self.lang(), "btn.save_settings")).clicked() {
-                // Clamp destination limits to their documented bounds.
-                self.config.max_destinations = self
-                    .config
-                    .max_destinations
-                    .clamp(1, crate::destination::MAX_DESTINATIONS_HARD as u32);
-                self.config.consecutive_error_limit =
-                    self.config.consecutive_error_limit.clamp(3, 10);
-                let _ = save_config(&self.config);
-                // Live-apply the anti-ban settings to the running engine.
-                self.engine.set_antiban(self.config.antiban.clone());
-                // Live-apply the API host allowlist (no restart needed).
-                self.engine
-                    .set_api_allowlist(self.config.api_allowed_hosts.clone());
-                // Live-apply the destination caps (no restart needed).
-                self.engine
-                    .set_global_daily_cap(self.config.global_daily_cap);
-                self.engine
-                    .set_dest_error_limit(self.config.consecutive_error_limit);
-                // Apply the real OS autostart hook.
-                match crate::autostart::set_enabled(self.config.autostart) {
-                    Ok(()) => self.set_status("Đã lưu cài đặt."),
-                    Err(e) => self.set_status(&format!(
-                        "Đã lưu cài đặt, nhưng không bật được khởi động cùng máy: {e}"
-                    )),
-                }
-                #[cfg(target_os = "windows")]
-                self.sync_tray();
-            }
         });
         ui.add_space(12.0);
+        theme::group_label(ui, "HỆ THỐNG");
+        ui.add_space(4.0);
         theme::card(ui, |ui| {
             theme::section_title(ui, t(self.lang(), "settings.updates"));
             ui.checkbox(
                 &mut self.config.auto_check_updates,
                 "Tự động kiểm tra cập nhật khi mở app",
             );
-            ui.horizontal(|ui| {
-                if theme::primary_button(ui, "Kiểm tra cập nhật").clicked() {
-                    self.check_updates(true);
-                }
-                ui.label(self.update_status_line());
-            });
+            // Button and status on separate rows: button + the
+            // unbounded status line (it can carry a full error
+            // URL) in one horizontal overflowed the viewport and
+            // — via the ScrollArea content-width feedback loop —
+            // widened the whole Settings screen, clipping every
+            // wrapped description (verified by screenshot).
+            if theme::primary_button(ui, "Kiểm tra cập nhật").clicked() {
+                self.check_updates(true);
+            }
+            let status = self.update_status_line();
+            if !status.is_empty() {
+                ui.add(egui::Label::new(status).wrap());
+            }
             theme::muted(
                 ui,
                 "Nicord chỉ hỏi bản phát hành công khai trên GitHub, không gửi dữ liệu cá nhân. Cập nhật chỉ diễn ra khi bạn đồng ý — file cài đặt được thay, còn token, kịch bản và lịch sử gửi vẫn nguyên.",
             );
         });
         ui.add_space(12.0);
+        theme::group_label(ui, "DỮ LIỆU");
+        ui.add_space(4.0);
         self.show_backup_card(ui);
         ui.add_space(12.0);
         self.show_maintenance_card(ui);
