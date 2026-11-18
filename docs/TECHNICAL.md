@@ -527,8 +527,8 @@ a paused destination stays paused across restarts until resumed.
   when a URL is saved from onboarding/Settings.
 - **Migration:** on startup, `ensure_destinations_migrated` creates
   one destination from the legacy URL (encrypted bytes copied
-  as-is, never decrypted) and assigns every scenario's
-  `destination_id` to it when the mode is Webhook. Idempotent and
+  as-is, never decrypted) and assigns every scenario without a
+  destination to it when the mode is Webhook. Idempotent and
   lossless; existing destinations are never duplicated.
 - **Engine:** one loop (guard kept). Per scenario, the sender is
   resolved from the scenario's destination. Pre-send checks:
@@ -544,13 +544,176 @@ a paused destination stays paused across restarts until resumed.
   stagger separates webhook sends in one tick. Content fallback:
   node message → scenario messages → destination default messages.
 - **UI:** Destinations screen (list + editor + delete with scenario
-  reassignment + clone starting without a URL). Builder picks one
-  destination per scenario (enabled destinations only). Dashboard
+  reassignment + clone starting without a URL). Builder picks the
+  scenario's destinations (see Broadcast below). Dashboard
   shows a card per destination plus a global-pause banner. Logs
   filter by destination (channel id). `thread_id` is validated
   (digits only) but not used for sending until verified.
 - **User-token mode is unchanged:** single-channel rule, no
   destinations, no shared multi-channel send path.
+
+## Broadcast (idea #1): one scenario, many destinations
+
+A scenario in Webhook mode lists its destinations
+(`destination_ids`); one firing sends the same message to EVERY
+listed destination, sequentially, with a fixed 1-second stagger
+between webhook sends. Each destination keeps its own fault
+isolation: its own pre-send checks (enabled, paused, URL, quiet
+window, 429 cooldown, daily cap), its own 429 handling, and its
+own consecutive-error counting. One destination's failure never
+blocks the others.
+
+- **Model:** `Scenario.destination_ids: Vec<String>`. Older files
+  stored one id under `"destination_id"` (a string); the
+  deserializer reads that form into the vec (empty and duplicate
+  ids dropped), so old scenarios, exports, and backups keep
+  working. New files serialize only `"destination_ids"`.
+  Validation (webhook mode) requires at least one id and rejects
+  duplicates — a duplicate would send twice to one channel.
+- **Engine:** the run loop resolves one (sender, destination)
+  pair per destination id (an unresolvable id is skipped with a
+  warning, never fatal) and calls `send_once` per target, each
+  with its own template identity (`{{username}}` = that
+  destination's effective name). Per-target results fold into one
+  outcome: any success consumes the run and resets the engine
+  error streak, while hard-failed targets still get their failure
+  rows and per-destination error counting; all-deferred retries
+  later; all-skipped/all-invalid consume quietly; all-failed
+  surfaces one combined error naming every target. Test-send
+  (Dashboard) fans out the same way and reports per-destination
+  results.
+- **UI:** the Builder destination picker is a checkbox list
+  (enabled destinations checkable; a selected-but-disabled one
+  shows greyed out, still stored, skipped at send time). A
+  warning appears when two selected destinations share a channel
+  id (two webhooks in one channel would duplicate every message).
+  Deleting a destination removes its id from every scenario; a
+  scenario left with no destination is reassigned or disabled, as
+  chosen in the delete dialog.
+- **Import:** destination ids that were not imported are removed
+  from scenario lists, with a warning per scenario.
+
+## Edit-in-place (idea #2): living messages
+
+A scenario can edit its previous message instead of posting a new
+one each firing (`edit_last_message`). The first firing posts new
+and records the message id; later firings PATCH that message. One
+id is remembered per target (destination id in Webhook mode,
+channel id in user-token mode), so broadcast + edit mode track
+each destination's living message separately.
+
+- **Model:** `Scenario.last_message_ids: HashMap<String, String>`,
+  persisted in the scenario JSON and exported/imported with it.
+  The engine loop records ids after successful sends (in the same
+  save as `last_run_at`); `send_once` never writes the scenario,
+  so test sends preview edit behaviour without rewriting stored
+  ids. The Builder shows how many messages are remembered and
+  offers "Quên tin nhắn cũ" (clear) so the next firing posts new.
+- **Endpoints:** `PATCH /channels/{id}/messages/{mid}` (user
+  mode) and `PATCH /webhooks/{id}/{token}/messages/{mid}`
+  (webhook mode, honouring `thread_id`). The edit body carries
+  content/embeds/`allowed_mentions`/flags only — no
+  username/avatar (execute-only) and no poll (polls cannot be
+  changed after sending). Message ids are digits-only validated
+  before any request (URL path).
+- **404 fallback:** a gone message (deleted in Discord) falls
+  back to a fresh send with an honest log line — and does NOT
+  pause the destination, because a deleted message says nothing
+  about the webhook. If the webhook itself is gone, the fallback
+  POST 404s and pauses the destination as usual.
+- **Counting:** edits log with status `"edited"` and count as
+  deliveries everywhere sends do: daily caps (global and
+  per-destination), the 7-day chart, the in-memory `sent_today`
+  counter, durable `{{counter:}}` increments, and the
+  destination minimum-interval clock. Edits skip auto-delete
+  (deleting the living message would defeat the mode) but keep
+  auto-break pacing. Logs filter offers "edited" as a status.
+- **Validation:** edit mode + a Send Command node is rejected
+  (commands are sent fresh every time and ignore the mode).
+  Attachments (idea #4) ride the first send only; edits never
+  re-send files.
+
+## Attachments (idea #4): files with messages
+
+A scenario lists local file paths (`attachments`); every fresh
+send uploads them with the message via Discord's multipart
+format (`payload_json` + `files[i]` parts). Both transports
+support it (user-mode `POST /channels/{id}/messages` and webhook
+execute). Edits never carry files.
+
+- **Model:** only PATHS are stored, in the scenario JSON. The
+  files themselves are read at send time and are NOT included in
+  exports, backups, or the config — a move to another machine
+  means re-picking paths, and import warns about it. Validation
+  allows at most 10 files (Discord's limit) with non-empty paths.
+- **Send-time policy:** files are read once per send (retries
+  re-send the same bytes). A missing, unreadable, non-file, or
+  oversize path is skipped with a warning — the message still
+  goes out, the skipped file is named (file name only, never the
+  full local path) in the log row's detail and in tracing, and
+  the Builder shows the same status live. Never a crash, never a
+  blocked send. The per-file cap is 8 MiB (Discord's base
+  limit); boosted servers allow more, but Nicord never assumes a
+  boost. MIME types are guessed from the extension (small
+  built-in map, `application/octet-stream` fallback).
+- **UI:** the Builder attachments section edits paths inline,
+  shows each file's size or its skip reason, and adds/removes
+  paths (manual entry — no native file picker dependency, so the
+  build stays identical on all three OSes).
+- **Live verification still needed:** a real send with a file
+  attached, on each transport, confirming the file arrives and
+  the multipart body is accepted.
+
+## HTTP data (idea #5): Call API nodes
+
+A `UtilityCallApi` node fetches one JSON value from an HTTPS
+endpoint before the message renders, and binds it to a template
+variable (`{{name}}`). Nodes run in node order, before counters
+and rendering; fetched values override same-named scenario
+variables (fresher data wins). Command nodes do not receive API
+values, matching counters.
+
+- **URL as a secret.** The URL may contain an API key, so the
+  node stores only a secret-store reference (`url_ref`, entry
+  `api-url:<node-id>`, same keyring/blob machinery as webhook
+  URLs and tokens) plus the host in plaintext for display
+  (`url_host`). The Builder URL field is a password field; once
+  saved, the URL is never shown again, only the host. The URL
+  is never logged: fetch errors name the host at most, and
+  reqwest errors pass through `without_url()`.
+- **Fences.** HTTPS only (strict parser: rejects http,
+  userinfo, fragments, whitespace, bad ports; allows explicit
+  ports, IP literals, and localhost). Optional host allowlist
+  in `AppConfig.api_allowed_hosts`, mirrored live into the
+  engine (same RwLock pattern as the anti-ban config; empty =
+  any HTTPS host; a leading-dot entry matches subdomains but
+  not the bare domain). Per-fetch timeout (default 10 s, 1–60),
+  1 MiB streaming response cap (refused as soon as crossed),
+  no auth, no cookies, no redirects beyond reqwest's default.
+  The allowlist is persisted in config and carried by
+  export/import. SSRF is the user's responsibility: the
+  endpoints are their own, on their own machine.
+- **Failure policy.** Per node: "skip" (default) writes a
+  failure row naming the host and variable, consumes the turn
+  via the `skip:` taxonomy (no engine-pause escalation), and
+  sends nothing; "empty" binds `""` and sends with a warning.
+  Validation is structural only (non-empty ref, valid variable
+  name, non-empty dotted field path, timeout in range,
+  policy in {skip, empty}) — the secret is resolved at fetch
+  time, and scheme + allowlist are enforced there and at paste
+  time in the editor. Duplicate variable names across Call API
+  nodes are rejected. A numeric path segment indexes arrays
+  only, never object keys; an empty path means the whole
+  document. Missing fields fail the fetch (no silent empty).
+- **Import.** API URLs are per-machine secrets: an imported
+  scenario keeps its node references but the URLs do not
+  travel, so both the single-scenario import and the backup
+  import warn that URLs must be re-entered on this machine.
+  A stale reference fails closed at send time.
+- **Live verification still needed:** a Call API node against
+  a real HTTPS JSON endpoint, confirming the value lands in
+  the sent message, plus a failing endpoint confirming the
+  skip policy (failure row, no send) and the empty policy.
 
 ## Quality of life (P1)
 

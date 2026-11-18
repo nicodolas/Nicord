@@ -46,6 +46,7 @@ Bạn chỉ cần mở app, soạn nội dung, đặt lịch, rồi để app ch
 
 - Mỗi kênh là một đích đến với webhook chính thức của Discord, có cài đặt riêng: tên hiển thị, giới hạn gửi mỗi ngày, khoảng nghỉ tối thiểu, khung giờ im lặng, tin nhắn mặc định.
 - Theo dõi trạng thái từng kênh: webhook còn tốt không, hôm nay đã gửi bao nhiêu, lần tới gửi khi nào. Kênh gặp lỗi sẽ tự tạm dừng, các kênh khác vẫn chạy bình thường.
+- Một kịch bản có thể gửi cùng một tin tới nhiều kênh cùng lúc — mỗi kênh vẫn giữ giới hạn, khung giờ im lặng và lỗi riêng.
 - Gửi vào thread trong kênh, nếu bạn muốn.
 
 ### Soạn tin nhắn như trong Discord
@@ -53,6 +54,9 @@ Bạn chỉ cần mở app, soạn nội dung, đặt lịch, rồi để app ch
 - Xem trước tin nhắn đúng kiểu Discord ngay khi gõ, kèm đếm ký tự; tin quá 2000 ký tự sẽ bị chặn trước khi gửi.
 - Thư viện mẫu tin dùng lại, xoay vòng nhiều mẫu, spin text, biến ngày/giờ.
 - Embed với tiêu đề, mô tả, màu sắc và trường thông tin; bảng chọn emoji.
+- Chế độ sửa tin nhắn cũ: thay vì gửi tin mới mỗi lần, kịch bản sửa ngay tin nhắn trước đó — tin luôn mới mà kênh không bị tràn; nếu tin đã bị xóa thì tự gửi tin mới.
+- Đính kèm file vào tin nhắn: ảnh, tài liệu, tối đa 10 tệp mỗi tin; file thiếu hoặc quá lớn sẽ bị bỏ qua và báo rõ trong lịch sử, tin vẫn gửi bình thường.
+- Lấy dữ liệu từ web: kịch bản có thể tải một giá trị JSON từ địa chỉ https của bạn và chèn vào tin nhắn; địa chỉ được lưu mã hóa, chỉ lấy từ host bạn cho phép, và khi lỗi có thể bỏ lượt hoặc gửi với giá trị rỗng.
 
 ### Lịch gửi linh hoạt
 

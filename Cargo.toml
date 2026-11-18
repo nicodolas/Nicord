@@ -13,7 +13,7 @@ eframe = { version = "0.31", default-features = false, features = ["glow", "defa
 egui = "0.31"
 # Async + HTTP (Discord REST only; no gateway needed for scheduled sending)
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "multipart"] }
 # Auto-update: extract the release zip (Deflate, as produced by
 # Compress-Archive in the release workflow). Pure Rust, no system deps.
 zip = "2"

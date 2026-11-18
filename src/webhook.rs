@@ -13,8 +13,8 @@
 //! command nodes in webhook mode instead of pretending they work.
 
 use crate::discord::{
-    discord_error_from_status, reqwest_error, AllowedMentions, DiscordClient, DiscordError,
-    SendOptions, SentMessage,
+    discord_error_from_status, reqwest_error, AllowedMentions, AttachedFile, DiscordClient,
+    DiscordError, SendOptions, SentMessage,
 };
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -296,6 +296,65 @@ impl WebhookClient {
         }
     }
 
+    /// Execute with file attachments (idea #4): the same JSON body
+    /// as `send_message_with_embeds`, carried as the `payload_json`
+    /// part of a multipart request.
+    pub async fn send_message_with_files(
+        &self,
+        content: &str,
+        embeds: &[crate::embed::Embed],
+        opts: &SendOptions,
+        poll: Option<&crate::poll::Poll>,
+        files: &[AttachedFile],
+    ) -> Result<SentMessage, DiscordError> {
+        if content.chars().count() > 2000 {
+            return Err(DiscordError::Other(
+                "message is longer than Discord's 2000-character limit".into(),
+            ));
+        }
+        let body = ExecuteBody {
+            content,
+            username: if self.username_override.is_empty() {
+                None
+            } else {
+                Some(&self.username_override)
+            },
+            avatar_url: if self.avatar_url_override.is_empty() {
+                None
+            } else {
+                Some(&self.avatar_url_override)
+            },
+            embeds: embeds.iter().map(|e| e.to_json()).collect(),
+            allowed_mentions: opts.allowed_mentions(),
+            flags: opts.flags(),
+            poll: poll.map(|p| p.to_json()),
+        };
+        let payload_json =
+            serde_json::to_string(&body).map_err(|e| DiscordError::Other(e.to_string()))?;
+        let form = crate::discord::build_multipart_form(&payload_json, files);
+        let resp = self
+            .http
+            .post(self.execute_url())
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| reqwest_error("network error", e))?;
+        match resp.status() {
+            StatusCode::OK | StatusCode::CREATED => resp
+                .json()
+                .await
+                .map_err(|e| reqwest_error("bad webhook send response", e)),
+            StatusCode::NO_CONTENT => Ok(SentMessage {
+                id: String::new(),
+                channel_id: String::new(),
+            }),
+            s => Err(discord_error_from_status(
+                s,
+                &resp.text().await.unwrap_or_default(),
+            )),
+        }
+    }
+
     /// Delete one message sent through this webhook (Q13, manual
     /// only — the Logs screen calls this after explicit confirmation;
     /// nothing automatic ever calls it). Discord returns 204 and
@@ -330,6 +389,67 @@ impl WebhookClient {
         }
     }
 
+    /// Edit a message sent through this webhook (idea #2).
+    /// PATCH carries content/embeds/allowed_mentions/flags only —
+    /// no username/avatar (execute-only) and no poll (not
+    /// editable). Honours `thread_id` for thread messages, like
+    /// delete. A 404 means the message is gone and surfaces as
+    /// `NotFound` so the caller can fall back to a fresh send (it
+    /// must NOT pause the destination: the webhook itself may be
+    /// fine). The id must be digits-only (URL path).
+    pub async fn edit_message(
+        &self,
+        message_id: &str,
+        content: &str,
+        embeds: &[crate::embed::Embed],
+        opts: &SendOptions,
+    ) -> Result<SentMessage, DiscordError> {
+        let id = message_id.trim();
+        if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(DiscordError::Other(
+                "message id must be a numeric Discord snowflake".into(),
+            ));
+        }
+        if content.chars().count() > 2000 {
+            return Err(DiscordError::Other(
+                "message is longer than Discord's 2000-character limit".into(),
+            ));
+        }
+        let mut url = format!("{}/messages/{id}", self.url.base_url);
+        if let Some(thread_id) = self.safe_thread_id() {
+            url.push_str(&format!("?thread_id={thread_id}"));
+        }
+        let body = EditBody {
+            content,
+            embeds: embeds.iter().map(|e| e.to_json()).collect(),
+            allowed_mentions: opts.allowed_mentions(),
+            flags: opts.flags(),
+        };
+        let resp = self
+            .http
+            .patch(url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| reqwest_error("network error", e))?;
+        match resp.status() {
+            StatusCode::OK | StatusCode::CREATED => resp
+                .json()
+                .await
+                .map_err(|e| reqwest_error("bad webhook edit response", e)),
+            // 204 should not happen for edits, but handle it: the
+            // edit went through, no message body to report.
+            StatusCode::NO_CONTENT => Ok(SentMessage {
+                id: String::new(),
+                channel_id: String::new(),
+            }),
+            s => Err(discord_error_from_status(
+                s,
+                &resp.text().await.unwrap_or_default(),
+            )),
+        }
+    }
+
     /// GET the webhook object (validation + display: name, channel).
     pub async fn get_webhook(&self) -> Result<WebhookInfo, DiscordError> {
         let resp = self
@@ -353,6 +473,20 @@ impl WebhookClient {
 
 /// The engine's send transport: either a user-token client or a
 /// webhook client. The engine calls `send_text` and never knows
+/// Edit-webhook-message request body: content/embeds/mentions/flags
+/// only. No username/avatar (execute-only), no poll (not editable).
+/// Module-level so its serialization is unit-testable without a network.
+#[derive(Serialize)]
+struct EditBody<'a> {
+    content: &'a str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    embeds: Vec<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allowed_mentions: Option<AllowedMentions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    flags: Option<u32>,
+}
+
 /// Execute-webhook request body. Module-level (not local to the
 /// send fn) so its serialization is unit-testable without a network.
 #[derive(Serialize)]
@@ -407,6 +541,49 @@ impl MessageSender {
             }
         }
     }
+
+    /// Send text with file attachments (idea #4). Empty `files`
+    /// behaves like a plain send (callers branch on that).
+    pub async fn send_with_files(
+        &self,
+        channel_id: &str,
+        content: &str,
+        embeds: &[crate::embed::Embed],
+        opts: &SendOptions,
+        poll: Option<&crate::poll::Poll>,
+        files: &[AttachedFile],
+    ) -> Result<SentMessage, DiscordError> {
+        match self {
+            MessageSender::User(c) => {
+                c.send_message_with_files(channel_id, content, embeds, opts, poll, files)
+                    .await
+            }
+            MessageSender::Webhook(c) => {
+                c.send_message_with_files(content, embeds, opts, poll, files)
+                    .await
+            }
+        }
+    }
+
+    /// Edit a previously sent message (idea #2). No poll: polls
+    /// cannot be changed after sending. A 404 surfaces as
+    /// `NotFound` so the caller can fall back to a fresh send.
+    pub async fn edit_message(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        content: &str,
+        embeds: &[crate::embed::Embed],
+        opts: &SendOptions,
+    ) -> Result<SentMessage, DiscordError> {
+        match self {
+            MessageSender::User(c) => {
+                c.edit_message(channel_id, message_id, content, embeds, opts)
+                    .await
+            }
+            MessageSender::Webhook(c) => c.edit_message(message_id, content, embeds, opts).await,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -415,6 +592,28 @@ mod tests {
 
     const GOOD: &str =
         "https://discord.com/api/webhooks/123456789/AbCdEfGhIjKlMnOpQrStUvWxYz0123456789";
+
+    #[test]
+    fn edit_body_carries_no_username_avatar_or_poll() {
+        let opts = SendOptions {
+            allow_mass_mentions: false,
+            silent: true,
+        };
+        let body = EditBody {
+            content: "hello",
+            embeds: vec![],
+            allowed_mentions: opts.allowed_mentions(),
+            flags: opts.flags(),
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        assert!(json.contains("\"content\":\"hello\""), "json: {json}");
+        assert!(json.contains("allowed_mentions"), "json: {json}");
+        assert!(json.contains("\"flags\":4096"), "json: {json}");
+        assert!(!json.contains("username"), "json: {json}");
+        assert!(!json.contains("avatar"), "json: {json}");
+        assert!(!json.contains("poll"), "json: {json}");
+        assert!(!json.contains("embeds"), "json: {json}");
+    }
 
     #[test]
     fn parse_accepts_valid_discord_url() {

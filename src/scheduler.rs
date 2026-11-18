@@ -14,7 +14,10 @@ use crate::{
     destination::{Destination, FailureState},
     discord::{build_interaction_payload, make_nonce, DiscordClient, DiscordError},
     gateway::{Gateway, SESSION_WAIT_SECS},
-    scenario::{due_time, render_template_with_vars, CommandConfig, Scenario, Schedule},
+    scenario::{
+        due_time, render_template_with_vars, ApiCallConfig, CommandConfig, NodeKind, Scenario,
+        Schedule,
+    },
     spintax::{apply_spintax, vary_message},
     store::Store,
     webhook::MessageSender,
@@ -88,6 +91,10 @@ pub struct Engine {
     /// new config while the engine reads a clone per send, so a toggle
     /// takes effect without restarting the engine.
     pub antiban: std::sync::RwLock<AntiBanConfig>,
+    /// API host allowlist (idea #5), live-editable the same way:
+    /// the UI writes the list, the engine reads a clone per fetch.
+    /// Empty = any HTTPS host.
+    pub api_allowed_hosts: std::sync::RwLock<Vec<String>>,
     /// Last send time per channel (enforces the per-channel interval).
     last_sent: Mutex<HashMap<String, Instant>>,
     /// Last message index sent per scenario (rotation never repeats).
@@ -147,6 +154,176 @@ pub struct Engine {
     error_pause_until: std::sync::Mutex<Option<Instant>>,
 }
 
+/// Human-readable byte size ("340 B", "2.1 KB", "9.0 MB") for
+/// attachment status lines. Shared with the Builder UI.
+pub(crate) fn format_bytes(n: u64) -> String {
+    if n >= 1024 * 1024 {
+        format!("{:.1} MB", n as f64 / (1024.0 * 1024.0))
+    } else if n >= 1024 {
+        format!("{:.1} KB", n as f64 / 1024.0)
+    } else {
+        format!("{n} B")
+    }
+}
+
+/// Read attachment files for one send (idea #4). Returns
+/// (files, skipped): a missing/unreadable/oversize/non-file path
+/// is skipped with its reason — never fatal, never a crash. Only
+/// the file NAME (never the full path) is reported, to keep local
+/// paths out of logs. At most MAX_ATTACHMENTS files are read
+/// (validation enforces the same cap; this clamps defensively for
+/// hand-built scenarios). Synchronous reads: files are local and
+/// capped at 8 MiB each, so the block is short.
+fn load_attachments(paths: &[String]) -> (Vec<crate::discord::AttachedFile>, Vec<String>) {
+    let mut files = Vec::new();
+    let mut skipped = Vec::new();
+    for raw in paths.iter().take(crate::discord::MAX_ATTACHMENTS) {
+        let path = raw.trim();
+        if path.is_empty() {
+            continue;
+        }
+        let name = std::path::Path::new(path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "(unnamed file)".to_string());
+        let meta = match std::fs::metadata(path) {
+            Ok(m) => m,
+            Err(_) => {
+                skipped.push(format!("{name} (missing)"));
+                continue;
+            }
+        };
+        if !meta.is_file() {
+            skipped.push(format!("{name} (not a file)"));
+            continue;
+        }
+        if meta.len() > crate::discord::MAX_ATTACHMENT_BYTES {
+            skipped.push(format!(
+                "{name} ({} over the 8 MB limit)",
+                format_bytes(meta.len())
+            ));
+            continue;
+        }
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                // Re-check after the read: the file may have grown
+                // between the metadata check and the read.
+                if bytes.len() as u64 > crate::discord::MAX_ATTACHMENT_BYTES {
+                    skipped.push(format!(
+                        "{name} ({} over the 8 MB limit)",
+                        format_bytes(bytes.len() as u64)
+                    ));
+                    continue;
+                }
+                files.push(crate::discord::AttachedFile {
+                    filename: name.clone(),
+                    content_type: crate::discord::guess_content_type(&name).to_string(),
+                    bytes,
+                });
+            }
+            Err(e) => skipped.push(format!("{name} (unreadable: {e})")),
+        }
+    }
+    (files, skipped)
+}
+
+/// Storage key for a scenario's last message id (idea #2): the
+/// destination id in webhook mode, the channel id in user-token
+/// mode. One entry per target, so broadcast + edit mode track
+/// each destination's living message separately.
+fn edit_key(destination: Option<&Destination>, channel_id: &str) -> String {
+    destination
+        .map(|d| d.id.clone())
+        .unwrap_or_else(|| channel_id.to_string())
+}
+
+/// One target's result inside a broadcast firing (idea #1).
+struct TargetResult {
+    /// Display label for error detail ("account" in user-token
+    /// mode, the destination's display name in webhook mode).
+    label: String,
+    /// Destination id ("" in user-token mode) for the log row.
+    destination_id: String,
+    /// Channel id for the log row (destination channel in webhook
+    /// mode, scenario channel in user-token mode).
+    channel_id: String,
+    /// Edit-in-place storage key (idea #2).
+    edit_key: String,
+    result: Result<String, String>,
+}
+
+/// Outcome of one broadcast firing: per-target results folded into
+/// the run loop's existing error taxonomy, so one firing consumes
+/// exactly one run and one destination's failure never blocks the
+/// others.
+enum BroadcastOutcome {
+    /// At least one target accepted the send.
+    Success,
+    /// Every attempted target deferred (429 cooldown / min interval).
+    Deferred(String),
+    /// Every attempted target skipped (cap / quiet window / disabled).
+    Skipped(String),
+    /// The scenario itself is invalid.
+    Invalid(String),
+    /// Every attempted target failed with a hard error. Carries the
+    /// combined detail naming every target.
+    Failed(String),
+}
+
+/// Whether an error is a hard failure (counts toward error
+/// limits), as opposed to the run loop's defer/skip/invalid
+/// taxonomy.
+fn is_hard_broadcast_error(e: &str) -> bool {
+    !(e.starts_with("defer:") || e.starts_with("skip:") || e.starts_with("invalid scenario:"))
+}
+
+/// Fold per-target results into one outcome. Precedence: any
+/// success wins; otherwise a defer wins (a retryable target must
+/// never be consumed as failed); otherwise a hard failure wins
+/// (it must surface and count); skip and invalid consume quietly.
+/// `results` must be non-empty (the caller skips the firing when
+/// nothing was attempted).
+fn aggregate_broadcast(results: &[TargetResult]) -> BroadcastOutcome {
+    if results.iter().any(|r| r.result.is_ok()) {
+        return BroadcastOutcome::Success;
+    }
+    let first_with = |prefix: &str| {
+        results
+            .iter()
+            .filter_map(|r| r.result.as_ref().err())
+            .find(|e| e.starts_with(prefix))
+            .cloned()
+    };
+    if let Some(e) = first_with("defer:") {
+        return BroadcastOutcome::Deferred(e);
+    }
+    if results
+        .iter()
+        .filter_map(|r| r.result.as_ref().err())
+        .any(|e| is_hard_broadcast_error(e))
+    {
+        let combined = results
+            .iter()
+            .filter_map(|r| r.result.as_ref().err().map(|e| format!("{}: {e}", r.label)))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return BroadcastOutcome::Failed(format!(
+            "broadcast failed for {} target(s): {combined}",
+            results.len()
+        ));
+    }
+    if let Some(e) = first_with("skip:") {
+        return BroadcastOutcome::Skipped(e);
+    }
+    if let Some(e) = first_with("invalid scenario:") {
+        return BroadcastOutcome::Invalid(e);
+    }
+    // Unreachable: every result is Err, and any Err is either
+    // defer/skip/invalid or hard. Kept as a defensive fallback so a
+    // future error prefix can never silently consume a run.
+    BroadcastOutcome::Failed("broadcast failed: unknown error".to_string())
+}
+
 impl Engine {
     pub fn new(
         store: Arc<Store>,
@@ -158,6 +335,7 @@ impl Engine {
         Self {
             store,
             antiban: std::sync::RwLock::new(antiban),
+            api_allowed_hosts: std::sync::RwLock::new(Vec::new()),
             last_sent: Mutex::new(HashMap::new()),
             last_msg_index: Mutex::new(HashMap::new()),
             sent_today: Mutex::new(sent),
@@ -252,6 +430,22 @@ impl Engine {
         self.antiban.read().map(|c| c.clone()).unwrap_or_default()
     }
 
+    /// Current API host allowlist (clone per fetch).
+    pub fn api_allowlist(&self) -> Vec<String> {
+        self.api_allowed_hosts
+            .read()
+            .map(|c| c.clone())
+            .unwrap_or_default()
+    }
+
+    /// Replace the API host allowlist live (Settings Save). Takes
+    /// effect on the next fetch — no engine restart needed.
+    pub fn set_api_allowlist(&self, hosts: Vec<String>) {
+        if let Ok(mut c) = self.api_allowed_hosts.write() {
+            *c = hosts;
+        }
+    }
+
     /// Replace the anti-ban config live (Settings Save). Takes effect
     /// on the next send — no engine restart needed.
     pub fn set_antiban(&self, cfg: AntiBanConfig) {
@@ -338,6 +532,55 @@ impl Engine {
     fn reset_dest_errors(&self, dest_id: &str) {
         if let Ok(mut map) = self.dest_errors.lock() {
             map.remove(dest_id);
+        }
+    }
+
+    /// Write one failure row per hard-failed broadcast target and
+    /// run per-destination error escalation for each. Shared by the
+    /// partial-success and total-failure arms of the run loop, so
+    /// Logs shows every destination's failure in both cases.
+    /// Details are scrubbed before truncating so a URL straddling
+    /// the cut cannot survive in part.
+    fn log_broadcast_failures(&self, scenario: &Scenario, results: &[TargetResult]) {
+        for r in results {
+            let Err(e) = &r.result else {
+                continue;
+            };
+            if !is_hard_broadcast_error(e) {
+                continue;
+            }
+            let safe_err = crate::store::scrub_secrets(e);
+            let detail: String = safe_err.chars().take(1000).collect();
+            self.write_log(&SendLogEntry {
+                scenario_id: scenario.id.clone(),
+                scenario_name: scenario.name.clone(),
+                channel_id: r.channel_id.clone(),
+                status: "failed".into(),
+                detail,
+                message_id: String::new(),
+                destination_id: r.destination_id.clone(),
+            });
+            if !r.destination_id.is_empty() {
+                self.escalate_dest_errors(&r.destination_id, &safe_err);
+            }
+        }
+    }
+
+    /// Per-destination consecutive-error escalation: pause only that
+    /// destination when it crosses the limit. Never overwrite a
+    /// 404/401 pause set by the send path itself.
+    fn escalate_dest_errors(&self, dest_id: &str, safe_err: &str) {
+        if self.record_dest_error(dest_id) {
+            if let Ok(Some(current)) = self.store.load_destination(dest_id) {
+                if current.failure_state == FailureState::Ok {
+                    let _ = self.store.set_destination_failure(
+                        dest_id,
+                        FailureState::PausedErrors,
+                        safe_err,
+                    );
+                    crate::notify::play(crate::notify::SoundEvent::DestinationPaused);
+                }
+            }
         }
     }
 
@@ -450,6 +693,90 @@ impl Engine {
     /// a failure; the run retries on a later tick, slightly late.
     /// `destination` is Some in webhook mode (per-destination checks),
     /// None in user-token mode. Never panics on Discord errors.
+    /// Execute the scenario's Call API nodes (idea #5), in node
+    /// order, returning variable name → fetched value. Runs before
+    /// template rendering so `{{variable}}` resolves to fetched
+    /// data. On failure: the "skip" policy (default) writes a
+    /// failure row — so a dying API is visible in Logs — and
+    /// returns a "skip:" error (the turn is consumed, with no
+    /// engine-pause escalation); the "empty" policy binds "" and
+    /// lets the send proceed. The URL is resolved from the secret
+    /// store here and never logged; errors name the host at most.
+    async fn fetch_api_vars(
+        &self,
+        scenario: &Scenario,
+        destination: Option<&Destination>,
+    ) -> Result<HashMap<String, String>, String> {
+        let mut out: HashMap<String, String> = HashMap::new();
+        let allowlist = self.api_allowlist();
+        let log_channel = destination
+            .map(|d| d.channel_id.clone())
+            .filter(|c| !c.is_empty())
+            .unwrap_or_else(|| scenario.channel_id.clone());
+        for node in &scenario.nodes {
+            if node.kind != NodeKind::UtilityCallApi {
+                continue;
+            }
+            let cfg = ApiCallConfig::from_node(node);
+            // Structural validation, fail-closed: a node that
+            // cannot validate must not fetch. (send_once already
+            // validated the scenario; this guards direct callers
+            // and config edits between validation and fetch.)
+            if let Err(e) = cfg.validate() {
+                return Err(format!("invalid scenario: Call API node {}: {e}", node.id));
+            }
+            let host = if cfg.url_host.trim().is_empty() {
+                "the configured host".to_string()
+            } else {
+                cfg.url_host.trim().to_string()
+            };
+            let fetched = match crate::secret_store::load_secret(&cfg.url_ref) {
+                Ok(url) => {
+                    crate::apidata::fetch_api_value(
+                        &url,
+                        cfg.field_path.trim(),
+                        cfg.timeout_secs,
+                        crate::apidata::API_MAX_BYTES,
+                        &allowlist,
+                    )
+                    .await
+                }
+                Err(e) => Err(format!("cannot load the saved URL ({e})")),
+            };
+            match fetched {
+                Ok(value) => {
+                    out.insert(cfg.variable.trim().to_string(), value);
+                }
+                Err(e) => {
+                    if cfg.effective_on_failure() == "empty" {
+                        tracing::warn!(
+                            "scenario '{}': API fetch for {{{}}} (host {host}) failed: {e} — sending with an empty value",
+                            scenario.name,
+                            cfg.variable.trim()
+                        );
+                        out.insert(cfg.variable.trim().to_string(), String::new());
+                    } else {
+                        let detail = format!(
+                            "API fetch for {{{}}} (host {host}) failed: {e}",
+                            cfg.variable.trim()
+                        );
+                        self.write_log(&SendLogEntry {
+                            scenario_id: scenario.id.clone(),
+                            scenario_name: scenario.name.clone(),
+                            channel_id: log_channel.clone(),
+                            status: "failed".into(),
+                            detail: detail.chars().take(1000).collect(),
+                            message_id: String::new(),
+                            destination_id: destination.map(|d| d.id.clone()).unwrap_or_default(),
+                        });
+                        return Err(format!("skip: {detail}"));
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
     pub async fn send_once(
         &self,
         scenario: &Scenario,
@@ -659,6 +986,11 @@ impl Engine {
             .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
             .collect();
         vars.extend(scenario.set_variable_overrides());
+        // External data (idea #5): fetched values override
+        // same-named scenario variables — fresher data wins.
+        // A "skip" failure returns here, before any send.
+        let api_vars = self.fetch_api_vars(scenario, destination).await?;
+        vars.extend(api_vars);
         // Durable counters (idea #6): resolve the values the
         // template references BEFORE rendering; the increment
         // happens after a successful send, at the end of this fn.
@@ -749,8 +1081,56 @@ impl Engine {
         // Retry: network errors up to 3x with backoff; 429 waits retry_after;
         // 401/403/404 stop immediately (Spec §6).
         let embeds: Vec<crate::embed::Embed> = scenario.active_embeds();
-        let result = self
-            .send_message_with_retry(
+        // Edit-in-place (idea #2): when enabled and a previous
+        // message id is known for this target, PATCH it instead of
+        // posting new. A gone target (404) falls back to a fresh
+        // send below; the new id is recorded by the caller (the
+        // run loop), never here — send_once stays side-effect free
+        // on the scenario, so test sends cannot rewrite it.
+        let edit_target = if scenario.edit_last_message {
+            scenario
+                .last_message_ids
+                .get(&edit_key(destination, &scenario.channel_id))
+                .filter(|id| !id.trim().is_empty())
+                .cloned()
+        } else {
+            None
+        };
+        let result = if let Some(mid) = edit_target {
+            match self
+                .edit_message_with_retry(
+                    scenario,
+                    sender,
+                    destination,
+                    &mid,
+                    &clean,
+                    &embeds,
+                    &antiban,
+                    &mut rng,
+                )
+                .await
+            {
+                Ok(Some(id)) => Ok(id),
+                Ok(None) => {
+                    tracing::info!(
+                        "scenario '{}': edited message {mid} is gone — sending a new message",
+                        scenario.name
+                    );
+                    self.send_message_with_retry(
+                        scenario,
+                        sender,
+                        destination,
+                        &clean,
+                        &embeds,
+                        &antiban,
+                        &mut rng,
+                    )
+                    .await
+                }
+                Err(e) => Err(e),
+            }
+        } else {
+            self.send_message_with_retry(
                 scenario,
                 sender,
                 destination,
@@ -759,7 +1139,8 @@ impl Engine {
                 &antiban,
                 &mut rng,
             )
-            .await;
+            .await
+        };
         // Counters increment ONLY on a successful send: a failed
         // or deferred run must not advance the series. A failed
         // increment is logged, never fatal — the message went out.
@@ -802,19 +1183,41 @@ impl Engine {
             allow_mass_mentions: scenario.allow_mass_mentions,
             silent: scenario.silent_send,
         };
+        // Attachments (idea #4): read once per send (retries
+        // re-send the same bytes, no re-read). Missing/oversize
+        // files are skipped with a warning; the message still
+        // goes out. Edits never reach this fn, so files ride
+        // fresh sends only.
+        let (files, skipped) = load_attachments(&scenario.attachments);
+        for s in &skipped {
+            tracing::warn!("scenario '{}': attachment skipped: {s}", scenario.name);
+        }
         let mut attempt = 0;
         loop {
             attempt += 1;
-            match sender
-                .send_with_embeds(
-                    &scenario.channel_id,
-                    clean,
-                    embeds,
-                    &opts,
-                    scenario.poll.as_ref(),
-                )
-                .await
-            {
+            let attempt_result = if files.is_empty() {
+                sender
+                    .send_with_embeds(
+                        &scenario.channel_id,
+                        clean,
+                        embeds,
+                        &opts,
+                        scenario.poll.as_ref(),
+                    )
+                    .await
+            } else {
+                sender
+                    .send_with_files(
+                        &scenario.channel_id,
+                        clean,
+                        embeds,
+                        &opts,
+                        scenario.poll.as_ref(),
+                        &files,
+                    )
+                    .await
+            };
+            match attempt_result {
                 Ok(sent) => {
                     *self.sent_today.lock().await += 1;
                     // Record the actual send time for the destination's
@@ -827,11 +1230,14 @@ impl Engine {
                         self.reset_dest_errors(&dest.id);
                     }
                     // A webhook 204 has no message id: do not claim one.
-                    let detail = if sent.id.is_empty() {
+                    let mut detail = if sent.id.is_empty() {
                         "message sent (webhook, no id returned)".to_string()
                     } else {
                         format!("message {}", sent.id)
                     };
+                    if !skipped.is_empty() {
+                        detail.push_str(&format!(" (attachment skipped: {})", skipped.join(", ")));
+                    }
                     let entry = SendLogEntry {
                         scenario_id: scenario.id.clone(),
                         scenario_name: scenario.name.clone(),
@@ -910,6 +1316,132 @@ impl Engine {
                         crate::notify::play(crate::notify::SoundEvent::DestinationPaused);
                     }
                     return Err(format!("stopped immediately: {m}"));
+                }
+                Err(DiscordError::Other(m)) => {
+                    if attempt >= 3 {
+                        return Err(format!("failed after 3 attempts: {m}"));
+                    }
+                    let backoff = 2u64.pow(attempt) * 2;
+                    if self.sleep_interruptible(Duration::from_secs(backoff)).await {
+                        return Err("emergency stop pressed during retry backoff".into());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Edit one message with the retry policy (idea #2). Returns
+    /// `Ok(Some(id))` when edited, `Ok(None)` when the target is gone
+    /// (404 — the caller falls back to a fresh send; the destination
+    /// is NOT paused: a deleted message says nothing about the
+    /// webhook), `Err` on other failures. Mirrors
+    /// `send_message_with_retry` except: no auto-delete (deleting
+    /// the living message would defeat edit mode), no destination
+    /// pause on 404, and the log status is "edited" (counted as a
+    /// delivery by the cap queries). Keep the two in sync.
+    #[allow(clippy::too_many_arguments)]
+    async fn edit_message_with_retry(
+        &self,
+        scenario: &Scenario,
+        sender: &MessageSender,
+        destination: Option<&Destination>,
+        message_id: &str,
+        clean: &str,
+        embeds: &[crate::embed::Embed],
+        antiban: &AntiBanConfig,
+        rng: &mut StdRng,
+    ) -> Result<Option<String>, String> {
+        let log_channel = destination
+            .map(|d| d.channel_id.clone())
+            .filter(|c| !c.is_empty())
+            .unwrap_or_else(|| scenario.channel_id.clone());
+        let opts = crate::discord::SendOptions {
+            allow_mass_mentions: scenario.allow_mass_mentions,
+            silent: scenario.silent_send,
+        };
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match sender
+                .edit_message(&scenario.channel_id, message_id, clean, embeds, &opts)
+                .await
+            {
+                Ok(sent) => {
+                    *self.sent_today.lock().await += 1;
+                    if let Some(dest) = destination {
+                        self.last_sent
+                            .lock()
+                            .await
+                            .insert(dest.id.clone(), Instant::now());
+                        self.reset_dest_errors(&dest.id);
+                    }
+                    // A 204 has no message id: the edited message
+                    // keeps its old id.
+                    let id = if sent.id.is_empty() {
+                        message_id.to_string()
+                    } else {
+                        sent.id.clone()
+                    };
+                    let entry = SendLogEntry {
+                        scenario_id: scenario.id.clone(),
+                        scenario_name: scenario.name.clone(),
+                        channel_id: log_channel.clone(),
+                        status: "edited".into(),
+                        detail: format!("edited message {id}"),
+                        message_id: id.clone(),
+                        destination_id: destination.map(|d| d.id.clone()).unwrap_or_default(),
+                    };
+                    self.write_log(&entry);
+                    crate::notify::play(crate::notify::SoundEvent::SendSuccess);
+                    self.maybe_auto_break(antiban, rng).await?;
+                    return Ok(Some(id));
+                }
+                Err(DiscordError::RateLimited {
+                    retry_after_secs,
+                    global,
+                }) => {
+                    tracing::warn!("Discord 429, waiting {retry_after_secs}s (global={global})");
+                    if let Some(dest) = destination {
+                        if global {
+                            self.set_global_pause(retry_after_secs);
+                        } else {
+                            self.set_cooldown(&dest.id, retry_after_secs);
+                        }
+                        return Err(format!(
+                            "defer: Discord rate limit, retry after {retry_after_secs}s (global={global})"
+                        ));
+                    }
+                    let paused = if global {
+                        self.sleep_interruptible(Duration::from_secs(3600)).await
+                    } else {
+                        self.sleep_interruptible(Duration::from_secs(retry_after_secs.max(1)))
+                            .await
+                    };
+                    if paused {
+                        return Err("emergency stop pressed during rate-limit pause".into());
+                    }
+                    if attempt >= 3 {
+                        return Err(format!(
+                            "rate limited repeatedly (last retry_after {retry_after_secs}s)"
+                        ));
+                    }
+                }
+                Err(DiscordError::Unauthorized(m)) | Err(DiscordError::Forbidden(m)) => {
+                    if let Some(dest) = destination {
+                        let _ = self.store.set_destination_failure(
+                            &dest.id,
+                            FailureState::Paused401,
+                            &format!("stopped immediately: {m}"),
+                        );
+                        crate::notify::play(crate::notify::SoundEvent::DestinationPaused);
+                    }
+                    return Err(format!("stopped immediately: {m}"));
+                }
+                Err(DiscordError::NotFound(_)) => {
+                    // The message is gone (deleted in Discord). Not
+                    // a destination failure: fall back to a fresh
+                    // send, decided by the caller.
+                    return Ok(None);
                 }
                 Err(DiscordError::Other(m)) => {
                     if attempt >= 3 {
@@ -1274,16 +1806,16 @@ impl Engine {
     }
 
     /// Main loop: every second, fire scenarios whose schedule is due.
-    /// `get_sender` supplies a fresh sender; `scenarios` is re-read each tick
-    /// so edits in the UI take effect without restarting the engine.
-    /// Main engine loop. `resolve_sender` maps each scenario to its
-    /// sender plus its destination (Some in webhook mode, None in
-    /// user-token mode). One loop only (atomic guard); destinations
+    /// `resolve_sender` maps each scenario to its targets: one
+    /// (sender, destination) pair in user-token mode, one pair per
+    /// destination in webhook mode (broadcast, idea #1). `scenarios`
+    /// is re-read each tick so edits in the UI take effect without
+    /// restarting the engine. One loop only (atomic guard); targets
     /// are processed sequentially in a stable order, with a fixed
     /// 1-second stagger between webhook sends in one tick.
     pub async fn run_loop(
         self: Arc<Self>,
-        resolve_sender: impl Fn(&Scenario) -> Option<(MessageSender, Option<Destination>)>
+        resolve_sender: impl Fn(&Scenario) -> Vec<(MessageSender, Option<Destination>)>
             + Send
             + Sync
             + 'static,
@@ -1357,48 +1889,91 @@ impl Engine {
                 ) else {
                     continue;
                 };
-                let Some((sender, destination)) = resolve_sender(&scenario) else {
+                // Broadcast (idea #1): one firing sends to every
+                // resolved target — one sender in user-token mode,
+                // one sender per destination in webhook mode. An
+                // empty list means nothing resolved (no credential /
+                // no usable destination): skip quietly, as before.
+                let targets = resolve_sender(&scenario);
+                if targets.is_empty() {
                     continue;
-                };
-                // Only the first distinct channel may send (user mode).
-                // Webhook mode ignores channel_id: the URL is channel-bound.
-                if destination.is_none() && !sender.is_webhook() {
-                    if let Some(allowed) = &allowed_channel {
-                        if &scenario.channel_id != allowed {
-                            tracing::warn!(
-                                "scenario {} uses channel {} but only {} may send — skipped",
-                                scenario.name,
-                                scenario.channel_id,
-                                allowed
-                            );
-                            continue;
-                        }
-                    }
                 }
-                // Template identity: per-destination in webhook mode
-                // (stored name, no network), global account identity
-                // in user mode (refreshed when still the fallback).
-                let (username, server_name) = if let Some(dest) = &destination {
-                    (dest.effective_username(), String::new())
-                } else {
-                    if self.identity().await.0 == "you" {
-                        if let MessageSender::User(client) = &sender {
-                            self.refresh_identity(client).await;
+                let any_webhook = targets.iter().any(|(_, d)| d.is_some());
+                let mut results: Vec<TargetResult> = Vec::new();
+                for (ti, (sender, destination)) in targets.iter().enumerate() {
+                    // Only the first distinct channel may send (user mode).
+                    // Webhook mode ignores channel_id: the URL is channel-bound.
+                    if destination.is_none() && !sender.is_webhook() {
+                        if let Some(allowed) = &allowed_channel {
+                            if &scenario.channel_id != allowed {
+                                tracing::warn!(
+                                    "scenario {} uses channel {} but only {} may send — skipped",
+                                    scenario.name,
+                                    scenario.channel_id,
+                                    allowed
+                                );
+                                continue;
+                            }
                         }
                     }
-                    self.identity().await
-                };
-                match self
-                    .send_once(
-                        &scenario,
-                        &sender,
-                        destination.as_ref(),
-                        &username,
-                        &server_name,
-                    )
-                    .await
-                {
-                    Ok(_) => {
+                    // Fixed 1-second stagger between webhook sends
+                    // in one firing (transparent, never random).
+                    if ti > 0
+                        && sender.is_webhook()
+                        && self.sleep_interruptible(Duration::from_secs(1)).await
+                    {
+                        break;
+                    }
+                    // Template identity: per-destination in webhook mode
+                    // (stored name, no network), global account identity
+                    // in user mode (refreshed when still the fallback).
+                    let (username, server_name) = if let Some(dest) = destination {
+                        (dest.effective_username(), String::new())
+                    } else {
+                        if self.identity().await.0 == "you" {
+                            if let MessageSender::User(client) = sender {
+                                self.refresh_identity(client).await;
+                            }
+                        }
+                        self.identity().await
+                    };
+                    let label = destination
+                        .as_ref()
+                        .map(|d| d.display_name())
+                        .unwrap_or_else(|| "account".to_string());
+                    let channel_id = destination
+                        .as_ref()
+                        .map(|d| d.channel_id.clone())
+                        .filter(|c| !c.is_empty())
+                        .unwrap_or_else(|| scenario.channel_id.clone());
+                    let result = self
+                        .send_once(
+                            &scenario,
+                            sender,
+                            destination.as_ref(),
+                            &username,
+                            &server_name,
+                        )
+                        .await;
+                    results.push(TargetResult {
+                        label,
+                        destination_id: destination
+                            .as_ref()
+                            .map(|d| d.id.clone())
+                            .unwrap_or_default(),
+                        channel_id,
+                        edit_key: edit_key(destination.as_ref(), &scenario.channel_id),
+                        result,
+                    });
+                }
+                if results.is_empty() {
+                    // Nothing was attempted (every target filtered
+                    // out, or Emergency Stop during the stagger):
+                    // do not consume the run.
+                    continue;
+                }
+                match aggregate_broadcast(&results) {
+                    BroadcastOutcome::Success => {
                         consecutive_errors = 0;
                         // Consume this scheduled run exactly once.
                         let due_utc = due.with_timezone(&Utc);
@@ -1411,23 +1986,44 @@ impl Engine {
                                 scenario.name
                             );
                         }
+                        // Edit-in-place (idea #2): record the
+                        // message id per target so the next firing
+                        // edits it. Empty ids (webhook 204) are
+                        // skipped — an unrecorded target posts new
+                        // next time, honestly.
+                        if scenario.edit_last_message {
+                            for r in &results {
+                                if let Ok(id) = &r.result {
+                                    if !id.is_empty() {
+                                        scenario
+                                            .last_message_ids
+                                            .insert(r.edit_key.clone(), id.clone());
+                                    }
+                                }
+                            }
+                        }
                         self.save_run_state(&scenario, "save scenario last-run after send");
+                        // Partial failure: other targets succeeded, so
+                        // the run is consumed and the engine error
+                        // streak resets — but each failed target still
+                        // gets its failure row and error counting, so
+                        // Logs shows it and a sick destination still
+                        // pauses itself.
+                        self.log_broadcast_failures(&scenario, &results);
                         // Fixed 1-second stagger between webhook sends
                         // in one tick (transparent, never random).
-                        if destination.is_some()
-                            && self.sleep_interruptible(Duration::from_secs(1)).await
-                        {
+                        if any_webhook && self.sleep_interruptible(Duration::from_secs(1)).await {
                             break;
                         }
                     }
-                    Err(e) if e.starts_with("defer:") => {
+                    BroadcastOutcome::Deferred(e) => {
                         // Short wait (interval / 429 cooldown / global
                         // pause): do NOT consume the run, count an
                         // error, or log a failure. The run retries on
                         // a later tick, slightly late.
                         tracing::info!("scenario {} deferred: {e}", scenario.name);
                     }
-                    Err(e) if e.starts_with("skip:") => {
+                    BroadcastOutcome::Skipped(e) => {
                         // Intentional skip (sleep window / cap / time
                         // window): consume the run so it is not retried
                         // every second, but do not count it as a failure.
@@ -1440,7 +2036,7 @@ impl Engine {
                         }
                         self.save_run_state(&scenario, "save scenario last-run after skip");
                     }
-                    Err(e) if e.starts_with("invalid scenario:") => {
+                    BroadcastOutcome::Invalid(e) => {
                         // A broken scenario is not a broken
                         // destination: consume the run (like a skip)
                         // so it is not retried every second, but do
@@ -1459,63 +2055,24 @@ impl Engine {
                         }
                         self.save_run_state(&scenario, "save scenario last-run after invalid run");
                     }
-                    Err(e) => {
+                    BroadcastOutcome::Failed(e) => {
                         // Defense in depth: error strings must never
                         // carry credentials into tracing output, the
                         // database, or the UI. Scrub once here so all
-                        // three sinks below share the cleaned text.
+                        // sinks below share the cleaned text.
                         let safe_err = crate::store::scrub_secrets(&e);
                         tracing::warn!("scenario {} failed: {safe_err}", scenario.name);
-                        // Persist failures so Logs can filter by status
-                        // and the Dashboard can count them (QoL). The
-                        // detail is truncated: Discord error bodies can
-                        // be long, and the log is for diagnosis, not a
+                        // One failure row per failed target (in the
+                        // single-target case exactly the old single
+                        // row), so Logs filters see every
+                        // destination's failure. Details are
+                        // truncated: Discord error bodies can be long,
+                        // and the log is for diagnosis, not a
                         // transcript. Scrubbed before truncating so a
                         // URL straddling the cut cannot survive in part.
-                        let detail: String = safe_err.chars().take(1000).collect();
-                        // Log channel: the destination's channel in
-                        // webhook mode (scenario.channel_id is empty
-                        // there), mirroring the success path — so the
-                        // Logs destination filter sees failures too.
-                        let log_channel = destination
-                            .as_ref()
-                            .map(|d| d.channel_id.clone())
-                            .filter(|c| !c.is_empty())
-                            .unwrap_or_else(|| scenario.channel_id.clone());
-                        self.write_log(&SendLogEntry {
-                            scenario_id: scenario.id.clone(),
-                            scenario_name: scenario.name.clone(),
-                            channel_id: log_channel,
-                            status: "failed".into(),
-                            detail,
-                            message_id: String::new(),
-                            destination_id: destination
-                                .as_ref()
-                                .map(|d| d.id.clone())
-                                .unwrap_or_default(),
-                        });
+                        self.log_broadcast_failures(&scenario, &results);
                         crate::notify::play(crate::notify::SoundEvent::SendFailure);
                         consecutive_errors += 1;
-                        // Per-destination consecutive errors: pause only
-                        // that destination when it crosses the limit.
-                        // Never overwrite a 404/401 pause set by the
-                        // send path itself.
-                        if let Some(dest) = &destination {
-                            if self.record_dest_error(&dest.id) {
-                                if let Ok(Some(current)) = self.store.load_destination(&dest.id) {
-                                    if current.failure_state == FailureState::Ok {
-                                        let _ = self.store.set_destination_failure(
-                                            &dest.id,
-                                            FailureState::PausedErrors,
-                                            &safe_err,
-                                        );
-                                        crate::notify::play(
-                                            crate::notify::SoundEvent::DestinationPaused,
-                                        );
-                                    }
-                                }
-                            }
-                        }
                         // Spec §6: 3 consecutive errors pauses the engine.
                         // Interruptible: Emergency Stop must not wait
                         // out the full 10 minutes.
@@ -1558,6 +2115,143 @@ impl Drop for LoopGuard {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    fn target(label: &str, result: Result<String, String>) -> TargetResult {
+        TargetResult {
+            label: label.to_string(),
+            destination_id: format!("dest-{label}"),
+            channel_id: "chan-1".to_string(),
+            edit_key: format!("dest-{label}"),
+            result,
+        }
+    }
+
+    #[test]
+    fn broadcast_aggregation_folds_per_target_results() {
+        // Any success wins, even with failures alongside.
+        let mixed = vec![
+            target("a", Ok("111".to_string())),
+            target("b", Err("network error".to_string())),
+            target("c", Err("skip: quiet window".to_string())),
+        ];
+        assert!(matches!(
+            aggregate_broadcast(&mixed),
+            BroadcastOutcome::Success
+        ));
+        // Defer beats hard failure: a retryable target must retry.
+        let deferred = vec![
+            target("a", Err("defer: cooling down".to_string())),
+            target("b", Err("network error".to_string())),
+        ];
+        assert!(matches!(
+            aggregate_broadcast(&deferred),
+            BroadcastOutcome::Deferred(_)
+        ));
+        // Hard failure beats skip: it must surface and count.
+        let failed = vec![
+            target("a", Err("skip: cap reached".to_string())),
+            target("b", Err("network error".to_string())),
+        ];
+        match aggregate_broadcast(&failed) {
+            BroadcastOutcome::Failed(detail) => {
+                assert!(detail.contains("a:"), "detail: {detail}");
+                assert!(detail.contains("b:"), "detail: {detail}");
+                assert!(detail.contains("2 target"), "detail: {detail}");
+            }
+            other => panic!(
+                "expected Failed, got {}",
+                match other {
+                    BroadcastOutcome::Success => "Success",
+                    BroadcastOutcome::Deferred(_) => "Deferred",
+                    BroadcastOutcome::Skipped(_) => "Skipped",
+                    BroadcastOutcome::Invalid(_) => "Invalid",
+                    BroadcastOutcome::Failed(_) => "Failed",
+                }
+            ),
+        }
+        // All skipped -> Skipped; all invalid -> Invalid.
+        let skipped = vec![target("a", Err("skip: cap".to_string()))];
+        assert!(matches!(
+            aggregate_broadcast(&skipped),
+            BroadcastOutcome::Skipped(_)
+        ));
+        let invalid = vec![target("a", Err("invalid scenario: no name".to_string()))];
+        assert!(matches!(
+            aggregate_broadcast(&invalid),
+            BroadcastOutcome::Invalid(_)
+        ));
+        // Single-target behaviour is unchanged: Ok -> Success,
+        // hard Err -> Failed naming the target.
+        let single_ok = vec![target("a", Ok("1".to_string()))];
+        assert!(matches!(
+            aggregate_broadcast(&single_ok),
+            BroadcastOutcome::Success
+        ));
+        let single_err = vec![target("a", Err("boom".to_string()))];
+        match aggregate_broadcast(&single_err) {
+            BroadcastOutcome::Failed(detail) => assert!(detail.contains("a: boom")),
+            _ => panic!("expected Failed"),
+        }
+    }
+
+    #[test]
+    fn load_attachments_skips_missing_and_oversize_files() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("nicord-attach-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let small = dir.join("hello.txt");
+        std::fs::write(&small, b"hi").unwrap();
+        let big = dir.join("big.bin");
+        {
+            let mut f = std::fs::File::create(&big).unwrap();
+            f.write_all(&vec![
+                0u8;
+                (crate::discord::MAX_ATTACHMENT_BYTES + 1) as usize
+            ])
+            .unwrap();
+        }
+        let missing = dir.join("nope.png");
+        let (files, skipped) = load_attachments(&[
+            small.to_string_lossy().into_owned(),
+            big.to_string_lossy().into_owned(),
+            missing.to_string_lossy().into_owned(),
+            String::new(),
+        ]);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].filename, "hello.txt");
+        assert_eq!(files[0].content_type, "text/plain");
+        assert_eq!(files[0].bytes, b"hi");
+        assert_eq!(skipped.len(), 2);
+        assert!(
+            skipped.iter().any(|s| s.starts_with("big.bin")),
+            "{skipped:?}"
+        );
+        assert!(
+            skipped.iter().any(|s| s.starts_with("nope.png")),
+            "{skipped:?}"
+        );
+        // Full paths never appear in skip reasons.
+        for s in &skipped {
+            assert!(!s.contains(dir.to_str().unwrap()), "{s}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_attachments_clamps_to_ten_files() {
+        let dir = std::env::temp_dir().join(format!("nicord-attach-clamp-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut paths = Vec::new();
+        for i in 0..12 {
+            let p = dir.join(format!("f{i}.txt"));
+            std::fs::write(&p, b"x").unwrap();
+            paths.push(p.to_string_lossy().into_owned());
+        }
+        let (files, skipped) = load_attachments(&paths);
+        assert_eq!(files.len(), 10);
+        assert!(skipped.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Build a UTC instant (never via Local wall-clock: these tests must
     /// pass under any machine timezone).

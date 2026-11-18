@@ -64,6 +64,11 @@ pub fn destination_entry(dest_id: &str) -> String {
     format!("destination:{dest_id}")
 }
 
+/// Keyring entry for one Call API node's URL (idea #5).
+pub fn api_url_entry(node_id: &str) -> String {
+    format!("api-url:{node_id}")
+}
+
 /// Prefix marking a stored value as a keyring reference.
 const KEYRING_PREFIX: &str = "kr:";
 

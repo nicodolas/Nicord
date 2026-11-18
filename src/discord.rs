@@ -15,6 +15,72 @@ use serde::{Deserialize, Serialize};
 
 pub const DISCORD_API: &str = "https://discord.com/api/v10";
 
+/// Maximum files per message (Discord limit).
+pub const MAX_ATTACHMENTS: usize = 10;
+/// Maximum bytes per file: 8 MiB, Discord's base limit. Boosted
+/// servers allow more, but Nicord never assumes a boost — a file
+/// over this cap is skipped with a warning, never sent.
+pub const MAX_ATTACHMENT_BYTES: u64 = 8 * 1024 * 1024;
+
+/// One file ready to upload (idea #4). The `filename` is the bare
+/// file name (no directories) — local paths never leave the
+/// machine. Bytes are read at send time; only paths are stored.
+#[derive(Debug, Clone)]
+pub struct AttachedFile {
+    pub filename: String,
+    pub content_type: String,
+    pub bytes: Vec<u8>,
+}
+
+/// Guess a file's MIME type from its extension (lowercased).
+/// Unknown extensions fall back to `application/octet-stream`,
+/// which Discord accepts for any file.
+pub fn guess_content_type(filename: &str) -> &'static str {
+    let ext = filename
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "mp4" => "video/mp4",
+        "mov" => "video/quicktime",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "pdf" => "application/pdf",
+        "txt" => "text/plain",
+        "json" => "application/json",
+        "zip" => "application/zip",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Build the multipart body Discord expects for a message with
+/// files: a `payload_json` part (the message JSON, as
+/// `application/json`) plus one `files[i]` part per file.
+pub fn build_multipart_form(
+    payload_json: &str,
+    files: &[AttachedFile],
+) -> reqwest::multipart::Form {
+    let json_part = reqwest::multipart::Part::text(payload_json.to_string())
+        .mime_str("application/json")
+        .unwrap_or_else(|_| reqwest::multipart::Part::text(payload_json.to_string()));
+    let mut form = reqwest::multipart::Form::new().part("payload_json", json_part);
+    for (i, file) in files.iter().enumerate() {
+        let part = reqwest::multipart::Part::bytes(file.bytes.clone())
+            .file_name(file.filename.clone())
+            .mime_str(&file.content_type)
+            .unwrap_or_else(|_| {
+                reqwest::multipart::Part::bytes(file.bytes.clone()).file_name(file.filename.clone())
+            });
+        form = form.part(format!("files[{i}]"), part);
+    }
+    form
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SendMessageBody {
     pub content: String,
@@ -341,6 +407,92 @@ impl DiscordClient {
         let resp = self
             .http
             .post(&url)
+            .header("Authorization", self.auth_header())
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| reqwest_error("network error", e))?;
+        self.handle_response(resp).await
+    }
+
+    /// Send a message with file attachments (idea #4): the same
+    /// JSON body as `send_message_with_embeds`, carried as the
+    /// `payload_json` part of a multipart request. Empty `files`
+    /// behaves like a plain send (callers branch on that).
+    pub async fn send_message_with_files(
+        &self,
+        channel_id: &str,
+        content: &str,
+        embeds: &[crate::embed::Embed],
+        opts: &SendOptions,
+        poll: Option<&crate::poll::Poll>,
+        files: &[AttachedFile],
+    ) -> Result<SentMessage, DiscordError> {
+        let url = format!("{DISCORD_API}/channels/{channel_id}/messages");
+        let body = SendMessageBody {
+            content: content.to_string(),
+            embeds: if embeds.is_empty() {
+                None
+            } else {
+                Some(embeds.iter().map(|e| e.to_json()).collect())
+            },
+            allowed_mentions: opts.allowed_mentions(),
+            flags: opts.flags(),
+            poll: poll.map(|p| p.to_json()),
+        };
+        let payload_json =
+            serde_json::to_string(&body).map_err(|e| DiscordError::Other(e.to_string()))?;
+        let form = build_multipart_form(&payload_json, files);
+        let resp = self
+            .http
+            .post(&url)
+            .header("Authorization", self.auth_header())
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| reqwest_error("network error", e))?;
+        self.handle_response(resp).await
+    }
+
+    /// Edit a message this account sent (idea #2, edit-in-place).
+    /// PATCH carries content/embeds/allowed_mentions/flags only —
+    /// polls cannot be changed after sending, so the poll is never
+    /// included here. The message id must be digits-only (it goes
+    /// into the URL path).
+    pub async fn edit_message(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        content: &str,
+        embeds: &[crate::embed::Embed],
+        opts: &SendOptions,
+    ) -> Result<SentMessage, DiscordError> {
+        let id = message_id.trim();
+        if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(DiscordError::Other(
+                "message id must be a numeric Discord snowflake".into(),
+            ));
+        }
+        if content.chars().count() > 2000 {
+            return Err(DiscordError::Other(
+                "message is longer than Discord's 2000-character limit".into(),
+            ));
+        }
+        let url = format!("{DISCORD_API}/channels/{channel_id}/messages/{id}");
+        let body = SendMessageBody {
+            content: content.to_string(),
+            embeds: if embeds.is_empty() {
+                None
+            } else {
+                Some(embeds.iter().map(|e| e.to_json()).collect())
+            },
+            allowed_mentions: opts.allowed_mentions(),
+            flags: opts.flags(),
+            poll: None,
+        };
+        let resp = self
+            .http
+            .patch(&url)
             .header("Authorization", self.auth_header())
             .json(&body)
             .send()
@@ -692,6 +844,18 @@ pub fn delete_url(channel_id: &str, message_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_type_guessing_covers_common_files() {
+        assert_eq!(guess_content_type("a.png"), "image/png");
+        assert_eq!(guess_content_type("A.JPG"), "image/jpeg");
+        assert_eq!(guess_content_type("clip.mp4"), "video/mp4");
+        assert_eq!(guess_content_type("doc.pdf"), "application/pdf");
+        assert_eq!(guess_content_type("noext"), "application/octet-stream");
+        assert_eq!(guess_content_type("weird.xyz"), "application/octet-stream");
+        // Multi-dot names use the last extension.
+        assert_eq!(guess_content_type("archive.tar.zip"), "application/zip");
+    }
 
     #[test]
     fn retry_after_parses_fractional_seconds() {

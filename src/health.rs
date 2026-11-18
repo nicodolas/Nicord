@@ -226,7 +226,7 @@ mod tests {
         let mut cfg = webhook_config();
         cfg.last_export_at = "2026-11-17T00:00:00Z".to_string();
         let mut s = Scenario::new("Kịch bản");
-        s.destination_id = Some("d1".to_string());
+        s.destination_ids = vec!["d1".to_string()];
         s.enabled = true;
         let issues = startup_checks(&cfg, &[d], &[s]);
         assert!(issues.is_empty(), "expected no issues, got: {issues:?}");

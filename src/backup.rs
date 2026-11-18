@@ -618,14 +618,40 @@ fn apply_import_with(
                 .push(format!("Scenario '{}' skipped: {e}", s.name));
             continue;
         }
-        if let Some(dest_id) = &s.destination_id {
-            if !dest_ids.contains(dest_id.as_str()) {
-                report.warnings.push(format!(
-                    "Scenario '{}' references a destination that was not imported; its destination was cleared.",
-                    s.name
-                ));
-                s.destination_id = None;
-            }
+        // Drop destination ids that were not imported (broadcast
+        // lists keep the ids that did arrive); warn so the user
+        // can re-pick the missing ones.
+        let before = s.destination_ids.len();
+        s.destination_ids
+            .retain(|id| dest_ids.contains(id.as_str()));
+        let dropped = before - s.destination_ids.len();
+        if dropped > 0 {
+            report.warnings.push(format!(
+                "Scenario '{}' references {dropped} destination(s) that were not imported; those were removed.",
+                s.name
+            ));
+        }
+        // Call API URLs (idea #5) are per-machine secrets: the
+        // exported node carries only a reference, which will not
+        // resolve on this machine. The scenario still imports —
+        // the node fails closed at send time — but warn so the
+        // user re-enters the URL before relying on it.
+        let api_nodes = s
+            .nodes
+            .iter()
+            .filter(|n| n.kind == crate::scenario::NodeKind::UtilityCallApi)
+            .filter(|n| {
+                !crate::scenario::ApiCallConfig::from_node(n)
+                    .url_ref
+                    .trim()
+                    .is_empty()
+            })
+            .count();
+        if api_nodes > 0 {
+            report.warnings.push(format!(
+                "Scenario '{}' has {api_nodes} Call API node(s): their URLs are secrets bound to the exporting machine — re-enter each URL on this machine.",
+                s.name
+            ));
         }
         imported_scenarios.push(s);
     }
@@ -943,12 +969,12 @@ mod tests {
             build_export(&store, &AppConfig::default(), ExportMode::Safe, "").unwrap();
         let mut s = Scenario::new("Orphaned");
         s.channel_id = "111".to_string();
-        s.destination_id = Some("no-such-destination".to_string());
+        s.destination_ids = vec!["no-such-destination".to_string()];
         file.scenarios = vec![s];
         let (_, report) = apply_import(&store, &file, "").unwrap();
         let loaded = store.load_scenarios().unwrap();
         assert_eq!(loaded.len(), 1);
-        assert!(loaded[0].destination_id.is_none());
+        assert!(loaded[0].destination_ids.is_empty());
         assert!(report.warnings.iter().any(|w| w.contains("not imported")));
     }
 

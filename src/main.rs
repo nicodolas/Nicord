@@ -7,6 +7,7 @@
 //! mode is the official, recommended alternative.
 
 mod antiban;
+mod apidata;
 mod app;
 mod autostart;
 mod backup;

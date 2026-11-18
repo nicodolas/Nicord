@@ -561,6 +561,7 @@ impl NodeKind {
                 | NodeKind::UtilityWait
                 | NodeKind::UtilityRandomPick
                 | NodeKind::UtilitySetVariable
+                | NodeKind::UtilityCallApi
         )
     }
     #[allow(dead_code)]
@@ -839,6 +840,113 @@ impl CommandConfig {
     }
 }
 
+// ---------------------------------------------------------------------------
+// External data (`UtilityCallApi`, idea #5): fetch JSON over HTTPS and
+// feed one field into a template variable. The URL is a secret (it
+// may carry an API key): only a secret-store reference is kept in
+// the node config, never the plaintext URL.
+// ---------------------------------------------------------------------------
+
+/// Configuration for a `UtilityCallApi` node.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiCallConfig {
+    /// Secret-store reference for the URL (`kr:` ref or encrypted
+    /// blob). Empty = not configured yet.
+    #[serde(default)]
+    pub url_ref: String,
+    /// Host part of the URL, stored in plaintext for display (the
+    /// host is not secret; the full URL may carry an API key).
+    #[serde(default)]
+    pub url_host: String,
+    /// Template variable name fed by the fetch (`{{name}}`).
+    #[serde(default)]
+    pub variable: String,
+    /// Dot path into the JSON response (`weather.temp`, array
+    /// indices as numbers: `items.0.name`).
+    #[serde(default)]
+    pub field_path: String,
+    /// Per-fetch timeout in seconds (1–60, default 10).
+    #[serde(default = "default_api_timeout")]
+    pub timeout_secs: u64,
+    /// Failure policy: "skip" (default — skip the turn with a log
+    /// row) or "empty" (send with an empty value).
+    #[serde(default)]
+    pub on_failure: String,
+}
+
+fn default_api_timeout() -> u64 {
+    crate::apidata::DEFAULT_API_TIMEOUT_SECS
+}
+
+impl Default for ApiCallConfig {
+    fn default() -> Self {
+        Self {
+            url_ref: String::new(),
+            url_host: String::new(),
+            variable: String::new(),
+            field_path: String::new(),
+            timeout_secs: default_api_timeout(),
+            on_failure: "skip".to_string(),
+        }
+    }
+}
+
+impl ApiCallConfig {
+    /// Parse a node's config (tolerant: unknown fields ignored).
+    /// A malformed config parses as the default, which fails
+    /// validation (empty URL/variable) — fail-closed, like
+    /// `CommandConfig::from_node`.
+    pub fn from_node(node: &Node) -> Self {
+        serde_json::from_value(node.config.clone()).unwrap_or_default()
+    }
+
+    /// Effective failure policy: "empty" only when explicitly set;
+    /// anything else (including "") means "skip".
+    pub fn effective_on_failure(&self) -> &'static str {
+        if self.on_failure.trim() == "empty" {
+            "empty"
+        } else {
+            "skip"
+        }
+    }
+
+    /// Structural validation. The URL itself is NOT resolved here:
+    /// validation runs on the UI thread and must not touch the
+    /// keyring; the scheme + allowlist are checked at fetch time
+    /// (fail-closed), and the editor checks the scheme when the
+    /// URL is pasted.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.url_ref.trim().is_empty() {
+            return Err(
+                "Call API node has no URL saved — paste an https URL in the node editor".into(),
+            );
+        }
+        if !valid_counter_name(self.variable.trim()) {
+            return Err("Call API variable name must be 1–64 letters, digits, '_' or '-'".into());
+        }
+        let path = self.field_path.trim();
+        if path.is_empty() {
+            return Err("Call API field path is empty — e.g. weather.temp".into());
+        }
+        if path.starts_with('.')
+            || path.ends_with('.')
+            || path.split('.').any(|seg| seg.trim().is_empty())
+        {
+            return Err(format!(
+                "Call API field path '{path}' is malformed — use dot-separated names like weather.temp"
+            ));
+        }
+        if self.timeout_secs < 1 || self.timeout_secs > 60 {
+            return Err("Call API timeout must be 1–60 seconds".into());
+        }
+        let policy = self.on_failure.trim();
+        if !policy.is_empty() && policy != "skip" && policy != "empty" {
+            return Err("Call API failure policy must be 'skip' or 'empty'".into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Edge {
     pub from: String,
@@ -891,11 +999,24 @@ pub struct Scenario {
     /// `channelId` on read, so older exported JSON keeps its channel.
     #[serde(default, alias = "channelId")]
     pub channel_id: String,
-    /// Destination id in Webhook mode (required when enabling).
+    /// Destination ids in Webhook mode (broadcast, idea #1): one
+    /// firing sends to EVERY listed destination, each with its own
+    /// fault isolation (a failure in one never blocks the others).
+    /// At least one is required when enabling in webhook mode.
     /// Ignored in user-token mode (which uses `channel_id`).
     /// Kept alongside `channel_id` so switching modes loses nothing.
-    #[serde(default)]
-    pub destination_id: Option<String>,
+    ///
+    /// Migration: older files stored ONE id under the key
+    /// `"destination_id"` (a string). The `alias` + custom
+    /// deserializer below reads that form into this vec, so old
+    /// scenarios, exports, and backups keep working; new files
+    /// serialize only `"destination_ids"`.
+    #[serde(
+        default,
+        alias = "destination_id",
+        deserialize_with = "de_destination_ids"
+    )]
+    pub destination_ids: Vec<String>,
     /// When true (webhook mode), send from the destination's
     /// default messages instead of this scenario's own messages,
     /// even when the scenario has messages. When false, the
@@ -932,6 +1053,32 @@ pub struct Scenario {
     /// poll). Results are not readable via webhook — see poll.rs.
     #[serde(default)]
     pub poll: Option<crate::poll::Poll>,
+    /// Edit-in-place mode (idea #2): when true, each firing edits
+    /// the scenario's previous message (one per target) instead of
+    /// posting a new one. The first firing posts new and records
+    /// the message id; a deleted target falls back to a new send.
+    /// Edits carry content/embeds/mentions/flags only — polls and
+    /// attachments ride the first send, never an edit.
+    #[serde(default)]
+    pub edit_last_message: bool,
+    /// File attachments (idea #4): local paths attached to every
+    /// fresh send (never to edits). Only the PATHS are stored —
+    /// the files themselves are read at send time and are NOT
+    /// included in exports/backups, so a moved file means a
+    /// re-picked path on the new machine. A missing or oversize
+    /// file is skipped with a warning in the log; the message
+    /// still goes out.
+    #[serde(default)]
+    pub attachments: Vec<String>,
+    /// Last message id sent per target, for edit-in-place mode:
+    /// keyed by destination id in webhook mode, by channel id in
+    /// user-token mode. Updated by the engine loop after each
+    /// successful send; the Builder can clear it ("forget") so the
+    /// next firing posts new. Exported/imported with the scenario;
+    /// a stale id (message deleted) falls back to a new send with
+    /// an honest log — never an error spiral.
+    #[serde(default)]
+    pub last_message_ids: std::collections::HashMap<String, String>,
     #[serde(default)]
     pub schedule: Option<Schedule>,
     #[serde(default)]
@@ -990,7 +1137,46 @@ where
     })
 }
 
+/// Deserialize `Scenario::destination_ids` from either the old form
+/// (one id string under `"destination_id"`) or the new form (an
+/// array under `"destination_ids"`). A missing key never reaches
+/// here (the field's `#[serde(default)]` applies instead). Empty
+/// and duplicate ids are dropped: an empty id can never resolve,
+/// and a duplicate would send the same message twice to one channel.
+fn de_destination_ids<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        Empty,
+        Many(Vec<String>),
+        One(String),
+    }
+    let ids = match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::Empty => Vec::new(),
+        OneOrMany::Many(ids) => ids,
+        OneOrMany::One(id) => vec![id],
+    };
+    let mut out: Vec<String> = Vec::new();
+    for id in ids {
+        let id = id.trim().to_string();
+        if !id.is_empty() && !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    Ok(out)
+}
+
 impl Scenario {
+    /// First destination id, if any — the "primary" destination used
+    /// by displays that show one destination (health, simulation).
+    /// Broadcast sends to all ids; this is display-only.
+    pub fn primary_destination_id(&self) -> Option<&str> {
+        self.destination_ids.first().map(|s| s.as_str())
+    }
+
     pub fn new(name: &str) -> Self {
         Self {
             schema_version: 1,
@@ -999,12 +1185,15 @@ impl Scenario {
             enabled: false,
             timezone: default_timezone(),
             channel_id: String::new(),
-            destination_id: None,
+            destination_ids: Vec::new(),
             use_destination_messages: false,
             embeds: Vec::new(),
             allow_mass_mentions: false,
             silent_send: false,
             poll: None,
+            edit_last_message: false,
+            attachments: Vec::new(),
+            last_message_ids: std::collections::HashMap::new(),
             schedule: Some(Schedule::Daily {
                 time: NaiveTime::from_hms_opt(9, 0, 0).unwrap_or_default(),
             }),
@@ -1058,15 +1247,29 @@ impl Scenario {
         if require_channel && self.channel_id.trim().is_empty() {
             return Err("no destination channel selected".into());
         }
-        if require_destination
-            && self
-                .destination_id
-                .as_deref()
-                .unwrap_or("")
-                .trim()
-                .is_empty()
-        {
-            return Err("no destination selected — pick a destination in the Builder".into());
+        if require_destination {
+            if !self.destination_ids.iter().any(|id| !id.trim().is_empty()) {
+                return Err(
+                    "no destination selected — pick at least one destination in the Builder".into(),
+                );
+            }
+            // A duplicate id would send twice to one channel. The
+            // deserializer dedupes on read, but a hand-built list can
+            // still carry one — fail closed with a clear error.
+            let mut seen: Vec<&str> = Vec::new();
+            for id in &self.destination_ids {
+                let id = id.trim();
+                if id.is_empty() {
+                    continue;
+                }
+                if seen.contains(&id) {
+                    return Err(
+                        "the same destination is selected twice — pick each destination once"
+                            .into(),
+                    );
+                }
+                seen.push(id);
+            }
         }
         let triggers = self
             .nodes
@@ -1084,7 +1287,7 @@ impl Scenario {
                 return Err(format!(
                     "Node '{}' is not implemented in this version — remove it \
                      (supported: Schedule/Manual trigger, Send Message, Send Embed, \
-                     Send Command, Time Window condition, Wait, Random Pick, Set Variable)",
+                     Send Command, Time Window condition, Wait, Random Pick, Set Variable, Call API)",
                     node.kind.label()
                 ));
             }
@@ -1106,6 +1309,31 @@ impl Scenario {
                 validate_time_window(node)
                     .map_err(|e| format!("Time Window node {}: {e}", node.id))?;
             }
+            if node.kind == NodeKind::UtilityCallApi {
+                ApiCallConfig::from_node(node)
+                    .validate()
+                    .map_err(|e| format!("Call API node {}: {e}", node.id))?;
+            }
+        }
+        // Two Call API nodes feeding the same variable would make
+        // the template value depend on node order — reject it.
+        {
+            let mut seen: Vec<String> = Vec::new();
+            for node in &self.nodes {
+                if node.kind != NodeKind::UtilityCallApi {
+                    continue;
+                }
+                let name = ApiCallConfig::from_node(node).variable.trim().to_string();
+                if name.is_empty() {
+                    continue;
+                }
+                if seen.contains(&name) {
+                    return Err(format!(
+                        "two Call API nodes feed the same variable '{{{name}}}' — rename one"
+                    ));
+                }
+                seen.push(name);
+            }
         }
         if let Some(s) = &self.schedule {
             s.validate()?;
@@ -1114,6 +1342,15 @@ impl Scenario {
         // — unless the scenario runs a command instead: then the message
         // nodes are ignored and need no content.
         let has_command = self.command_node().is_some();
+        // Edit-in-place (idea #2) edits messages; a command is sent
+        // fresh every time and ignores the mode entirely, so the
+        // combination is rejected instead of silently doing nothing.
+        if self.edit_last_message && has_command {
+            return Err(
+                "edit-in-place mode does not apply to Send Command nodes — remove the command node or turn the mode off"
+                    .into(),
+            );
+        }
         for node in &self.nodes {
             if node.kind == NodeKind::ActionSendMessage || node.kind == NodeKind::ActionSendEmbed {
                 let content = node_content(node);
@@ -1139,6 +1376,22 @@ impl Scenario {
         // both transports send the same poll payload.
         if let Some(poll) = &self.poll {
             poll.validate()?;
+        }
+        // Attachments (idea #4): at most 10 files, no empty paths.
+        // Existence and size are checked at send time (files can
+        // move after saving), with a warning in the Builder when a
+        // path is missing.
+        if self.attachments.len() > crate::discord::MAX_ATTACHMENTS {
+            return Err(format!(
+                "{} attachments, over Discord's {}-file limit",
+                self.attachments.len(),
+                crate::discord::MAX_ATTACHMENTS
+            ));
+        }
+        for (idx, path) in self.attachments.iter().enumerate() {
+            if path.trim().is_empty() {
+                return Err(format!("attachment {} has an empty path", idx + 1));
+            }
         }
         // Discord rejects any message over 2000 characters, so fail fast
         // here with a clear error instead of failing on every send.
@@ -1547,7 +1800,6 @@ pub fn analyze_import(text: &str, is_webhook: bool) -> (Option<Scenario>, Vec<St
         "name",
         "enabled",
         "timezone",
-        "destination_id",
         "schedule",
         "nodes",
         "edges",
@@ -1561,6 +1813,11 @@ pub fn analyze_import(text: &str, is_webhook: bool) -> (Option<Scenario>, Vec<St
     }
     if !obj.contains_key("channel_id") && !obj.contains_key("channelId") {
         warnings.push("Thiếu trường 'channel_id' — dùng giá trị mặc định.".to_string());
+    }
+    // `destination_id` (one string) is the legacy form of
+    // `destination_ids` (array); either one counts as present.
+    if !obj.contains_key("destination_ids") && !obj.contains_key("destination_id") {
+        warnings.push("Thiếu trường 'destination_ids' — dùng giá trị mặc định.".to_string());
     }
 
     let scenario: Scenario = match serde_json::from_value(value) {
@@ -1582,6 +1839,28 @@ pub fn analyze_import(text: &str, is_webhook: bool) -> (Option<Scenario>, Vec<St
     if let Err(e) = valid {
         warnings.push(format!("Không hợp lệ: {e}"));
         return (None, warnings);
+    }
+    // Attachments (idea #4): only paths travel with the file — the
+    // files themselves stay on the exporting machine.
+    if !scenario.attachments.is_empty() {
+        warnings.push(format!(
+            "Kịch bản có {} tệp đính kèm — chỉ đường dẫn được lưu, hãy kiểm tra file còn tồn tại trên máy này.",
+            scenario.attachments.len()
+        ));
+    }
+    // Call API URLs (idea #5) are per-machine secrets: the exported
+    // node carries only a reference, so the URL must be re-entered
+    // on this machine before the node can fetch.
+    let api_nodes = scenario
+        .nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::UtilityCallApi)
+        .filter(|n| !ApiCallConfig::from_node(n).url_ref.trim().is_empty())
+        .count();
+    if api_nodes > 0 {
+        warnings.push(format!(
+            "Kịch bản có {api_nodes} node Call API — địa chỉ URL là bí mật riêng của máy xuất, hãy nhập lại URL trên máy này trước khi chạy."
+        ));
     }
     (Some(scenario), warnings)
 }
@@ -2529,6 +2808,162 @@ mod tests {
     }
 
     #[test]
+    fn edit_mode_fields_default_off_and_round_trip() {
+        let fresh = Scenario::new("e");
+        assert!(!fresh.edit_last_message);
+        assert!(fresh.last_message_ids.is_empty());
+        let mut s = Scenario::new("e2");
+        s.edit_last_message = true;
+        s.last_message_ids
+            .insert("dest-1".to_string(), "111".to_string());
+        s.last_message_ids
+            .insert("chan-9".to_string(), "222".to_string());
+        let json = serde_json::to_string(&s).unwrap();
+        let back: Scenario = serde_json::from_str(&json).unwrap();
+        assert!(back.edit_last_message);
+        assert_eq!(
+            back.last_message_ids.get("dest-1").map(String::as_str),
+            Some("111")
+        );
+        assert_eq!(
+            back.last_message_ids.get("chan-9").map(String::as_str),
+            Some("222")
+        );
+        // Old files without the fields read as off/empty.
+        let old: Scenario = serde_json::from_str(r#"{"name":"o"}"#).unwrap();
+        assert!(!old.edit_last_message);
+        assert!(old.last_message_ids.is_empty());
+        // Edit mode + a command node is rejected (the command path
+        // ignores the mode, so the combination must not enable).
+        let mut cmd = Scenario::new("cmd");
+        cmd.channel_id = "123".to_string();
+        cmd.edit_last_message = true;
+        let mut node = Node::new(NodeKind::ActionSendCommand);
+        node.config = serde_json::json!({"kind": "prefix", "name": "rank"});
+        cmd.nodes.push(node);
+        let err = cmd.validate().unwrap_err();
+        assert!(err.contains("edit-in-place"), "unexpected error: {err}");
+        cmd.edit_last_message = false;
+        assert!(cmd.validate().is_ok());
+    }
+
+    #[test]
+    fn api_call_config_validation_and_duplicates() {
+        // A fresh node (empty config) fails closed.
+        let node = Node::new(NodeKind::UtilityCallApi);
+        let cfg = ApiCallConfig::from_node(&node);
+        assert!(cfg.validate().is_err());
+        // Malformed config parses as the default -> fails closed.
+        let mut bad = Node::new(NodeKind::UtilityCallApi);
+        bad.config = serde_json::json!({"timeout_secs": "not-a-number"});
+        assert!(ApiCallConfig::from_node(&bad).validate().is_err());
+        // A complete config validates.
+        let mut good = Node::new(NodeKind::UtilityCallApi);
+        good.config = serde_json::json!({
+            "url_ref": "blob:xxx",
+            "url_host": "api.example.com",
+            "variable": "temp",
+            "field_path": "weather.temp",
+            "timeout_secs": 10,
+            "on_failure": "skip"
+        });
+        assert!(ApiCallConfig::from_node(&good).validate().is_ok());
+        // Each rule, broken one at a time.
+        let mut broken = ApiCallConfig::from_node(&good);
+        broken.variable = "bad name!".to_string();
+        assert!(broken.validate().is_err());
+        broken = ApiCallConfig::from_node(&good);
+        broken.field_path = "weather..temp".to_string();
+        assert!(broken.validate().is_err());
+        broken = ApiCallConfig::from_node(&good);
+        broken.timeout_secs = 0;
+        assert!(broken.validate().is_err());
+        broken = ApiCallConfig::from_node(&good);
+        broken.timeout_secs = 61;
+        assert!(broken.validate().is_err());
+        broken = ApiCallConfig::from_node(&good);
+        broken.on_failure = "retry".to_string();
+        assert!(broken.validate().is_err());
+        // Duplicate variable names across nodes are rejected.
+        let mut s = Scenario::new("api");
+        s.channel_id = "123".to_string();
+        s.nodes.push(good.clone());
+        let mut second = Node::new(NodeKind::UtilityCallApi);
+        second.config = serde_json::json!({
+            "url_ref": "blob:yyy",
+            "variable": "temp",
+            "field_path": "other",
+            "timeout_secs": 10
+        });
+        s.nodes.push(second);
+        let err = s.validate().unwrap_err();
+        assert!(err.contains("same variable"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn attachment_validation_enforces_count_and_paths() {
+        let mut s = Scenario::new("a");
+        s.channel_id = "123".to_string();
+        assert!(s.validate().is_ok());
+        s.attachments = vec!["".to_string()];
+        assert!(s.validate().is_err());
+        s.attachments = (0..11).map(|i| format!("/tmp/f{i}.png")).collect();
+        let err = s.validate().unwrap_err();
+        assert!(err.contains("11 attachments"), "unexpected error: {err}");
+        s.attachments = (0..10).map(|i| format!("/tmp/f{i}.png")).collect();
+        assert!(s.validate().is_ok());
+        // Paths round-trip through JSON (the files themselves are
+        // never stored).
+        let json = serde_json::to_string(&s).unwrap();
+        let back: Scenario = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.attachments.len(), 10);
+        assert_eq!(back.attachments[0], "/tmp/f0.png");
+    }
+
+    #[test]
+    fn destination_ids_migration_reads_old_and_new_forms() {
+        // Old form: one string under "destination_id".
+        let old: Scenario =
+            serde_json::from_str(r#"{"name":"o","destination_id":"dest-1"}"#).unwrap();
+        assert_eq!(old.destination_ids, vec!["dest-1"]);
+        assert_eq!(old.primary_destination_id(), Some("dest-1"));
+        // New form: array under "destination_ids".
+        let new: Scenario =
+            serde_json::from_str(r#"{"name":"n","destination_ids":["a","b"]}"#).unwrap();
+        assert_eq!(new.destination_ids, vec!["a", "b"]);
+        // Null / missing -> empty.
+        let null: Scenario =
+            serde_json::from_str(r#"{"name":"z","destination_ids":null}"#).unwrap();
+        assert!(null.destination_ids.is_empty());
+        let missing: Scenario = serde_json::from_str(r#"{"name":"m"}"#).unwrap();
+        assert!(missing.destination_ids.is_empty());
+        // Empty strings and duplicates are dropped on read.
+        let messy: Scenario =
+            serde_json::from_str(r#"{"name":"x","destination_ids":["a","","a"," b ","b"]}"#)
+                .unwrap();
+        assert_eq!(messy.destination_ids, vec!["a", "b"]);
+        // New files serialize only "destination_ids".
+        let json = serde_json::to_string(&new).unwrap();
+        assert!(json.contains("destination_ids"));
+        assert!(!json.contains("destination_id\""), "json: {json}");
+    }
+
+    #[test]
+    fn broadcast_validation_requires_one_and_rejects_duplicates() {
+        let mut s = Scenario::new("b");
+        assert!(s.validate_for_webhook().is_err());
+        s.destination_ids = vec!["a".to_string(), "a".to_string()];
+        let err = s.validate_for_webhook().unwrap_err();
+        assert!(err.contains("twice"), "unexpected error: {err}");
+        s.destination_ids = vec!["a".to_string(), "b".to_string()];
+        assert!(s.validate_for_webhook().is_ok());
+        // User mode ignores the list entirely (channel governs).
+        s.destination_ids = vec!["a".to_string(), "a".to_string()];
+        s.channel_id = "123".to_string();
+        assert!(s.validate().is_ok());
+    }
+
+    #[test]
     fn webhook_validation_allows_empty_channel_but_rejects_commands() {
         // Message scenario with no channel: user-mode validation fails,
         // webhook validation passes (the URL is channel-bound) once a
@@ -2536,13 +2971,13 @@ mod tests {
         let mut s = Scenario::new("webhook");
         assert!(s.validate().is_err());
         assert!(s.validate_for_webhook().is_err());
-        s.destination_id = Some("dest-1".to_string());
+        s.destination_ids = vec!["dest-1".to_string()];
         assert!(s.validate_for_webhook().is_ok());
         // Adding a command node flips webhook validation to an error,
         // while user-mode validation (with a channel) still passes.
         let mut s2 = Scenario::new("webhook-cmd");
         s2.channel_id = "123".to_string();
-        s2.destination_id = Some("dest-1".to_string());
+        s2.destination_ids = vec!["dest-1".to_string()];
         let mut node = Node::new(NodeKind::ActionSendCommand);
         node.config = serde_json::json!({"kind": "prefix", "name": "rank"});
         s2.nodes.push(node);

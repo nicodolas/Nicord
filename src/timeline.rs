@@ -187,8 +187,7 @@ pub fn upcoming_runs(
             continue;
         };
         let destination = scenario
-            .destination_id
-            .as_deref()
+            .primary_destination_id()
             .and_then(|id| destinations.iter().find(|d| d.id == id));
         let sent = destination
             .map(|d| sent_today_by_dest.get(&d.id).copied().unwrap_or(0))

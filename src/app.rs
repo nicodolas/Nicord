@@ -17,12 +17,12 @@ use crate::{
     discord::{Channel, DiscordClient, DiscordError, Guild, Me},
     preview::{char_count, expand_shortcodes, over_limit, parse_markdown},
     scenario::{
-        analyze_import, slash_option_kind_label, CommandConfig, Node, NodeKind, Scenario, Schedule,
-        SlashOption, SLASH_OPTION_KINDS,
+        analyze_import, slash_option_kind_label, ApiCallConfig, CommandConfig, Node, NodeKind,
+        Scenario, Schedule, SlashOption, SLASH_OPTION_KINDS,
     },
-    scheduler::{channels_violation, Engine},
+    scheduler::{channels_violation, format_bytes, Engine},
     secret_store::{
-        delete_secret, destination_entry, load_secret, migrate_secret, store_secret,
+        api_url_entry, delete_secret, destination_entry, load_secret, migrate_secret, store_secret,
         ENTRY_ACCOUNT_TOKEN, ENTRY_LEGACY_WEBHOOK,
     },
     store::{
@@ -65,6 +65,11 @@ pub struct NicordApp {
     pub webhook_check_status: Arc<Mutex<String>>,
     pub new_scenario_name: String,
     pub new_message: String,
+    /// File path being typed for a new attachment (idea #4).
+    pub new_attachment_path: String,
+    /// API URL being typed for a Call API node (idea #5; never
+    /// stored in plaintext — saved via the secret store on click).
+    pub api_url_input: String,
     /// Builder list search query. Session-only: a search is
     /// transient, nobody expects it to survive a restart.
     pub builder_search: String,
@@ -98,7 +103,7 @@ pub struct NicordApp {
     pub channels: Arc<Mutex<Vec<Channel>>>,
     pub picker_guild_id: String,
     pub log_filter: String,
-    /// Logs status filter ("" = all, else "sent"/"failed"/"deleted").
+    /// Logs status filter ("" = all, else "sent"/"edited"/"failed"/"deleted").
     pub log_status_filter: String,
     /// Logs scenario filter ("" = all, else a scenario id).
     pub log_scenario_filter: String,
@@ -286,6 +291,33 @@ fn try_enable_scenario(list: &mut [Scenario], i: usize, is_webhook: bool) -> Opt
     None
 }
 
+/// Attachment path status for the Builder (idea #4): metadata
+/// only, contents are never read for display.
+enum AttachmentStatus {
+    Ok(u64),
+    Missing,
+    Oversize(u64),
+    NotAFile,
+    Empty,
+}
+
+fn attachment_status(path: &str) -> AttachmentStatus {
+    if path.is_empty() {
+        return AttachmentStatus::Empty;
+    }
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return AttachmentStatus::Missing,
+    };
+    if !meta.is_file() {
+        return AttachmentStatus::NotAFile;
+    }
+    if meta.len() > crate::discord::MAX_ATTACHMENT_BYTES {
+        return AttachmentStatus::Oversize(meta.len());
+    }
+    AttachmentStatus::Ok(meta.len())
+}
+
 /// Build a sender from a config snapshot, following its send mode.
 /// None when the active mode has no usable credential.
 /// User-token mode only in practice for the engine: webhook mode
@@ -303,30 +335,66 @@ fn sender_for_config(config: &AppConfig) -> Option<MessageSender> {
     }
 }
 
-/// Resolve a scenario's sender + destination from a config snapshot.
-/// Webhook mode: the scenario's `destination_id` selects the
-/// destination; the sender is built from that destination's own
-/// encrypted URL and username override. None when the scenario has
-/// no destination, the destination is missing, or its URL cannot be
-/// decrypted/parsed — the engine skips such scenarios instead of
-/// silently sending to a different channel. User-token mode:
-/// the account sender, no destination.
-fn resolve_sender_for_scenario(
+/// Resolve a scenario's send targets from a config snapshot.
+/// Webhook mode: one (sender, destination) pair per destination id
+/// in the scenario (broadcast, idea #1); the sender is built from
+/// that destination's own encrypted URL and username override. An
+/// id that cannot be resolved (missing destination, undecryptable
+/// or unparsable URL, unbuildable client) is skipped with a
+/// warning — one bad destination must not silence the others.
+/// User-token mode: the single account sender, no destination.
+/// Empty when nothing resolves — the engine skips such scenarios
+/// instead of silently sending to a different channel.
+fn resolve_senders_for_scenario(
     store: &Store,
     config: &AppConfig,
     scenario: &Scenario,
-) -> Option<(MessageSender, Option<Destination>)> {
+) -> Vec<(MessageSender, Option<Destination>)> {
     match config.send_mode {
-        SendMode::UserToken => sender_for_config(config).map(|s| (s, None)),
+        SendMode::UserToken => sender_for_config(config)
+            .map(|s| vec![(s, None)])
+            .unwrap_or_default(),
         SendMode::Webhook => {
-            let dest_id = scenario.destination_id.as_deref()?;
-            let dest = store.load_destination(dest_id).ok()??;
-            let url = load_secret(&dest.encrypted_url).ok()?;
-            let parsed = parse_webhook_url(&url).ok()?;
-            let client = WebhookClient::new(parsed, &dest.username_override)?
-                .with_avatar_url(&dest.avatar_url_override)
-                .with_thread_id(&dest.thread_id);
-            Some((MessageSender::Webhook(client), Some(dest)))
+            let mut out = Vec::new();
+            for dest_id in &scenario.destination_ids {
+                let dest_id = dest_id.trim();
+                if dest_id.is_empty() {
+                    continue;
+                }
+                let Ok(Some(dest)) = store.load_destination(dest_id) else {
+                    tracing::warn!(
+                        "scenario '{}' references missing destination '{dest_id}' — skipped",
+                        scenario.name
+                    );
+                    continue;
+                };
+                let Ok(url) = load_secret(&dest.encrypted_url) else {
+                    tracing::warn!(
+                        "destination '{}' URL cannot be decrypted — skipped",
+                        dest.display_name()
+                    );
+                    continue;
+                };
+                let Ok(parsed) = parse_webhook_url(&url) else {
+                    tracing::warn!(
+                        "destination '{}' URL cannot be parsed — skipped",
+                        dest.display_name()
+                    );
+                    continue;
+                };
+                let Some(client) = WebhookClient::new(parsed, &dest.username_override).map(|c| {
+                    c.with_avatar_url(&dest.avatar_url_override)
+                        .with_thread_id(&dest.thread_id)
+                }) else {
+                    tracing::warn!(
+                        "destination '{}' client cannot be built — skipped",
+                        dest.display_name()
+                    );
+                    continue;
+                };
+                out.push((MessageSender::Webhook(client), Some(dest)));
+            }
+            out
         }
     }
 }
@@ -432,6 +500,10 @@ impl NicordApp {
             config.global_daily_cap,
             config.consecutive_error_limit,
         ));
+        // The engine starts with an empty allowlist; mirror the
+        // saved one so Call API fetches are fenced from the first
+        // run (idea #5).
+        engine.set_api_allowlist(config.api_allowed_hosts.clone());
         let has_enabled = scenarios.iter().any(|s| s.enabled);
         // First "sent today" value, so the Dashboard is correct from
         // the first frame (the 5 s cache in update() takes over after).
@@ -451,6 +523,8 @@ impl NicordApp {
             webhook_check_status: Arc::new(Mutex::new(String::new())),
             new_scenario_name: String::new(),
             new_message: String::new(),
+            new_attachment_path: String::new(),
+            api_url_input: String::new(),
             builder_search: String::new(),
             last_window_rect: None,
             did_initial_minimize: false,
@@ -621,7 +695,7 @@ impl NicordApp {
         if self.config.send_mode == SendMode::Webhook {
             if let Ok(dests) = self.store.load_destinations() {
                 if let Some(first) = dests.iter().find(|d| d.is_sendable()) {
-                    s.destination_id = Some(first.id.clone());
+                    s.destination_ids = vec![first.id.clone()];
                 }
             }
         }
@@ -649,22 +723,20 @@ impl NicordApp {
     /// Spawn a background thread that sends one test message for the
     /// selected-or-first scenario (see `test_send_target`), using
     /// the current send mode's stored credential. In webhook mode
-    /// the scenario's own destination is used.
+    /// the scenario's own destinations are used (broadcast: every
+    /// checked destination gets the test, like a real firing).
     fn test_send(&self) {
         let Some(scenario) = self.test_send_target() else {
             self.set_status("No scenario yet — create one first.");
             return;
         };
-        let (sender, destination) =
-            match resolve_sender_for_scenario(&self.store, &self.config, &scenario) {
-                Some(pair) => pair,
-                None => {
-                    self.set_status(
-                    "No valid credential/destination for this scenario in the current send mode.",
-                );
-                    return;
-                }
-            };
+        let targets = resolve_senders_for_scenario(&self.store, &self.config, &scenario);
+        if targets.is_empty() {
+            self.set_status(
+                "No valid credential/destination for this scenario in the current send mode.",
+            );
+            return;
+        }
         let engine = self.engine.clone();
         let status = self.status.clone();
         std::thread::spawn(move || {
@@ -677,51 +749,81 @@ impl NicordApp {
                     return;
                 }
             };
-            // Template identity: per-destination in webhook mode
-            // (stored name, no network), account identity in user mode.
-            let (username, server_name) = if let Some(dest) = &destination {
-                (dest.effective_username(), String::new())
-            } else {
-                rt.block_on(async {
-                    match &sender {
-                        MessageSender::User(client) => {
-                            let u = client
-                                .get_me_typed()
-                                .await
-                                .map(|m| m.display_name())
-                                .unwrap_or_else(|_| "you".to_string());
-                            let s = client
-                                .list_guilds()
-                                .await
-                                .ok()
-                                .and_then(|g| g.first().map(|x| x.name.clone()))
-                                .unwrap_or_else(|| "server".to_string());
-                            (u, s)
+            let total = targets.len();
+            let mut sent_ids: Vec<String> = Vec::new();
+            let mut failures: Vec<String> = Vec::new();
+            for (sender, destination) in &targets {
+                // Template identity: per-destination in webhook mode
+                // (stored name, no network), account identity in user mode.
+                let (username, server_name) = if let Some(dest) = destination {
+                    (dest.effective_username(), String::new())
+                } else {
+                    rt.block_on(async {
+                        match sender {
+                            MessageSender::User(client) => {
+                                let u = client
+                                    .get_me_typed()
+                                    .await
+                                    .map(|m| m.display_name())
+                                    .unwrap_or_else(|_| "you".to_string());
+                                let s = client
+                                    .list_guilds()
+                                    .await
+                                    .ok()
+                                    .and_then(|g| g.first().map(|x| x.name.clone()))
+                                    .unwrap_or_else(|| "server".to_string());
+                                (u, s)
+                            }
+                            MessageSender::Webhook(_) => ("you".to_string(), String::new()),
                         }
-                        MessageSender::Webhook(_) => ("you".to_string(), String::new()),
-                    }
-                })
-            };
-            let result = rt.block_on(engine.send_once(
-                &scenario,
-                &sender,
-                destination.as_ref(),
-                &username,
-                &server_name,
-            ));
+                    })
+                };
+                match rt.block_on(engine.send_once(
+                    &scenario,
+                    sender,
+                    destination.as_ref(),
+                    &username,
+                    &server_name,
+                )) {
+                    Ok(id) => sent_ids.push(id),
+                    Err(e) => failures.push(format!(
+                        "{}: {e}",
+                        destination
+                            .as_ref()
+                            .map(|d| d.display_name())
+                            .unwrap_or_else(|| "account".to_string())
+                    )),
+                }
+            }
             // The engine already beeps on success; beep here too for
             // failures (test sends bypass the run loop's failure log).
             // The throttle keeps a success from beeping twice.
-            if result.is_ok() {
-                crate::notify::play(crate::notify::SoundEvent::SendSuccess);
-            } else {
+            if sent_ids.is_empty() {
                 crate::notify::play(crate::notify::SoundEvent::SendFailure);
+            } else {
+                crate::notify::play(crate::notify::SoundEvent::SendSuccess);
             }
             if let Ok(mut s) = status.lock() {
-                *s = match result {
-                    Ok(id) if id.is_empty() => "Test sent! (webhook, no id returned)".to_string(),
-                    Ok(id) => format!("Test sent! message id {id}"),
-                    Err(e) => format!("Test failed: {e}"),
+                *s = if failures.is_empty() {
+                    if total == 1 {
+                        match sent_ids.into_iter().next().unwrap_or_default() {
+                            id if id.is_empty() => {
+                                "Test sent! (webhook, no id returned)".to_string()
+                            }
+                            id => format!("Test sent! message id {id}"),
+                        }
+                    } else {
+                        format!("Test sent to all {total} destinations!")
+                    }
+                } else if sent_ids.is_empty() {
+                    format!("Test failed: {}", failures.join("; "))
+                } else {
+                    format!(
+                        "Test sent to {}/{} destinations; failed: {}",
+                        sent_ids.len(),
+                        total,
+                        failures.join("; ")
+                    )
                 };
             }
         });
@@ -1349,7 +1451,7 @@ impl NicordApp {
                 let store2 = store.clone();
                 let resolve_sender = move |scenario: &Scenario| {
                     let cfg = load_config();
-                    resolve_sender_for_scenario(&store2, &cfg, scenario)
+                    resolve_senders_for_scenario(&store2, &cfg, scenario)
                 };
                 let scenarios_fn = move || scenarios2.lock().map(|l| l.clone()).unwrap_or_default();
                 engine2.run_loop(resolve_sender, scenarios_fn).await;
@@ -2283,7 +2385,7 @@ impl NicordApp {
                     let next_for_dest = self.scenarios.lock().map(|l| {
                         l.iter()
                             .filter(|s| {
-                                s.enabled && s.destination_id.as_deref() == Some(dest.id.as_str())
+                                s.enabled && s.destination_ids.iter().any(|id| id == &dest.id)
                             })
                             .filter_map(|s| next_runs.get(&s.id).map(|t| (*t, s.timezone.clone())))
                             .min_by_key(|(t, _)| *t)
@@ -2972,76 +3074,108 @@ impl NicordApp {
         theme::card(ui, |ui| {
             theme::section_title(ui, t(self.lang(), "builder.editor"));
             if self.config.send_mode == SendMode::Webhook {
-                // Destination picker: each scenario sends to exactly
-                // one destination. A scenario without one cannot be
-                // enabled (validation blocks it with a clear error).
+                // Destination picker (broadcast, idea #1): each
+                // firing sends to EVERY checked destination. A
+                // scenario with none checked cannot be enabled
+                // (validation blocks it with a clear error).
                 let dests = self.store.load_destinations().unwrap_or_default();
-                let current_dest_id = {
-                    self.scenarios
-                        .lock()
-                        .map(|l| {
-                            l.get(i)
-                                .and_then(|s| s.destination_id.clone())
-                                .unwrap_or_default()
-                        })
-                        .unwrap_or_default()
-                };
-                let current_label = dests
-                    .iter()
-                    .find(|d| d.id == current_dest_id)
-                    .map(|d| d.display_name())
-                    .unwrap_or_else(|| "— Chưa chọn đích đến —".to_string());
+                let selected_ids: Vec<String> = self
+                    .scenarios
+                    .lock()
+                    .map(|l| {
+                        l.get(i)
+                            .map(|s| s.destination_ids.clone())
+                            .unwrap_or_default()
+                    })
+                    .unwrap_or_default();
                 ui.horizontal(|ui| {
                     ui.label("Gửi tới:");
-                    egui::ComboBox::from_id_salt("builder_destination")
-                        .selected_text(current_label)
-                        .show_ui(ui, |ui| {
-                            for d in dests.iter().filter(|d| d.enabled) {
-                                if ui
-                                    .selectable_label(d.id == current_dest_id, d.display_name())
-                                    .clicked()
-                                {
-                                    if let Ok(mut list) = self.scenarios.lock() {
-                                        if let Some(s) = list.get_mut(i) {
-                                            s.destination_id = Some(d.id.clone());
-                                            let _ = self.store.save_scenario(s);
-                                        }
-                                    }
-                                }
-                            }
-                            if dests.iter().any(|d| !d.enabled) {
-                                ui.separator();
-                                theme::muted(ui, "Đích đến đã tắt không hiện ở đây.");
-                            }
-                        });
                     if ui.button("Sửa đích đến").clicked() {
                         self.screen = Screen::Destinations;
                     }
                 });
-                if let Some(dest) = dests.iter().find(|d| d.id == current_dest_id) {
+                let mut toggled: Option<(String, bool)> = None;
+                for d in &dests {
+                    let mut checked = selected_ids.iter().any(|id| id == &d.id);
+                    if d.enabled {
+                        if ui.checkbox(&mut checked, d.display_name()).changed() {
+                            toggled = Some((d.id.clone(), checked));
+                        }
+                    } else if checked {
+                        // Selected but disabled: shown, not clickable
+                        // — the id stays in the list and the engine
+                        // skips it until the destination is re-enabled.
+                        ui.add_enabled(
+                            false,
+                            egui::Checkbox::new(
+                                &mut checked,
+                                format!("{} (đã tắt)", d.display_name()),
+                            ),
+                        );
+                    }
+                }
+                if let Some((id, checked)) = toggled {
+                    if let Ok(mut list) = self.scenarios.lock() {
+                        if let Some(s) = list.get_mut(i) {
+                            if checked {
+                                if !s.destination_ids.iter().any(|x| x == &id) {
+                                    s.destination_ids.push(id);
+                                }
+                            } else {
+                                s.destination_ids.retain(|x| x != &id);
+                            }
+                            let _ = self.store.save_scenario(s);
+                        }
+                    }
+                }
+                if dests
+                    .iter()
+                    .any(|d| !d.enabled && !selected_ids.iter().any(|id| id == &d.id))
+                {
+                    theme::muted(ui, "Đích đến đã tắt và không được chọn không hiện ở đây.");
+                }
+                // Same-channel warning: two webhooks in one channel
+                // would post the same message twice per firing.
+                let selected_dests: Vec<&Destination> = dests
+                    .iter()
+                    .filter(|d| selected_ids.iter().any(|id| id == &d.id))
+                    .collect();
+                let mut seen_channels: Vec<&str> = Vec::new();
+                let mut dup_channel = false;
+                for d in &selected_dests {
+                    if d.channel_id.is_empty() {
+                        continue;
+                    }
+                    if seen_channels.contains(&d.channel_id.as_str()) {
+                        dup_channel = true;
+                    }
+                    seen_channels.push(d.channel_id.as_str());
+                }
+                if dup_channel {
+                    ui.label(
+                        RichText::new(
+                            "Cảnh báo: hai đích đến cùng một kênh — mỗi lần chạy sẽ gửi trùng tin nhắn.",
+                        )
+                        .color(theme::palette().danger),
+                    );
+                }
+                if selected_dests.is_empty() {
+                    if dests.is_empty() {
+                        theme::muted(
+                            ui,
+                            "Chưa có đích đến nào — thêm một webhook trong Đích đến.",
+                        );
+                    } else {
+                        theme::muted(ui, "Chọn ít nhất một đích đến để bật kịch bản này.");
+                    }
+                } else {
                     theme::muted(
                         ui,
                         &format!(
-                            "Giới hạn: {}/ngày, cách nhau tối thiểu {}s{}",
-                            if dest.daily_cap == 0 {
-                                "theo toàn cục".to_string()
-                            } else {
-                                dest.daily_cap.to_string()
-                            },
-                            dest.min_interval_secs,
-                            match (&dest.quiet_start, &dest.quiet_end) {
-                                (Some(s), Some(e)) => format!(", im lặng {s}–{e}"),
-                                _ => String::new(),
-                            }
+                            "Sẽ gửi tới {} đích đến mỗi lần chạy, mỗi đích có giới hạn và lỗi riêng.",
+                            selected_dests.len()
                         ),
                     );
-                } else if dests.is_empty() {
-                    theme::muted(
-                        ui,
-                        "Chưa có đích đến nào — thêm một webhook trong Đích đến.",
-                    );
-                } else {
-                    theme::muted(ui, "Chọn một đích đến để bật kịch bản này.");
                 }
                 theme::muted(ui, "Lệnh (Send Command) không hoạt động ở chế độ Webhook.");
                 ui.add_space(6.0);
@@ -3161,7 +3295,7 @@ impl NicordApp {
             ui.add_space(4.0);
             self.show_content_source(ui, i);
             ui.add_space(6.0);
-            ui.label("Nodes (in order — click a command node to edit it):");
+            ui.label("Nodes (in order — click a command or Call API node to edit it):");
             // Q1 preview: live Discord-style preview of the text
             // being composed, with a 2000-character counter.
             self.show_message_preview(ui);
@@ -3174,6 +3308,10 @@ impl NicordApp {
             self.show_embed_composer(ui, i);
             ui.add_space(6.0);
             self.show_poll_composer(ui, i);
+            ui.add_space(6.0);
+            self.show_edit_mode_section(ui, i);
+            ui.add_space(6.0);
+            self.show_attachments_section(ui, i);
             ui.add_space(6.0);
             // Import warnings from the last import (Q3), if any.
             if !self.import_warnings.is_empty() {
@@ -3199,6 +3337,7 @@ impl NicordApp {
                 }
             }
             self.show_command_editor(ui, i);
+            self.show_api_editor(ui, i);
             // Node buttons + Validate + Export/Import live in the pinned
             // action bar below the editor (show_builder_actions), so they
             // are always visible without scrolling.
@@ -3232,7 +3371,7 @@ impl NicordApp {
             let scenario = list.unwrap_or(None);
             let dest = scenario
                 .as_ref()
-                .and_then(|s| s.destination_id.clone())
+                .and_then(|s| s.primary_destination_id().map(str::to_string))
                 .and_then(|id| self.store.load_destination(&id).ok().flatten());
             (scenario, dest)
         };
@@ -3638,8 +3777,7 @@ impl NicordApp {
                             sc.schedule = schedule.clone();
                             sc.timezone = timezone.clone();
                             let dest = sc
-                                .destination_id
-                                .as_deref()
+                                .primary_destination_id()
                                 .and_then(|id| self.store.load_destination(id).ok().flatten());
                             let sent = dest
                                 .as_ref()
@@ -4128,6 +4266,158 @@ impl NicordApp {
         }
     }
 
+    /// Edit-in-place section (idea #2): toggle + explanation + the
+    /// remembered message ids + a "forget" button. Reads the
+    /// scenario into locals, edits, and writes back when changed
+    /// (same pattern as the composers).
+    fn show_edit_mode_section(&mut self, ui: &mut egui::Ui, i: usize) {
+        let (mut edit_on, remembered) = self
+            .scenarios
+            .lock()
+            .map(|l| {
+                l.get(i)
+                    .map(|s| (s.edit_last_message, s.last_message_ids.len()))
+                    .unwrap_or((false, 0))
+            })
+            .unwrap_or((false, 0));
+        let mut changed = false;
+        let mut forget = false;
+        theme::card(ui, |ui| {
+            theme::section_title(ui, "Sửa tin nhắn cũ (thay vì gửi mới)");
+            if ui
+                .checkbox(
+                    &mut edit_on,
+                    "Mỗi lần chạy sửa tin nhắn cũ thay vì gửi tin mới",
+                )
+                .changed()
+            {
+                changed = true;
+            }
+            theme::muted(
+                ui,
+                "Lần chạy đầu tiên vẫn gửi tin mới và nhớ lại tin đó; các lần sau sửa ngay tin đó. Nếu tin đã bị xóa, lần chạy tiếp theo gửi tin mới. Chỉ nội dung và embed được sửa — bình chọn và tệp đính kèm chỉ đi kèm tin gửi mới.",
+            );
+            if remembered > 0 {
+                ui.horizontal(|ui| {
+                    theme::muted(ui, &format!("Đang nhớ {remembered} tin nhắn."));
+                    if ui.button("Quên tin nhắn cũ").clicked() {
+                        forget = true;
+                    }
+                });
+                theme::muted(ui, "Quên xong, lần chạy tới sẽ gửi tin mới.");
+            }
+        });
+        if changed || forget {
+            if let Ok(mut list) = self.scenarios.lock() {
+                if let Some(s) = list.get_mut(i) {
+                    s.edit_last_message = edit_on;
+                    if forget {
+                        s.last_message_ids.clear();
+                    }
+                    let _ = self.store.save_scenario(s);
+                }
+            }
+        }
+    }
+
+    /// Attachments section (idea #4): editable path list with a
+    /// per-file status (exists/size/missing/oversize), an add row,
+    /// and remove buttons. Paths are edited in a local draft and
+    /// written back when changed (same pattern as the composers).
+    /// Status checks are plain `metadata` calls — cheap for a
+    /// handful of files, and they never read file contents.
+    fn show_attachments_section(&mut self, ui: &mut egui::Ui, i: usize) {
+        let mut paths: Vec<String> = self
+            .scenarios
+            .lock()
+            .map(|l| l.get(i).map(|s| s.attachments.clone()).unwrap_or_default())
+            .unwrap_or_default();
+        let mut changed = false;
+        let mut remove: Option<usize> = None;
+        theme::card(ui, |ui| {
+            theme::section_title(ui, "Tệp đính kèm");
+            theme::muted(
+                ui,
+                "Tệp đi kèm mỗi tin gửi mới (không đi kèm khi sửa tin cũ). Chỉ đường dẫn được lưu — file không đi kèm khi xuất cấu hình. Tối đa 10 tệp, mỗi tệp tối đa 8 MB.",
+            );
+            for (idx, path) in paths.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(path)
+                                .hint_text("/đường/dẫn/tới/file.png")
+                                .desired_width(260.0),
+                        )
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                    // Per-file status, computed fresh each frame.
+                    let status = attachment_status(path.trim());
+                    match status {
+                        AttachmentStatus::Ok(size) => {
+                            theme::muted(ui, &format_bytes(size));
+                        }
+                        AttachmentStatus::Missing => {
+                            ui.label(
+                                RichText::new("không tìm thấy — sẽ bị bỏ qua")
+                                    .color(theme::palette().danger),
+                            );
+                        }
+                        AttachmentStatus::Oversize(size) => {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} — quá 8 MB, sẽ bị bỏ qua",
+                                    format_bytes(size)
+                                ))
+                                .color(theme::palette().danger),
+                            );
+                        }
+                        AttachmentStatus::NotAFile => {
+                            ui.label(
+                                RichText::new("không phải file — sẽ bị bỏ qua")
+                                    .color(theme::palette().danger),
+                            );
+                        }
+                        AttachmentStatus::Empty => {}
+                    }
+                    if ui.button("✕").clicked() {
+                        remove = Some(idx);
+                    }
+                });
+            }
+            if let Some(idx) = remove {
+                paths.remove(idx);
+                changed = true;
+            }
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.new_attachment_path)
+                        .hint_text("Đường dẫn file mới…")
+                        .desired_width(260.0),
+                );
+                let can_add = !self.new_attachment_path.trim().is_empty() && paths.len() < 10;
+                if ui
+                    .add_enabled(can_add, egui::Button::new("+ Thêm tệp"))
+                    .clicked()
+                {
+                    paths.push(self.new_attachment_path.trim().to_string());
+                    self.new_attachment_path.clear();
+                    changed = true;
+                }
+                theme::muted(ui, &format!("{}/10 tệp", paths.len()));
+            });
+        });
+        if changed {
+            if let Ok(mut list) = self.scenarios.lock() {
+                if let Some(s) = list.get_mut(i) {
+                    s.attachments = paths;
+                    let _ = self.store.save_scenario(s);
+                }
+            }
+        }
+    }
+
     /// Discord-style preview of the message being composed (QoL Q1):
     /// markdown segments, emoji shortcodes expanded for display, and
     /// a live character counter. Empty input shows nothing.
@@ -4338,6 +4628,139 @@ impl NicordApp {
         }
     }
 
+    /// Editor panel for the selected `UtilityCallApi` node (idea
+    /// #5): HTTPS URL (saved via the secret store, never shown in
+    /// plaintext after saving), variable name, JSON field path,
+    /// timeout, and failure policy. Reads the node config into a
+    /// local `ApiCallConfig`, edits it, and writes it back when
+    /// changed (same pattern as the command editor).
+    fn show_api_editor(&mut self, ui: &mut egui::Ui, i: usize) {
+        let Some(sel_id) = self.selected_node.clone() else {
+            return;
+        };
+        let mut cfg_opt: Option<ApiCallConfig> = None;
+        if let Ok(list) = self.scenarios.lock() {
+            if let Some(s) = list.get(i) {
+                if let Some(n) = s.nodes.iter().find(|n| n.id == sel_id) {
+                    if n.kind == NodeKind::UtilityCallApi {
+                        cfg_opt = Some(ApiCallConfig::from_node(n));
+                    }
+                }
+            }
+        }
+        let Some(mut cfg) = cfg_opt else {
+            return;
+        };
+        ui.separator();
+        theme::section_title(ui, "Lấy dữ liệu từ web (Call API)");
+        theme::muted(
+            ui,
+            "Mỗi lần chạy, Nicord tải JSON từ địa chỉ này và đưa một trường vào biến mẫu. Chỉ dùng https. Địa chỉ có thể chứa khóa API nên được lưu mã hóa và không bao giờ hiện lại.",
+        );
+        if cfg.url_ref.trim().is_empty() {
+            theme::muted(ui, "Chưa có địa chỉ nào được lưu.");
+        } else if cfg.url_host.trim().is_empty() {
+            theme::muted(ui, "Đã lưu một địa chỉ (máy này).");
+        } else {
+            theme::muted(
+                ui,
+                &format!("Đã lưu địa chỉ cho host {}.", cfg.url_host.trim()),
+            );
+        }
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.api_url_input)
+                    .hint_text("https://api.example.com/data?key=...")
+                    .password(true)
+                    .desired_width(300.0),
+            );
+            if ui.button("Lưu địa chỉ").clicked() {
+                let input = self.api_url_input.trim().to_string();
+                match crate::apidata::parse_api_url(&input) {
+                    Ok(host) => {
+                        match store_secret(&api_url_entry(&sel_id), &input) {
+                            Ok(stored) => {
+                                // Best-effort cleanup of the previous
+                                // entry (a re-save replaces it).
+                                if !cfg.url_ref.trim().is_empty() {
+                                    delete_secret(&cfg.url_ref);
+                                }
+                                cfg.url_ref = stored;
+                                cfg.url_host = host;
+                                self.api_url_input.clear();
+                                self.set_status("API URL saved (encrypted).");
+                            }
+                            Err(e) => {
+                                self.set_status(&format!("Could not save API URL: {e}"));
+                            }
+                        }
+                    }
+                    Err(e) => self.set_status(&format!("Invalid API URL: {e}")),
+                }
+            }
+            if !cfg.url_ref.trim().is_empty() && ui.button("Xóa địa chỉ").clicked() {
+                delete_secret(&cfg.url_ref);
+                cfg.url_ref.clear();
+                cfg.url_host.clear();
+                self.set_status("API URL removed.");
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Biến mẫu:");
+            ui.add(
+                egui::TextEdit::singleline(&mut cfg.variable)
+                    .hint_text("temp")
+                    .desired_width(120.0),
+            );
+            theme::muted(ui, "dùng trong tin nhắn như {{temp}}");
+        });
+        ui.horizontal(|ui| {
+            ui.label("Trường JSON:");
+            ui.add(
+                egui::TextEdit::singleline(&mut cfg.field_path)
+                    .hint_text("weather.temp")
+                    .desired_width(180.0),
+            );
+            theme::muted(ui, "đường dẫn chấm, số là vị trí trong mảng");
+        });
+        ui.horizontal(|ui| {
+            ui.label("Chờ tối đa (giây):");
+            ui.add(egui::DragValue::new(&mut cfg.timeout_secs).range(1..=60));
+            theme::muted(ui, "quá thời gian coi như lỗi");
+        });
+        let mut policy_empty = cfg.effective_on_failure() == "empty";
+        egui::ComboBox::from_label("Khi lấy dữ liệu lỗi")
+            .selected_text(if policy_empty {
+                "Gửi với giá trị rỗng"
+            } else {
+                "Bỏ lượt này"
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut policy_empty, false, "Bỏ lượt này (ghi vào lịch sử)");
+                ui.selectable_value(&mut policy_empty, true, "Gửi với giá trị rỗng");
+            });
+        cfg.on_failure = if policy_empty {
+            "empty".to_string()
+        } else {
+            "skip".to_string()
+        };
+        if let Err(e) = cfg.validate() {
+            ui.label(RichText::new(e).color(theme::palette().danger));
+        }
+        // Write back when changed (same pattern as the command editor).
+        if let Ok(mut list) = self.scenarios.lock() {
+            if let Some(s) = list.get_mut(i) {
+                if let Some(n) = s.nodes.iter_mut().find(|n| n.id == sel_id) {
+                    let new_cfg = serde_json::to_value(&cfg).unwrap_or_default();
+                    if n.config != new_cfg {
+                        n.config = new_cfg;
+                        let _ = self.store.save_scenario(s);
+                    }
+                }
+            }
+        }
+    }
+
     /// Pinned action bar under the Builder editor: Validate, node
     /// buttons, Export/Import. Kept outside the editor's ScrollArea
     /// so the key actions are always visible in the 700 px window.
@@ -4381,6 +4804,14 @@ impl NicordApp {
                     if let Ok(mut list) = self.scenarios.lock() {
                         if let Some(s) = list.get_mut(i) {
                             s.nodes.push(Node::new(NodeKind::UtilityWait));
+                        }
+                    }
+                    self.save_scenarios();
+                }
+                if ui.button("+ Call API").clicked() {
+                    if let Ok(mut list) = self.scenarios.lock() {
+                        if let Some(s) = list.get_mut(i) {
+                            s.nodes.push(Node::new(NodeKind::UtilityCallApi));
                         }
                     }
                     self.save_scenarios();
@@ -4488,7 +4919,7 @@ impl NicordApp {
             "Tin thử từ Nicord — đích đến '{}'. Bạn có thể xóa tin này trong Discord.",
             dest.display_name()
         )];
-        scenario.destination_id = Some(dest.id.clone());
+        scenario.destination_ids = vec![dest.id.clone()];
         let engine = self.engine.clone();
         let status = self.status.clone();
         let username = dest.effective_username();
@@ -4944,7 +5375,7 @@ impl NicordApp {
                     .lock()
                     .map(|list| {
                         list.iter()
-                            .filter(|s| s.destination_id.as_deref() == Some(confirm_id.as_str()))
+                            .filter(|s| s.destination_ids.iter().any(|id| id == &confirm_id))
                             .map(|s| s.name.clone())
                             .collect()
                     })
@@ -4963,7 +5394,7 @@ impl NicordApp {
                     if users.is_empty() {
                         theme::muted(ui, "Không có kịch bản nào dùng đích đến này.");
                     } else {
-                        ui.label("Chuyển các kịch bản này sang:");
+                        ui.label("Kịch bản nào không còn đích đến sẽ chuyển sang:");
                         let others: Vec<Destination> = dests
                             .iter()
                             .filter(|d| d.id != confirm_id)
@@ -4993,16 +5424,20 @@ impl NicordApp {
                     }
                     ui.horizontal(|ui| {
                         if theme::danger_button(ui, "Xóa thật").clicked() {
-                            // Reassign or disable the scenarios first.
+                            // Remove the deleted id from every scenario;
+                            // a scenario left with no destination is
+                            // reassigned or disabled, as chosen.
                             if let Ok(mut list) = self.scenarios.lock() {
                                 for s in list.iter_mut() {
-                                    if s.destination_id.as_deref() == Some(confirm_id.as_str()) {
-                                        if self.dest_delete_target.is_empty() {
-                                            s.enabled = false;
-                                            s.destination_id = None;
-                                        } else {
-                                            s.destination_id =
-                                                Some(self.dest_delete_target.clone());
+                                    if s.destination_ids.iter().any(|id| id == &confirm_id) {
+                                        s.destination_ids.retain(|id| id != &confirm_id);
+                                        if s.destination_ids.is_empty() {
+                                            if self.dest_delete_target.is_empty() {
+                                                s.enabled = false;
+                                            } else {
+                                                s.destination_ids
+                                                    .push(self.dest_delete_target.clone());
+                                            }
                                         }
                                     }
                                 }
@@ -5075,6 +5510,11 @@ impl NicordApp {
                             &mut self.log_status_filter,
                             "sent".to_string(),
                             "sent",
+                        );
+                        ui.selectable_value(
+                            &mut self.log_status_filter,
+                            "edited".to_string(),
+                            "edited",
                         );
                         ui.selectable_value(
                             &mut self.log_status_filter,
@@ -5785,6 +6225,8 @@ impl NicordApp {
                 self.engine
                     .set_dest_error_limit(self.config.consecutive_error_limit);
                 self.engine.set_antiban(self.config.antiban.clone());
+                self.engine
+                    .set_api_allowlist(self.config.api_allowed_hosts.clone());
                 self.backup_warnings = report.warnings;
                 self.backup_import_confirm = false;
                 self.backup_import_passphrase.clear();
@@ -6114,6 +6556,46 @@ impl NicordApp {
             );
         });
         ui.add_space(12.0);
+        // API host allowlist (idea #5): edited in a local draft,
+        // written back on change; persisted + live-applied by the
+        // Save button below (same as the other settings here).
+        theme::card(ui, |ui| {
+            theme::section_title(ui, "Call API — Host được phép");
+            theme::muted(
+                ui,
+                "Để trống: node Call API được lấy dữ liệu từ bất kỳ host https nào. Thêm host để giới hạn: mỗi dòng một host, '.example.com' cho phép mọi tên miền con.",
+            );
+            let mut hosts = self.config.api_allowed_hosts.clone();
+            let mut changed = false;
+            let mut remove: Option<usize> = None;
+            for (idx, host) in hosts.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(egui::TextEdit::singleline(host).desired_width(240.0))
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                    if ui.button("✕").clicked() {
+                        remove = Some(idx);
+                    }
+                });
+            }
+            if let Some(idx) = remove {
+                hosts.remove(idx);
+                changed = true;
+            }
+            if ui.button("+ Thêm host").clicked() {
+                hosts.push(String::new());
+                changed = true;
+            }
+            if changed {
+                // Empty rows are kept (so clearing a row to retype
+                // does not delete it); matching ignores blanks.
+                self.config.api_allowed_hosts = hosts;
+            }
+        });
+        ui.add_space(12.0);
         theme::card(ui, |ui| {
             theme::section_title(ui, "Limits");
             ui.label("Limits: 1 channel • 300 messages/day (resets 00:00 UTC)");
@@ -6283,6 +6765,9 @@ impl NicordApp {
                 let _ = save_config(&self.config);
                 // Live-apply the anti-ban settings to the running engine.
                 self.engine.set_antiban(self.config.antiban.clone());
+                // Live-apply the API host allowlist (no restart needed).
+                self.engine
+                    .set_api_allowlist(self.config.api_allowed_hosts.clone());
                 // Live-apply the destination caps (no restart needed).
                 self.engine
                     .set_global_daily_cap(self.config.global_daily_cap);
@@ -6488,7 +6973,7 @@ mod tests {
         assert!(!list[0].enabled);
 
         // With a destination the fresh scenario is valid: enabled.
-        list[0].destination_id = Some("dest-1".to_string());
+        list[0].destination_ids = vec!["dest-1".to_string()];
         let msg = try_enable_scenario(&mut list, 0, true);
         assert_eq!(msg, None);
         assert!(list[0].enabled);
@@ -6549,7 +7034,7 @@ mod tests {
     fn try_enable_clears_last_run_for_once_scenarios() {
         use chrono::TimeZone;
         let mut s = Scenario::new("Once fired");
-        s.destination_id = Some("dest-1".to_string());
+        s.destination_ids = vec!["dest-1".to_string()];
         s.schedule = Some(Schedule::Once {
             at: chrono::Utc.with_ymd_and_hms(2026, 11, 17, 9, 0, 0).unwrap(),
         });
@@ -6562,7 +7047,7 @@ mod tests {
         // Recurring schedules keep their anchor: re-enabling must
         // not replay already-fired runs.
         let mut s = Scenario::new("Daily");
-        s.destination_id = Some("dest-1".to_string());
+        s.destination_ids = vec!["dest-1".to_string()];
         let fired = chrono::Utc.with_ymd_and_hms(2026, 11, 17, 9, 0, 5).unwrap();
         s.last_run_at = Some(fired);
         let mut list = vec![s];

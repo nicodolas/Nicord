@@ -111,6 +111,12 @@ pub struct AppConfig {
     /// Missing in old configs → true: failures deserve attention.
     #[serde(default = "default_true")]
     pub sound_enabled: bool,
+    /// Host allowlist for Call API fetches (idea #5). Empty = any
+    /// HTTPS host. Entries match exactly, or as a suffix when they
+    /// start with '.' (see `apidata::host_allowed`). Persisted in
+    /// config and carried by export/import.
+    #[serde(default)]
+    pub api_allowed_hosts: Vec<String>,
     /// Also play a sound on successful sends. Default false: with
     /// frequent schedules, a sound per send would be noise.
     #[serde(default)]
@@ -210,6 +216,7 @@ impl Default for AppConfig {
             tray_enabled: false,
             auto_check_updates: true,
             sound_enabled: true,
+            api_allowed_hosts: Vec::new(),
             sound_on_success: false,
             last_export_at: String::new(),
             ui_scale: default_ui_scale(),
@@ -617,7 +624,7 @@ impl Store {
             Err(_) => return 0,
         };
         conn.query_row(
-            "SELECT COUNT(*) FROM send_logs WHERE status = 'sent' AND created_at >= ?1 AND created_at < ?2",
+            "SELECT COUNT(*) FROM send_logs WHERE status IN ('sent', 'edited') AND created_at >= ?1 AND created_at < ?2",
             params![start, end],
             |row| row.get::<_, i64>(0),
         )
@@ -890,8 +897,8 @@ impl Store {
     fn assign_unassigned_scenarios(&self, dest_id: &str) -> Result<(), String> {
         let scenarios = self.load_scenarios()?;
         for mut s in scenarios {
-            if s.destination_id.is_none() {
-                s.destination_id = Some(dest_id.to_string());
+            if s.destination_ids.is_empty() {
+                s.destination_ids = vec![dest_id.to_string()];
                 self.save_scenario(&s)?;
             }
         }
@@ -912,7 +919,7 @@ impl Store {
             Err(_) => return 0,
         };
         conn.query_row(
-            "SELECT COUNT(*) FROM send_logs WHERE status = 'sent' AND destination_id = ?1 AND created_at >= ?2 AND created_at < ?3",
+            "SELECT COUNT(*) FROM send_logs WHERE status IN ('sent', 'edited') AND destination_id = ?1 AND created_at >= ?2 AND created_at < ?3",
             params![destination_id, start, end],
             |row| row.get::<_, i64>(0),
         )
@@ -1123,7 +1130,7 @@ impl Store {
         let mut stmt = conn
             .prepare(
                 "SELECT substr(created_at, 1, 10), status, COUNT(*) FROM send_logs
-                 WHERE created_at >= ?1 AND status IN ('sent', 'failed')
+                 WHERE created_at >= ?1 AND status IN ('sent', 'edited', 'failed')
                  GROUP BY 1, 2 ORDER BY 1",
             )
             .map_err(|e| e.to_string())?;
@@ -1141,9 +1148,10 @@ impl Store {
         for row in rows {
             let (date, status, count) = row.map_err(|e| e.to_string())?;
             let entry = by_day.entry(date).or_default();
-            if status == "sent" {
-                entry.0 = count.max(0) as u32;
-            } else {
+            // Edits are deliveries, not failures.
+            if status == "sent" || status == "edited" {
+                entry.0 += count.max(0) as u32;
+            } else if status == "failed" {
                 entry.1 = count.max(0) as u32;
             }
         }
@@ -1509,6 +1517,35 @@ mod tests {
         assert_eq!(store.count_sends_today_for_destination("d1"), 3);
         assert_eq!(store.count_sends_today_for_destination("d2"), 1);
         assert_eq!(store.count_sends_today_for_destination("nope"), 0);
+    }
+
+    #[test]
+    fn edited_rows_count_as_deliveries_not_failures() {
+        let store = Store::open_memory().unwrap();
+        let today = chrono::Utc::now().date_naive();
+        let rows = [
+            (format!("{today}T10:00:00+00:00"), "sent", "d1"),
+            (format!("{today}T11:00:00+00:00"), "edited", "d1"),
+            (format!("{today}T12:00:00+00:00"), "edited", "d1"),
+            (format!("{today}T13:00:00+00:00"), "failed", "d1"),
+        ];
+        {
+            let conn = store.db.lock().unwrap();
+            for (at, status, dest) in &rows {
+                conn.execute(
+                    "INSERT INTO send_logs (scenario_id, scenario_name, channel_id, status, detail, created_at, destination_id)
+                     VALUES ('s', 'n', 'c', ?1, 'd', ?2, ?3)",
+                    params![status, at, dest],
+                )
+                .unwrap();
+            }
+        }
+        assert_eq!(store.count_sends_today(), 3);
+        assert_eq!(store.count_sends_today_for_destination("d1"), 3);
+        let days = store.counts_by_day(1).unwrap();
+        assert_eq!(days.len(), 1);
+        assert_eq!(days[0].1, 3, "sent+edited");
+        assert_eq!(days[0].2, 1, "failed");
     }
 
     #[test]
@@ -1933,7 +1970,7 @@ mod tests {
     fn migration_creates_one_destination_and_assigns_scenarios() {
         let store = Store::open_memory().unwrap();
         let mut s = Scenario::new("migrated");
-        s.destination_id = None;
+        s.destination_ids = Vec::new();
         store.save_scenario(&s).unwrap();
         let mut cfg = AppConfig {
             send_mode: SendMode::Webhook,
@@ -1949,7 +1986,7 @@ mod tests {
         assert_eq!(dests[0].webhook_id, "999");
         assert_eq!(dests[0].encrypted_url, "ENC");
         let scenarios = store.load_scenarios().unwrap();
-        assert_eq!(scenarios[0].destination_id, Some(dests[0].id.clone()));
+        assert_eq!(scenarios[0].destination_ids, vec![dests[0].id.clone()]);
         // Second run is a no-op (idempotent, no duplicates).
         assert!(!store.ensure_destinations_migrated(&mut cfg).unwrap());
         assert_eq!(store.load_destinations().unwrap().len(), 1);
@@ -1961,7 +1998,7 @@ mod tests {
     fn migration_assigns_scenarios_when_destinations_already_exist() {
         let store = Store::open_memory().unwrap();
         let mut s = Scenario::new("unassigned");
-        s.destination_id = None;
+        s.destination_ids = Vec::new();
         store.save_scenario(&s).unwrap();
         let dest = Destination::new("Existing");
         store.save_destination(&dest).unwrap();
@@ -1972,7 +2009,7 @@ mod tests {
         assert!(store.ensure_destinations_migrated(&mut cfg).unwrap());
         assert!(cfg.destinations_migrated);
         let scenarios = store.load_scenarios().unwrap();
-        assert_eq!(scenarios[0].destination_id, Some(dest.id.clone()));
+        assert_eq!(scenarios[0].destination_ids, vec![dest.id.clone()]);
         // No duplicate destination was created.
         assert_eq!(store.load_destinations().unwrap().len(), 1);
     }
