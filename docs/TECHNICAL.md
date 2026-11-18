@@ -822,7 +822,15 @@ persist it — and include it in export/import. Full rules:
   from Settings and at startup. The current palette is process-wide
   (`palette()`), read by every helper and screen — the old
   per-color constants are gone, so a missed call site fails to
-  compile instead of staying dark.
+  compile instead of staying dark. `apply_theme` installs the
+  built style into BOTH of egui's dark/light style slots and pins
+  the theme preference to Nicord's own choice: `set_style` alone
+  only writes the currently active slot, which follows the OS
+  theme by default, so on a light-mode Windows the first frame
+  flipped to the untouched default light style and crashed in
+  `TextStyle::resolve` on the custom `SectionTitle`/`BigNumber`
+  entries (regression test
+  `apply_theme_survives_os_theme_flip`).
 - **Manual delete (Q13).** One sent message at a time, from the
   Logs screen, webhook mode only, with an inline confirmation.
   Nothing automatic calls it: no engine, schedule, or bulk path.

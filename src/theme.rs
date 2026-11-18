@@ -260,6 +260,17 @@ fn install_fonts(ctx: &egui::Context) -> bool {
 /// given theme. Called once at startup (from the eframe creation
 /// closure) and again whenever the user switches theme in Settings
 /// (font installation is idempotent, so re-running it is harmless).
+///
+/// egui keeps SEPARATE dark and light styles, and `set_style` only
+/// writes the currently active one — which follows the OS theme by
+/// default. At startup no OS theme has been reported yet, so the
+/// active style is the Dark fallback; on a light-mode Windows the
+/// first frame then flips the active style to the untouched
+/// default light style, and the first custom-styled label panics
+/// in `TextStyle::resolve` (it panics on a missing entry). So the
+/// built style goes into BOTH slots, and the theme preference is
+/// pinned to Nicord's own choice, so the OS theme can never swap
+/// the active style underneath the app again.
 pub fn apply_theme(ctx: &egui::Context, choice: ThemeChoice, scale: UiScale) {
     if let Ok(mut current) = CURRENT_PALETTE.write() {
         *current = choice.palette();
@@ -267,7 +278,13 @@ pub fn apply_theme(ctx: &egui::Context, choice: ThemeChoice, scale: UiScale) {
     let semibold_ok = install_fonts(ctx);
     let mut style = (*ctx.style()).clone();
     apply_visuals(&mut style, semibold_ok, choice, scale.factor());
-    ctx.set_style(style);
+    let style = std::sync::Arc::new(style);
+    ctx.set_style_of(egui::Theme::Dark, style.clone());
+    ctx.set_style_of(egui::Theme::Light, style);
+    ctx.set_theme(match choice {
+        ThemeChoice::Dark => egui::Theme::Dark,
+        ThemeChoice::Light => egui::Theme::Light,
+    });
 }
 
 fn widget_visuals(bg: Color32, weak_bg: Color32, stroke: Stroke, fg: Color32) -> WidgetVisuals {
@@ -617,6 +634,40 @@ mod tests {
             apply_theme(ctx, ThemeChoice::Dark, UiScale::Medium);
         });
         assert_eq!(palette(), DARK_PALETTE);
+    }
+
+    #[test]
+    fn apply_theme_survives_os_theme_flip() {
+        let _guard = lock_palette_for_test();
+        let ctx = egui::Context::default();
+        // Pass 1: startup — no OS theme reported yet, so egui falls
+        // back to Dark and `apply_theme` installs the theme.
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            apply_theme(ctx, ThemeChoice::Dark, UiScale::Medium);
+        });
+        // Pass 2: Windows reports a light OS theme (winit sets
+        // `system_theme` on RawInput). Before the fix this flipped
+        // the active style to the untouched default light style and
+        // the first section title panicked in TextStyle::resolve —
+        // the exact crash seen on a light-mode Windows machine.
+        let input = egui::RawInput {
+            system_theme: Some(egui::Theme::Light),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            for name in ["SectionTitle", "BigNumber"] {
+                let _ = TextStyle::Name(name.into()).resolve(&ctx.style());
+            }
+            // Both theme slots must carry the custom styles, so no
+            // later theme flip can ever hit a default style.
+            for theme in [egui::Theme::Dark, egui::Theme::Light] {
+                let _ = TextStyle::Name("SectionTitle".into()).resolve(&ctx.style_of(theme));
+            }
+        });
+        // Restore dark so other tests see the default palette.
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            apply_theme(ctx, ThemeChoice::Dark, UiScale::Medium);
+        });
     }
 
     #[test]
