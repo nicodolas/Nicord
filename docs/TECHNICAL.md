@@ -1523,13 +1523,15 @@ button that only validated and sent nothing).
   normal export → import flow.
 - **Disabled buttons are near-invisible in this theme**
   (pre-existing, not introduced here): a disabled button
-  paints with the card-colored `noninteractive` style, so
-  Lên/Xuống at the ends of a list and the trigger step's Xóa
-  show no visible button. The buttons still exist and work
-  when enabled (verified live: all four message buttons on a
-  middle row, all three step buttons on a middle step).
-  Changing the `noninteractive` style is not a safe fix —
-  its background fill is also the window background.
+  paints with the card-colored `noninteractive` style — and
+  still takes its space. A 2026-11-19 fix stopped rendering
+  the move buttons that do not apply (message rows and step
+  rows: "Lên" only above the first row, "Xuống" only below
+  the last, no Xóa on the only trigger), because an invisible
+  "Lên" between "Xóa" and "Xuống" read as a stray 74 px gap
+  (verified by screenshot + pixel measurement). Changing the
+  `noninteractive` style itself is not a safe fix — its
+  background fill is also the window background.
 - **Layout notes from live verification (Xvfb, 900x600 and
   1100x700):** the action bar is three explicit rows
   ("Kiểm tra hợp lệ" / "+ Gửi tin nhắn" "+ Gửi lệnh" /
@@ -1538,11 +1540,23 @@ button that only validated and sent nothing).
   wrap the long label and "+ Gửi lệnh" slid off-screen; the
   pinned action-bar reserve is 250 px so the import row stays
   reachable at 900x600. Message-row truncation is measured
-  outside the inner `ScrollArea`, or the content-width
-  feedback loop narrows the list and clips the buttons.
+  once, before the rows, or the content-width feedback loop
+  narrows the list and clips the buttons.
   Verified live: add/edit/move/delete message, add/move/
   delete step, two-click confirms with Hủy, scenario-delete
   confirm with Hủy, 252 tests green.
+- **No nested vertical ScrollArea for the message list
+  (2026-11-19):** the list used to live in its own inner
+  `ScrollArea` (max 120 px), but a nested vertical
+  ScrollArea only gets the outer viewport's remaining height
+  (egui 0.31 `ScrollArea::begin` caps its content Ui at the
+  outer inner height), so at scroll 0 it was ~88 px tall and
+  the 2nd row's buttons were clipped at its bottom edge,
+  reading as "stuck" to the pinned action bar. The list now
+  renders inline in the Messages card; the outer editor
+  ScrollArea already scrolls. Raising `max_height` cannot fix
+  this — it only caps, it cannot grant more height than the
+  outer viewport remainder.
 
 ## UI declutter: Builder tabs, shorter text, no duplicates (2026-11-19)
 
@@ -1702,3 +1716,191 @@ batch; sending behavior is untouched (display only).
   last status string; saving overwrites it with the confirmation,
   and `refresh_health()` also clears the matching health error.
 - **No new persisted state** (`token_valid` is derived).
+
+## Simple schedule editor + EverySeconds (2026-11-19)
+
+- **Problem:** the schedule editor exposed a raw 5-field cron box
+  ("Cron (5 trường): 0 9 * * *") on the main screen, and the
+  "Một lần" schedule was display-only ("không sửa được ở đây —
+  import JSON để đổi"). Ordinary users do not read cron.
+- **Editor now:** plain-language mode chips — "Mỗi vài phút",
+  "Mỗi vài giờ", "Hàng ngày", "Hàng tuần", "Một lần", "Tùy chỉnh
+  (giây)" — each showing only its own simple inputs ("Cứ mỗi ___
+  phút gửi một lần", "Vào lúc HH:MM hàng ngày", weekday chips +
+  time, date DD/MM/YYYY + time). The existing 6 quick presets
+  stay on top and fill in the right mode + values. Cron lives
+  only behind the "Nâng cao (Cron)" toggle, collapsed by default;
+  it auto-opens when the draft schedule is already Cron, so an
+  old cron expression is never hidden silently, and it is kept
+  verbatim when saved untouched.
+- **Mode switching keeps values:** converting derives from the
+  current schedule when possible ("Mỗi 30 phút" -> "Tùy chỉnh"
+  fills 1800 seconds; "Hàng ngày 9:00" -> "Một lần" keeps 9:00)
+  and otherwise restores the last-used value per mode
+  (session-only `sched_last_*` fields; the schedule itself is
+  the only persisted state). The Cron toggle state is
+  session-only `sched_cron_open: Option<bool>` (None = auto).
+- **New `Schedule::EverySeconds { seconds: u32 }`** (serde
+  `{"kind":"every_seconds","seconds":N}`; old configs parse
+  unchanged). `next_after` adds the seconds as an absolute
+  duration, like EveryMinutes/EveryHours, so a DST transition
+  shifts the wall clock but not the instant. `due_time` routes
+  through the same `interval_due` as the other interval kinds.
+  Label: "Cứ mỗi N giây". The editor shows a live plain-words
+  hint (`describe_seconds`: 3600 -> "= 1 giờ", 5400 -> "= 1 giờ
+  30 phút", 90 -> "= 1 phút 30 giây").
+- **Minimum 60 seconds (`MIN_EVERY_SECONDS`), enforced in
+  `Schedule::validate` with a Vietnamese error.** The engine
+  scans for due scenarios every 1 s, so the scan is NOT the
+  binding constraint — the send path is: each destination only
+  sends once per `min_interval_secs` (default 60 s, hard floor
+  5 s in `destination.rs`), and a run that fires early is
+  deferred, not sent. Below 60 s the schedule would promise a
+  rate the send path cannot keep (webhook mode would
+  effectively send every 60 s), so 60 s is the honest floor.
+  (A user who lowers a destination's minimum interval to 5 s
+  still cannot schedule below 60 s — a deliberate, simple rule;
+  revisit only if a real use case appears.)
+- **No new persisted state** (mode last-values + Cron toggle are
+  session-only). No sending-behavior change.
+
+- **Channel picker labels (same batch):** in account mode the
+  server/channel pickers used `ComboBox::from_label`, which in
+  egui 0.31 renders the dropdown button FIRST and the label
+  AFTER — so the row read "[load] [server?] Máy chủ [channel?]
+  Kênh", labels trailing their own controls. Fixed with
+  explicit labels before `ComboBox::from_id_salt` controls, one
+  control per row: "Tải server" button, then "Máy chủ:" +
+  dropdown, then "Kênh:" + dropdown, plus one line stating the
+  intent ("Ở chế độ Tài khoản, mỗi kịch bản chỉ gửi vào 1 kênh
+  — chọn kênh ở trên, hoặc dán ID kênh vào ô dưới."). The "ID
+  kênh đích" field below is unchanged. Empty states show a
+  short "chưa có — …" note instead of a missing row. Dropdown
+  contents with real data could not be verified live here (no
+  real token, no Discord access from this VM); layout verified
+  by code + static GUI check.
+- **Step rows read as one step (same batch):** the workflow
+  rows showed a group badge ("Kích hoạt") + a separate
+  `selectable_label` with the short name ("Theo lịch"), which
+  read as two buttons — and the selected name highlighted like
+  an action button. Each row is now a single `selectable_label`
+  with the full label ("Kích hoạt: Theo lịch"; command steps
+  append the command name: "Hành động: Gửi lệnh — !ping").
+  Clicking still selects the step for the inspector. The
+  now-unused `NodeKind::group_label()` was deleted (clippy
+  `-D warnings` caught it).
+
+- **Cron inline validation (same batch, found by GUI test):**
+  the first build validated a cron expression only at
+  write-back, so a half-typed expression set the sticky status
+  "Lịch không hợp lệ — chưa lưu", which stayed visible even
+  after the user finished typing a valid expression that saved
+  fine. The editor now validates the expression inline on
+  every frame (`parse_cron`, same error string as `validate`),
+  so an invalid draft shows the red line under the preview and
+  skips the write-back instead of setting the status.
+- **Cron toggle dedup (same batch, found by GUI test):** the
+  first build rendered "Nâng cao (Cron)" twice when the mode
+  was Cron — once as the mode chip and once as the section
+  toggle. The section toggle was removed; the chip is the only
+  toggle (clicking it while Cron is active opens/closes the
+  section), and the expression field + example line show
+  directly below it.
+
+- **Schedule draft kept in session state (same batch, found by
+  GUI test):** the editor used to re-clone the schedule from
+  storage every frame and only write back when valid — so a
+  half-typed value was reverted on the very next frame: a fresh
+  cron expression (or a new time) could never be typed, because
+  every intermediate state is invalid. The editor now keeps a
+  session-only draft (`sched_draft`, keyed by list index +
+  scenario id), synced every frame and written back to the
+  scenario only when valid. Edge case: if the scenario's
+  schedule changes outside this editor (backup import) while
+  the same scenario stays selected, the stale draft is shown
+  until the user selects another scenario and comes back.
+
+## Builder responsive two-column layout (2026-11-19)
+
+- **Problem:** `show_builder` used `ui.columns(2, …)` — a fixed
+  50/50 split with only the default thin gutter (~13 px
+  measured), so the two cards sat pressed against the centre
+  line and looked overlapped. The mostly-empty scenario list
+  took as much room as the dense editor, at every window size.
+- **Layout now:** the list takes ~35% of the content width,
+  clamped to 240–320 px; the editor takes the rest; a clear
+  14 px gutter separates them. At 900×600 the list is 240 px
+  and the editor gains ~90 px over the old even split; at
+  wider windows the editor keeps growing while the list stops
+  at 320 px. The two rects are allocated explicitly with
+  `allocate_new_ui(UiBuilder::new().max_rect(…))` — a
+  horizontal flow would add its own item spacing on top of the
+  14 px gutter, so the gap would no longer be exact.
+  (`allocate_ui_at_rect` does the same thing but is deprecated
+  in egui 0.31; clippy `-D warnings` rejects it.) The two
+  ScrollAreas keep their distinct id_salts
+  (`builder_list`, `builder_editor`), and the 72 px reserve
+  for the pinned action bar is unchanged (bar measured ~64 px).
+- **The new-scenario row is always stacked** — field on top,
+  button below — at every window size. (Search field, bulk
+  buttons and scenario action rows fit at 212 px without
+  changes.)
+- **Root cause of the thin gutter (found by pixel
+  measurement):** the 14 px nominal gap rendered as only
+  ~5 px, because the list card was allocated 251 px wide
+  inside a 240 px column. A card's width is its widest content
+  row + frame margins, and the scenario action row
+  ("Nhân bản" 93 px + "Bật" 49 px + "Xóa" 53 px + gaps ≈
+  221 px) is wider than the ~210 px inside the card — so the
+  card grew past its column and ate ~10 px of the gutter. The
+  fix is adaptive: below 225 px of inner width the delete
+  control drops to a second row ("Nhân bản" + "Bật" on the
+  240 px and the visual gap is the full 14 px at every window
+  size. Verified by debug print (card outer rect 251.0 before
+  the fix) and pixel measurement after it.
+- **Second overflow in the same card (found by pixel
+  measurement at 1100×700):** with the action row fixed, the
+  card still overflowed by ~14 px at 1100 px, this time from
+  the new-scenario row: the "+ Kịch bản mới" button measures
+  130 px + 12 px spacing = 142 px, wider than the fixed
+  132 px reserve the field width was computed from, so the
+  field + button row totalled ~285 px against 270 px
+  available. Two one-row fixes were tried and both failed: a
+  right-to-left layout (button first, field takes the
+  remaining width) breaks inside this ScrollArea — the RTL
+  row is vertically centered and pushes the rest of the list
+  below the fold, because `with_layout` gives the child Ui
+  the full-height available rect and the egui 0.31 placer
+  centers RTL content in it (verified live: list column
+  empty except the row floating mid-card). So the row is
+  always stacked instead — it fits at any width or UI scale,
+  and the list column has empty space below anyway.
+- **Third overflow in the editor (found by pixel
+  measurement at 800×600 and 1100×700):** the "Tin nhắn"
+  card, the "Thư viện mẫu" card and the pinned bar all stuck
+  out ~26 px past the editor column's right edge (cards to
+  x=799 at 800 px — 1 px from the window edge — and to
+  x=1096 at 1100 px), while the "Soạn thảo" card stayed at
+  the intended width. Root cause is the TABS row, not any
+  row inside the cards: the three tab labels total ~306 px,
+  wider than the ~288 px content width at 800×600, and the
+  non-wrapping row widened the editor ScrollArea (the
+  feedback loop), so every card after the tabs came out
+  ~26 px too wide. Proven by debug print: available width
+  258 px at the "Soạn thảo" card, 284.5 px at the "Tin nhắn"
+  card, with only the tabs row in between — and by pixel
+  measurement (tabs span x=481..787). Fix: the tabs row is
+  now `horizontal_wrapped`, so the third tab drops to a
+  second line at narrow windows. (Two suspects were measured
+  and ruled out: the checkbox text is ~370 px but wraps, and
+  the "Nguồn tin" line wraps to two lines at 800 px. The
+  add-message row was ALSO stacked in the same batch — its
+  132 px reserve was smaller than the ~150 px "+ Thêm tin
+  nhắn" button — but the card stayed 313 px before and after
+  that change, so it was not the widener; the stacking is
+  kept as the same robustness rule, not as the fix for this
+  overflow.)
+- **Safety net:** if the window is shrunk far below the tested
+  sizes, the list shrinks (floor 160 px) instead of letting
+  the editor clip past the right edge; the editor never drops
+  under 200 px.

@@ -6,7 +6,7 @@
 //!   fires once per scheduled time: the due time is the latest scheduled
 //!   time in (anchor, now], where anchor = last_run or creation time.
 //!   There is no 60-second "now - 60s" window, so no duplicates and no
-//!   missed intervals for EveryMinutes/EveryHours.
+//!   missed intervals for EveryMinutes/EveryHours/EverySeconds.
 //! - `Once` fires exactly once, then the scenario is disabled.
 //! - Cron is a real 5-field parser (minute hour dom month dow), not hourly.
 //! - DST policy (L4, one policy for firing and display): an ambiguous
@@ -30,6 +30,8 @@ pub enum Schedule {
     EveryMinutes { minutes: u32 },
     /// Every N hours.
     EveryHours { hours: u32 },
+    /// Every N seconds (minimum `MIN_EVERY_SECONDS` — see below).
+    EverySeconds { seconds: u32 },
     /// Daily at a local time.
     Daily { time: NaiveTime },
     /// Weekly on given weekdays (0 = Mon .. 6 = Sun) at a local time.
@@ -38,12 +40,45 @@ pub enum Schedule {
     Cron { expr: String },
 }
 
+/// Minimum interval for `Schedule::EverySeconds` (seconds).
+///
+/// The engine scans for due scenarios every second, so the scan is
+/// not the binding constraint — the send path is: each destination
+/// only sends once per `min_interval_secs` (default 60 s, hard floor
+/// 5 s), and a run that fires early is deferred, not sent. Below
+/// 60 s the schedule would promise a rate the send path cannot
+/// keep (webhook mode would effectively send every 60 s), so 60 s
+/// is the honest floor.
+pub const MIN_EVERY_SECONDS: u32 = 60;
+
+/// Plain-words rendering of a second count, e.g. 3600 -> "1 giờ",
+/// 5400 -> "1 giờ 30 phút", 90 -> "1 phút 30 giây". Used by the
+/// schedule editor's "Tùy chỉnh" hint so users never have to do
+/// the conversion themselves.
+pub fn describe_seconds(seconds: u32) -> String {
+    let h = seconds / 3600;
+    let m = (seconds % 3600) / 60;
+    let s = seconds % 60;
+    let mut parts = Vec::new();
+    if h > 0 {
+        parts.push(format!("{h} giờ"));
+    }
+    if m > 0 {
+        parts.push(format!("{m} phút"));
+    }
+    if s > 0 || parts.is_empty() {
+        parts.push(format!("{s} giây"));
+    }
+    parts.join(" ")
+}
+
 impl Schedule {
     pub fn label(&self) -> String {
         match self {
             Schedule::Once { at } => format!("Một lần lúc {}", at.format("%Y-%m-%d %H:%M UTC")),
             Schedule::EveryMinutes { minutes } => format!("Mỗi {} phút", minutes),
             Schedule::EveryHours { hours } => format!("Mỗi {} giờ", hours),
+            Schedule::EverySeconds { seconds } => format!("Cứ mỗi {} giây", seconds),
             Schedule::Daily { time } => format!("Hàng ngày lúc {}", time.format("%H:%M")),
             Schedule::Weekly { weekdays, time } => {
                 const NAMES: [&str; 7] = ["T2", "T3", "T4", "T5", "T6", "T7", "CN"];
@@ -75,6 +110,13 @@ impl Schedule {
             Schedule::EveryHours { hours } => {
                 let h = (*hours).max(1) as i64;
                 from + chrono::Duration::hours(h)
+            }
+            Schedule::EverySeconds { seconds } => {
+                // Absolute-duration semantics, like EveryMinutes /
+                // EveryHours: N real seconds after `from`, whatever
+                // the wall clock does across a DST transition.
+                let s = (*seconds).max(MIN_EVERY_SECONDS) as i64;
+                from + chrono::Duration::seconds(s)
             }
             Schedule::Daily { time } => {
                 // Same DST policy as the firing decision (L4):
@@ -147,6 +189,9 @@ impl Schedule {
             Schedule::EveryHours { hours } if *hours == 0 => {
                 Err("khoảng cách phải >= 1 giờ".into())
             }
+            Schedule::EverySeconds { seconds } if *seconds < MIN_EVERY_SECONDS => Err(format!(
+                "mỗi lần gửi cách nhau ít nhất {MIN_EVERY_SECONDS} giây"
+            )),
             Schedule::Weekly { weekdays, .. } => {
                 if weekdays.is_empty() {
                     Err("lịch hàng tuần cần ít nhất một ngày trong tuần".into())
@@ -339,7 +384,7 @@ pub fn cron_matches(fields: &CronFields, dt: DateTime<chrono_tz::Tz>) -> bool {
 /// The cron minute-walk cannot use this helper (it visits
 /// absolute instants, not wall times), so it applies the same
 /// policy via `is_second_occurrence` instead.
-fn resolve_wall_time(
+pub(crate) fn resolve_wall_time(
     date: NaiveDate,
     time: NaiveTime,
     tz: chrono_tz::Tz,
@@ -428,6 +473,10 @@ pub fn due_time(
         }
         Schedule::EveryHours { hours } => {
             let interval = (*hours).max(1) as i64 * 3600;
+            interval_due(anchor_tz, now_tz, interval)
+        }
+        Schedule::EverySeconds { seconds } => {
+            let interval = (*seconds).max(MIN_EVERY_SECONDS) as i64;
             interval_due(anchor_tz, now_tz, interval)
         }
         Schedule::Daily { time } => wall_clock_due(anchor_tz, now_tz, *time, None, tz),
@@ -625,18 +674,6 @@ impl NodeKind {
             | NodeKind::ConditionRole
             | NodeKind::ConditionVariable => "Condition",
             _ => "Utility",
-        }
-    }
-
-    /// Display group for the UI (Vietnamese). `group()` stays English:
-    /// validation matches on it (`== "Trigger"`), so it is an internal
-    /// key, not a display string.
-    pub fn group_label(&self) -> &'static str {
-        match self.group() {
-            "Trigger" => "Kích hoạt",
-            "Action" => "Hành động",
-            "Condition" => "Điều kiện",
-            _ => "Tiện ích",
         }
     }
 }
@@ -2039,6 +2076,93 @@ mod tests {
             .unwrap()
             .with_timezone(&Local);
         assert_eq!(next, expected);
+    }
+
+    #[test]
+    fn every_seconds_serde_round_trip_and_old_config_still_parses() {
+        let s = Schedule::EverySeconds { seconds: 90 };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"every_seconds\""), "{json}");
+        let back: Schedule = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
+        // Old configs never mention the new variant — they must
+        // still parse (backward compatibility is a serde default
+        // here, but pin it so a future refactor cannot break it).
+        let old: Schedule =
+            serde_json::from_str(r#"{"kind":"every_minutes","minutes":30}"#).unwrap();
+        assert_eq!(old, Schedule::EveryMinutes { minutes: 30 });
+        let bad: Result<Schedule, _> =
+            serde_json::from_str(r#"{"kind":"every_seconds","seconds":30}"#);
+        // Parses fine (validation, not serde, enforces the floor).
+        assert_eq!(bad.unwrap(), Schedule::EverySeconds { seconds: 30 });
+    }
+
+    #[test]
+    fn describe_seconds_plain_words() {
+        assert_eq!(describe_seconds(3600), "1 giờ");
+        assert_eq!(describe_seconds(5400), "1 giờ 30 phút");
+        assert_eq!(describe_seconds(90), "1 phút 30 giây");
+        assert_eq!(describe_seconds(60), "1 phút");
+        assert_eq!(describe_seconds(3661), "1 giờ 1 phút 1 giây");
+        assert_eq!(describe_seconds(45), "45 giây");
+        assert_eq!(describe_seconds(0), "0 giây");
+        assert_eq!(
+            Schedule::EverySeconds { seconds: 90 }.label(),
+            "Cứ mỗi 90 giây"
+        );
+    }
+
+    #[test]
+    fn every_seconds_next_after_and_due_time() {
+        let s = Schedule::EverySeconds { seconds: 90 };
+        let from = Utc
+            .with_ymd_and_hms(2026, 11, 17, 10, 0, 0)
+            .unwrap()
+            .with_timezone(&Local);
+        let next = s.next_after(from, "Asia/Ho_Chi_Minh");
+        let expected = Utc
+            .with_ymd_and_hms(2026, 11, 17, 10, 1, 30)
+            .unwrap()
+            .with_timezone(&Local);
+        assert_eq!(next, expected);
+        // due_time: anchored at creation, fires once 90 s have passed.
+        let created = Utc.with_ymd_and_hms(2026, 11, 17, 10, 0, 0).unwrap();
+        let early = Utc
+            .with_ymd_and_hms(2026, 11, 17, 10, 0, 30)
+            .unwrap()
+            .with_timezone(&Local);
+        assert!(due_time(&s, None, Some(created), early, "UTC").is_none());
+        let due = Utc
+            .with_ymd_and_hms(2026, 11, 17, 10, 1, 30)
+            .unwrap()
+            .with_timezone(&Local);
+        assert!(due_time(&s, None, Some(created), due, "UTC").is_some());
+    }
+
+    #[test]
+    fn every_seconds_next_after_crosses_spring_forward() {
+        // Absolute-duration semantics: 3600 s after 01:30 EST is
+        // 03:30 EDT — the wall clock jumps the 02:00-03:00 gap,
+        // the instant is exactly one hour later.
+        let s = Schedule::EverySeconds { seconds: 3600 };
+        let from = Utc
+            .with_ymd_and_hms(2026, 3, 8, 6, 30, 0)
+            .unwrap()
+            .with_timezone(&Local);
+        let next = s.next_after(from, "America/New_York");
+        let expected = Utc
+            .with_ymd_and_hms(2026, 3, 8, 7, 30, 0)
+            .unwrap()
+            .with_timezone(&Local);
+        assert_eq!(next, expected);
+    }
+
+    #[test]
+    fn every_seconds_validate_rejects_below_minimum() {
+        assert!(Schedule::EverySeconds { seconds: 0 }.validate().is_err());
+        assert!(Schedule::EverySeconds { seconds: 59 }.validate().is_err());
+        assert!(Schedule::EverySeconds { seconds: 60 }.validate().is_ok());
+        assert!(Schedule::EverySeconds { seconds: 3600 }.validate().is_ok());
     }
 
     #[test]

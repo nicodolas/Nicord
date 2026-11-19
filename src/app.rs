@@ -103,6 +103,30 @@ pub struct NicordApp {
     /// Builder: whether the template-variables popup is open.
     /// Session-only.
     pub show_variables_popup: bool,
+    /// Builder schedule editor: last-used value per mode, so
+    /// switching modes keeps what the user already typed (e.g.
+    /// "Mỗi 30 phút" -> "Tùy chỉnh" fills 1800 seconds).
+    /// Session-only: the schedule itself is the persisted state.
+    pub sched_last_minutes: u32,
+    pub sched_last_hours: u32,
+    pub sched_last_seconds: u32,
+    pub sched_last_time: chrono::NaiveTime,
+    pub sched_last_weekdays: Vec<u8>,
+    /// Builder schedule editor: whether the "Nâng cao (Cron)"
+    /// section is open. None = auto (open exactly when the draft
+    /// schedule is a Cron schedule, so an old cron is never hidden
+    /// silently). Session-only.
+    pub sched_cron_open: Option<bool>,
+    /// Builder schedule editor: in-progress draft (schedule +
+    /// timezone) for the scenario being edited, keyed by (list
+    /// index, scenario id). Session-only: the editor used to
+    /// re-clone the schedule from storage every frame and only
+    /// write back when valid, so a half-typed value (a fresh cron
+    /// expression, a new time) was reverted on the very next frame
+    /// and could never be typed. The scenario itself is only
+    /// updated on a valid write-back.
+    pub sched_draft_for: Option<(usize, String)>,
+    pub sched_draft: Option<(Option<Schedule>, String)>,
     pub sent_today: u32,
     /// When `sent_today` was last re-read from the database. The
     /// count is refreshed at most every 5 seconds (see `update()`):
@@ -222,6 +246,33 @@ pub enum BuilderTab {
     /// All send options (embed, poll, silent, edit-in-place,
     /// attachments) in one card.
     Advanced,
+}
+
+/// Schedule editor modes (plain language). The mode is derived
+/// from the draft schedule; Cron is a mode too, but its editor
+/// lives in the collapsed "Nâng cao" section.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SchedMode {
+    Minutes,
+    Hours,
+    Daily,
+    Weekly,
+    Once,
+    Custom,
+    Cron,
+}
+
+fn sched_mode(schedule: &Option<Schedule>) -> SchedMode {
+    match schedule {
+        Some(Schedule::EveryMinutes { .. }) => SchedMode::Minutes,
+        Some(Schedule::EveryHours { .. }) => SchedMode::Hours,
+        Some(Schedule::Daily { .. }) => SchedMode::Daily,
+        Some(Schedule::Weekly { .. }) => SchedMode::Weekly,
+        Some(Schedule::Once { .. }) => SchedMode::Once,
+        Some(Schedule::EverySeconds { .. }) => SchedMode::Custom,
+        Some(Schedule::Cron { .. }) => SchedMode::Cron,
+        None => SchedMode::Daily,
+    }
 }
 
 /// Builder list search: case-insensitive substring match against
@@ -654,6 +705,14 @@ impl NicordApp {
             selected_node: None,
             builder_tab: BuilderTab::default(),
             show_variables_popup: false,
+            sched_last_minutes: 30,
+            sched_last_hours: 1,
+            sched_last_seconds: 3600,
+            sched_last_time: chrono::NaiveTime::from_hms_opt(9, 0, 0).unwrap_or_default(),
+            sched_last_weekdays: vec![0],
+            sched_cron_open: None,
+            sched_draft_for: None,
+            sched_draft: None,
             sent_today: sent_today_init,
             sent_today_updated: std::time::Instant::now(),
             next_run_cache: NextRunCache::default(),
@@ -3120,20 +3179,44 @@ impl NicordApp {
             "Thêm bước, bấm vào bước để sửa chi tiết. Kiểm tra hợp lệ chỉ kiểm tra, không gửi.",
         );
         ui.add_space(12.0);
-        // Two columns: scenario list | editor for the selected scenario.
-        // The editor content scrolls, but the action bar (Validate, node
-        // buttons, Export/Import) stays pinned below it, so the key
-        // actions are always visible in the 700 px window without deep
-        // scrolling.
-        ui.columns(2, |cols| {
+        // Responsive two columns: scenario list | editor. The old
+        // `ui.columns(2, …)` split the width 50/50 with only the
+        // default thin gutter, so the two cards sat pressed against
+        // the centre line while the mostly-empty list took as much
+        // room as the dense editor. The list now takes ~35% of the
+        // content width, clamped to 240–320 px, the editor takes
+        // the rest, and a clear 14 px gutter separates them. The
+        // rects are allocated explicitly instead of a horizontal
+        // flow, so the gutter is exact — a horizontal flow would
+        // add its own item spacing on top of it. (egui
+        // `allocate_new_ui` advances the parent cursor to just
+        // below the rect, so no extra spacing call is needed.)
+        let gap = 14.0;
+        let area = ui.available_rect_before_wrap();
+        let mut list_w = (area.width() * 0.35).clamp(240.0, 320.0);
+        // Safety net for windows shrunk far below the tested sizes:
+        // never let the editor drop under 200 px — shrink the list
+        // instead of clipping the editor past the right edge.
+        if area.width() - list_w - gap < 200.0 {
+            list_w = (area.width() - gap - 200.0).max(160.0);
+        }
+        let editor_w = (area.width() - list_w - gap).max(200.0);
+        let list_rect = egui::Rect::from_min_size(area.min, egui::vec2(list_w, area.height()));
+        let editor_rect = egui::Rect::from_min_size(
+            egui::pos2(area.min.x + list_w + gap, area.min.y),
+            egui::vec2(editor_w, area.height()),
+        );
+        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(list_rect), |ui| {
             // Distinct id_salts: two ScrollAreas in one frame must not
             // share an auto ID (egui debug-clash warnings + shared scroll
             // state).
             egui::ScrollArea::vertical()
                 .id_salt("builder_list")
-                .show(&mut cols[0], |ui| {
+                .show(ui, |ui| {
                     self.show_builder_list(ui);
                 });
+        });
+        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(editor_rect), |ui| {
             let selected = self.selected;
             match selected {
                 Some(i) => {
@@ -3145,11 +3228,11 @@ impl NicordApp {
                     // with margin. Too small and the bar slides past
                     // the window bottom at 900x600.
                     let action_h = 72.0;
-                    let avail = cols[1].available_height();
+                    let avail = ui.available_height();
                     egui::ScrollArea::vertical()
                         .id_salt("builder_editor")
                         .max_height((avail - action_h).max(140.0))
-                        .show(&mut cols[1], |ui| {
+                        .show(ui, |ui| {
                             // Inset: the scroll bar overlays the
                             // content's right edge, so full-width
                             // cards hid their border and the last
@@ -3158,11 +3241,11 @@ impl NicordApp {
                             ui.set_max_width((ui.available_width() - 14.0).max(200.0));
                             self.show_builder_editor(ui, i);
                         });
-                    cols[1].add_space(8.0);
-                    self.show_builder_actions(&mut cols[1], i);
+                    ui.add_space(8.0);
+                    self.show_builder_actions(ui, i);
                 }
                 None => {
-                    theme::card(&mut cols[1], |ui| {
+                    theme::card(ui, |ui| {
                         theme::section_title(ui, t(self.lang(), "builder.editor"));
                         theme::muted(
                             ui,
@@ -3177,19 +3260,28 @@ impl NicordApp {
     /// Left column of the Builder: the scenario list.
     fn show_builder_list(&mut self, ui: &mut egui::Ui) {
         theme::card(ui, |ui| {
-            // New-scenario row lives in this card (not above the columns)
-            // so the editor column gets the full height.
-            ui.horizontal(|ui| {
-                let field_w = (ui.available_width() - 132.0).max(100.0);
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.new_scenario_name)
-                        .hint_text("Tên kịch bản mới")
-                        .desired_width(field_w),
-                );
-                if theme::primary_button(ui, "+ Kịch bản mới").clicked() {
-                    self.create_scenario();
-                }
-            });
+            // Always stacked (field above the button): a one-row
+            // field + button needs the field width computed from
+            // the button's width, and the fixed reserve for it
+            // (132 px) was already too small at 1100x700 (button
+            // 130 px + 12 px spacing = 142 px), overflowing the
+            // card by ~15 px and eating the gutter. A
+            // right-to-left layout was tried instead and made it
+            // worse: inside this ScrollArea the RTL row is
+            // vertically centered and pushes the rest of the list
+            // below the fold (egui 0.31 placer quirk with a
+            // full-height available rect). Stacked, the row fits
+            // at any width or UI scale, and the list column has
+            // empty space below anyway.
+            ui.add(
+                egui::TextEdit::singleline(&mut self.new_scenario_name)
+                    .hint_text("Tên kịch bản mới")
+                    .desired_width(ui.available_width()),
+            );
+            ui.add_space(4.0);
+            if theme::primary_button(ui, "+ Kịch bản mới").clicked() {
+                self.create_scenario();
+            }
             ui.add_space(8.0);
             // Search + bulk actions. Labels are resolved before the
             // row: the search field holds a &mut borrow of the query
@@ -3270,13 +3362,9 @@ impl NicordApp {
                     {
                         selected = Some(i);
                     }
-                    ui.horizontal(|ui| {
-                        if ui.button("Nhân bản").clicked() {
-                            to_clone = Some(i);
-                        }
-                        if ui.button(if s.enabled { "Tắt" } else { "Bật" }).clicked() {
-                            to_toggle = Some(i);
-                        }
+                    // The delete control (arm → confirm/cancel) is
+                    // shared by both row layouts below.
+                    let mut delete_controls = |ui: &mut egui::Ui| {
                         // Delete is destructive: red text so it can
                         // never be confused with Enable at a glance,
                         // and two clicks so one stray tap cannot wipe
@@ -3300,7 +3388,33 @@ impl NicordApp {
                         {
                             to_arm_delete = Some(s.id.clone());
                         }
+                    };
+                    // Narrow list column: the three action buttons
+                    // ("Nhân bản" + "Bật"/"Tắt" + "Xóa" ≈ 221 px)
+                    // are wider than the ~210 px inside the card, so
+                    // on one row they would widen the card past its
+                    // column and eat the gutter to the editor — the
+                    // same overflow the new-scenario row avoids by
+                    // stacking. Below 225 px the delete control
+                    // drops to a second row; wider columns keep the
+                    // single row.
+                    let narrow_actions = ui.available_width() < 225.0;
+                    ui.horizontal(|ui| {
+                        if ui.button("Nhân bản").clicked() {
+                            to_clone = Some(i);
+                        }
+                        if ui.button(if s.enabled { "Tắt" } else { "Bật" }).clicked() {
+                            to_toggle = Some(i);
+                        }
+                        if !narrow_actions {
+                            delete_controls(ui);
+                        }
                     });
+                    if narrow_actions {
+                        ui.horizontal(|ui| {
+                            delete_controls(ui);
+                        });
+                    }
                     if !s.channel_id.is_empty() {
                         theme::muted(ui, &format!("kênh: {}", s.channel_id));
                     }
@@ -3446,20 +3560,20 @@ impl NicordApp {
             // moved. Previously the list was display-only and the
             // only way to drop a message was deleting the whole
             // scenario. Scenario mutations are collected during the
-            // rows and applied after the ScrollArea (same pattern
+            // rows and applied after the rows (same pattern
             // as the scenario list); only session state is set
             // inside the rows. Row text is truncated to the
-            // available width so the ScrollArea content width stays
-            // bounded (redesign feedback-loop rule).
+            // available width so the editor ScrollArea content
+            // width stays bounded (redesign feedback-loop rule).
             // Group 1: every message can be edited, deleted, or
             // moved. Previously the list was display-only and the
             // only way to drop a message was deleting the whole
             // scenario. Two rows per message (text, then actions),
             // like the scenario and destination rows: one row cannot
             // hold the text plus four buttons at 900 px. The
-            // truncation width is read OUTSIDE the ScrollArea: a
+            // truncation width is read once, before the rows: a
             // vertical ScrollArea follows its content width, so
-            // measuring inside it feeds back into a narrow
+            // measuring per-row feeds back into a narrow
             // equilibrium that clipped the move buttons (verified
             // by screenshot at 900x600).
             let list_w = ui.available_width();
@@ -3472,62 +3586,69 @@ impl NicordApp {
                     None
                 }
             });
-            egui::ScrollArea::vertical()
-                .id_salt("builder_messages")
-                .max_height(120.0)
-                .show(ui, |ui| {
-                    for (idx, m) in messages.iter().enumerate() {
-                        let over = over_limit(m);
-                        let shown = truncate_display(m, ((list_w - 24.0) / 8.0).max(8.0) as usize);
-                        let text = if over {
-                            format!("• {shown} (quá 2000 ký tự)")
-                        } else {
-                            format!("• {shown}")
-                        };
-                        ui.label(RichText::new(text).color(if over {
-                            theme::palette().danger
-                        } else {
-                            theme::palette().text
-                        }))
-                        .on_hover_text(m);
-                        ui.horizontal(|ui| {
-                            if editing_idx == Some(idx) {
-                                theme::muted(ui, "Đang sửa — sửa ở ô bên dưới.");
-                            } else if self.pending_delete_message.as_ref()
-                                == Some(&(scenario_id.to_string(), idx))
-                            {
-                                if theme::danger_button(ui, "Xóa thật?").clicked() {
-                                    msg_delete = Some(idx);
-                                }
-                                if ui.button("Hủy").clicked() {
-                                    self.pending_delete_message = None;
-                                }
-                            } else {
-                                if ui.button("Sửa").clicked() {
-                                    self.edit_message = Some((scenario_id.to_string(), idx));
-                                    self.new_message = m.clone();
-                                    self.pending_delete_message = None;
-                                }
-                                if ui.button("Xóa").clicked() {
-                                    self.pending_delete_message =
-                                        Some((scenario_id.to_string(), idx));
-                                }
-                                if ui.add_enabled(idx > 0, egui::Button::new("Lên")).clicked() {
-                                    msg_move = Some((idx, true));
-                                }
-                                if ui
-                                    .add_enabled(
-                                        idx + 1 < messages.len(),
-                                        egui::Button::new("Xuống"),
-                                    )
-                                    .clicked()
-                                {
-                                    msg_move = Some((idx, false));
-                                }
-                            }
-                        });
+            // No inner ScrollArea here on purpose: a nested vertical
+            // ScrollArea only gets the outer viewport's remaining
+            // height (egui caps its content Ui at the outer inner
+            // height), so at scroll 0 it was ~88 px tall and clipped
+            // the 2nd row's buttons at its bottom edge — the "stuck"
+            // look the user reported (verified live + in egui 0.31
+            // ScrollArea::begin). The outer editor ScrollArea already
+            // scrolls, so the list renders inline and every row is
+            // fully visible.
+            for (idx, m) in messages.iter().enumerate() {
+                let over = over_limit(m);
+                let shown = truncate_display(m, ((list_w - 24.0) / 8.0).max(8.0) as usize);
+                let text = if over {
+                    format!("• {shown} (quá 2000 ký tự)")
+                } else {
+                    format!("• {shown}")
+                };
+                ui.label(RichText::new(text).color(if over {
+                    theme::palette().danger
+                } else {
+                    theme::palette().text
+                }))
+                .on_hover_text(m);
+                ui.horizontal(|ui| {
+                    if editing_idx == Some(idx) {
+                        theme::muted(ui, "Đang sửa — sửa ở ô bên dưới.");
+                    } else if self.pending_delete_message.as_ref()
+                        == Some(&(scenario_id.to_string(), idx))
+                    {
+                        if theme::danger_button(ui, "Xóa thật?").clicked() {
+                            msg_delete = Some(idx);
+                        }
+                        if ui.button("Hủy").clicked() {
+                            self.pending_delete_message = None;
+                        }
+                    } else {
+                        if ui.button("Sửa").clicked() {
+                            self.edit_message = Some((scenario_id.to_string(), idx));
+                            self.new_message = m.clone();
+                            self.pending_delete_message = None;
+                        }
+                        if ui.button("Xóa").clicked() {
+                            self.pending_delete_message = Some((scenario_id.to_string(), idx));
+                        }
+                        // Only render the move buttons that
+                        // apply: a disabled button is
+                        // near-invisible in this theme
+                        // (noninteractive fill) but still takes
+                        // its space, so an invisible "Lên"
+                        // between "Xóa" and "Xuống" read as a
+                        // stray 74 px gap (verified by
+                        // screenshot + pixel measurement).
+                        if idx > 0 && ui.button("Lên").clicked() {
+                            msg_move = Some((idx, true));
+                        }
+                        if idx + 1 < messages.len() && ui.button("Xuống").clicked() {
+                            msg_move = Some((idx, false));
+                        }
                     }
                 });
+            }
+            // Small gap between the list and the add-message field.
+            ui.add_space(6.0);
             if let Some(idx) = msg_delete {
                 if let Ok(mut list) = self.scenarios.lock() {
                     if let Some(s) = list.get_mut(i) {
@@ -3548,20 +3669,27 @@ impl NicordApp {
                 self.edit_message = None;
                 self.save_scenarios();
             }
+            // Always stacked (field above, button(s) below): the
+            // old one-row layout sized the field from a fixed
+            // 132 px reserve for the "+ Thêm tin nhắn" button, but
+            // the button is ~150 px wide, so the row depended on a
+            // hardcoded reserve that was already wrong — the same
+            // bug class as the new-scenario row. (Measured: the
+            // card stayed 313 px wide before and after this change,
+            // so this row was NOT the widener behind the editor
+            // overflow; that was the tabs row. The stacking is kept
+            // as the same robustness rule, not as that fix.)
+            ui.add(
+                egui::TextEdit::singleline(&mut self.new_message)
+                    .hint_text(if editing_idx.is_some() {
+                        "Sửa tin nhắn..."
+                    } else {
+                        "Thêm tin nhắn..."
+                    })
+                    .desired_width(ui.available_width()),
+            );
+            ui.add_space(4.0);
             ui.horizontal(|ui| {
-                // The field must leave room for the button(s) in this
-                // narrow column, or they are pushed past the right edge.
-                let reserve = if editing_idx.is_some() { 210.0 } else { 132.0 };
-                let field_w = (ui.available_width() - reserve).max(100.0);
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.new_message)
-                        .hint_text(if editing_idx.is_some() {
-                            "Sửa tin nhắn..."
-                        } else {
-                            "Thêm tin nhắn..."
-                        })
-                        .desired_width(field_w),
-                );
                 // Over the Discord limit: the button is disabled and
                 // the preview below shows why (QoL Q1).
                 let too_long = over_limit(self.new_message.trim());
@@ -3637,72 +3765,64 @@ impl NicordApp {
             let mut node_delete: Option<String> = None;
             let mut node_move: Option<(String, bool)> = None;
             for (pos, (kind, id, cmd_name)) in nodes.iter().enumerate() {
-                // Labels already carry the group prefix
-                // ("Hành động: Gửi tin nhắn"); the badge shows the
-                // group, so the row shows the short name only.
-                let short = if kind == &NodeKind::ActionSendCommand {
-                    format!("Lệnh: {cmd_name}")
+                // One clickable chip per step, showing the full
+                // label ("Kích hoạt: Theo lịch"): the old badge +
+                // separate short name read as two buttons, and the
+                // selected name highlighted like an action button.
+                // The group is still in the text, so nothing is
+                // lost by dropping the badge here.
+                let full = if kind == &NodeKind::ActionSendCommand {
+                    format!("{} — {cmd_name}", kind.label())
                 } else {
-                    kind.label()
-                        .split(": ")
-                        .nth(1)
-                        .unwrap_or(kind.label())
-                        .to_string()
+                    kind.label().to_string()
                 };
                 // A long command name must not widen the card (the
                 // editor ScrollArea follows content width); the
                 // full name stays on hover.
-                let short_shown = truncate_display(&short, 36);
-                let group_kind = match kind.group() {
-                    "Trigger" => theme::BadgeKind::Info,
-                    "Action" => theme::BadgeKind::Success,
-                    "Condition" => theme::BadgeKind::Warning,
-                    _ => theme::BadgeKind::Muted,
-                };
+                let full_shown = truncate_display(&full, 36);
                 // Two rows, like the scenario and destination rows:
                 // name first, actions below, so names never clip at
                 // narrow windows.
                 ui.horizontal(|ui| {
-                    theme::badge(ui, kind.group_label(), group_kind);
                     if ui
                         .selectable_label(
                             self.selected_node.as_deref() == Some(id.as_str()),
-                            short_shown,
+                            full_shown,
                         )
-                        .on_hover_text(short)
+                        .on_hover_text(full)
                         .clicked()
                     {
                         self.selected_node = Some(id.clone());
                     }
                 });
                 ui.horizontal(|ui| {
-                    let is_only_trigger =
-                        kind.group() == "Trigger" && trigger_count == 1;
-                    if is_only_trigger {
-                        ui.add_enabled(false, egui::Button::new("Xóa"))
-                            .on_hover_text(
-                                "Không xóa được bước kích hoạt duy nhất — sửa lịch ở phần Lịch bên dưới.",
-                            );
-                    } else if self.pending_delete_node.as_deref() == Some(id.as_str()) {
-                        if theme::danger_button(ui, "Xóa thật?").clicked() {
-                            node_delete = Some(id.clone());
+                    let is_only_trigger = kind.group() == "Trigger" && trigger_count == 1;
+                    // The only trigger has no Xóa button at all, and
+                    // only the move buttons that apply are rendered:
+                    // a disabled button is near-invisible in this
+                    // theme but still takes its space, so an invisible
+                    // button in the middle of the row read as a stray
+                    // gap (same defect as the message rows). The
+                    // trigger stays protected by
+                    // `Scenario::remove_node` (exactly one trigger
+                    // required); its schedule is edited in the
+                    // schedule section below.
+                    if !is_only_trigger {
+                        if self.pending_delete_node.as_deref() == Some(id.as_str()) {
+                            if theme::danger_button(ui, "Xóa thật?").clicked() {
+                                node_delete = Some(id.clone());
+                            }
+                            if ui.button("Hủy").clicked() {
+                                self.pending_delete_node = None;
+                            }
+                        } else if ui.button("Xóa").clicked() {
+                            self.pending_delete_node = Some(id.clone());
                         }
-                        if ui.button("Hủy").clicked() {
-                            self.pending_delete_node = None;
-                        }
-                    } else if ui.button("Xóa").clicked() {
-                        self.pending_delete_node = Some(id.clone());
                     }
-                    if ui
-                        .add_enabled(pos > 0, egui::Button::new("Lên"))
-                        .clicked()
-                    {
+                    if pos > 0 && ui.button("Lên").clicked() {
                         node_move = Some((id.clone(), true));
                     }
-                    if ui
-                        .add_enabled(pos + 1 < nodes.len(), egui::Button::new("Xuống"))
-                        .clicked()
-                    {
+                    if pos + 1 < nodes.len() && ui.button("Xuống").clicked() {
                         node_move = Some((id.clone(), false));
                     }
                 });
@@ -3906,15 +4026,28 @@ impl NicordApp {
                 theme::muted(ui, "Lệnh (bước Gửi lệnh) không hoạt động ở chế độ Webhook.");
                 ui.add_space(6.0);
             } else {
-                ui.label("Chọn kênh (tải server/kênh của bạn từ Discord):");
+                // One channel per scenario in account mode: pick
+                // it above, or paste its ID below.
+                theme::muted(
+                    ui,
+                    "Ở chế độ Tài khoản, mỗi kịch bản chỉ gửi vào 1 kênh — chọn kênh ở trên, hoặc dán ID kênh vào ô dưới.",
+                );
                 ui.horizontal(|ui| {
                     if ui.button("Tải server").clicked() {
                         self.load_guilds();
                     }
-                    let guilds = self.guilds.lock().map(|g| g.clone()).unwrap_or_default();
-                    if !guilds.is_empty() {
+                });
+                // Explicit labels BEFORE their dropdowns:
+                // ComboBox::from_label renders the button first and
+                // the label after, which read as misaligned.
+                let guilds = self.guilds.lock().map(|g| g.clone()).unwrap_or_default();
+                ui.horizontal(|ui| {
+                    ui.label("Máy chủ:");
+                    if guilds.is_empty() {
+                        theme::muted(ui, "chưa có — bấm Tải server.");
+                    } else {
                         let mut picked = self.picker_guild_id.clone();
-                        egui::ComboBox::from_label("Máy chủ")
+                        egui::ComboBox::from_id_salt("picker_guild")
                             .selected_text(
                                 guilds
                                     .iter()
@@ -3934,10 +4067,15 @@ impl NicordApp {
                                 }
                             });
                     }
-                    let channels = self.channels.lock().map(|c| c.clone()).unwrap_or_default();
-                    if !channels.is_empty() {
+                });
+                let channels = self.channels.lock().map(|c| c.clone()).unwrap_or_default();
+                ui.horizontal(|ui| {
+                    ui.label("Kênh:");
+                    if channels.is_empty() {
+                        theme::muted(ui, "chưa có — chọn máy chủ trước.");
+                    } else {
                         let mut picked = channel_id.clone();
-                        egui::ComboBox::from_label("Kênh")
+                        egui::ComboBox::from_id_salt("picker_channel")
                             .selected_text(
                                 channels
                                     .iter()
@@ -3974,7 +4112,17 @@ impl NicordApp {
         // above stays visible; the rest splits into three tabs.
         // Session-only (see `builder_tab`): which tab is open is
         // transient UI state, like the selected node.
-        ui.horizontal(|ui| {
+        // Wrapped, not a single row: the three labels total
+        // ~306 px, wider than the ~288 px content width at
+        // 800x600, and a non-wrapping row wider than the viewport
+        // widens the whole editor ScrollArea (the feedback loop),
+        // so every card after the tabs — messages, templates —
+        // and the pinned bar stuck out ~26 px past the window's
+        // right margin (verified by debug print: available width
+        // 258 px before the tabs, 284.5 px after them). Wrapped,
+        // the third tab drops to a second line at narrow windows
+        // and everything stays inside.
+        ui.horizontal_wrapped(|ui| {
             for (tab, label) in [
                 (BuilderTab::Messages, "Tin nhắn"),
                 (BuilderTab::Schedule, "Bước & Lịch"),
@@ -4222,15 +4370,153 @@ impl NicordApp {
     /// Reads a snapshot, renders controls, writes back on change.
     /// Invalid input (bad time, bad cron, unknown timezone) is shown
     /// as an error and never written (fail-closed).
+    /// Convert the draft schedule to another editor mode, keeping
+    /// the current values whenever they carry over (e.g. "Mỗi 30
+    /// phút" -> "Tùy chỉnh" fills 1800 seconds; "Hàng ngày 9:00"
+    /// -> "Một lần" keeps 9:00). Values with nowhere to go are
+    /// remembered per mode (session-only) and restored when the
+    /// user switches back.
+    fn sched_convert(
+        &mut self,
+        from: &Option<Schedule>,
+        to: SchedMode,
+        timezone: &str,
+    ) -> Schedule {
+        // Remember what the current schedule holds first.
+        match from {
+            Some(Schedule::EveryMinutes { minutes }) => self.sched_last_minutes = *minutes,
+            Some(Schedule::EveryHours { hours }) => self.sched_last_hours = *hours,
+            Some(Schedule::EverySeconds { seconds }) => self.sched_last_seconds = *seconds,
+            Some(Schedule::Daily { time }) => self.sched_last_time = *time,
+            Some(Schedule::Weekly { weekdays, time }) => {
+                self.sched_last_weekdays = weekdays.clone();
+                self.sched_last_time = *time;
+            }
+            Some(Schedule::Once { at }) => {
+                let tz = crate::scenario::tz_from_name(timezone);
+                self.sched_last_time = at.with_timezone(&tz).time();
+            }
+            Some(Schedule::Cron { .. }) | None => {}
+        }
+        let tz = crate::scenario::tz_from_name(timezone);
+        match to {
+            SchedMode::Minutes => {
+                let minutes = match from {
+                    Some(Schedule::EveryMinutes { minutes }) => *minutes,
+                    Some(Schedule::EveryHours { hours }) => hours.saturating_mul(60).max(1),
+                    Some(Schedule::EverySeconds { seconds }) => (*seconds / 60).max(1),
+                    _ => self.sched_last_minutes,
+                };
+                Schedule::EveryMinutes { minutes }
+            }
+            SchedMode::Hours => {
+                let hours = match from {
+                    Some(Schedule::EveryHours { hours }) => *hours,
+                    Some(Schedule::EveryMinutes { minutes }) => (*minutes / 60).max(1),
+                    Some(Schedule::EverySeconds { seconds }) => (*seconds / 3600).max(1),
+                    _ => self.sched_last_hours,
+                };
+                Schedule::EveryHours { hours }
+            }
+            SchedMode::Daily => {
+                let time = match from {
+                    Some(Schedule::Daily { time }) | Some(Schedule::Weekly { time, .. }) => *time,
+                    Some(Schedule::Once { at }) => at.with_timezone(&tz).time(),
+                    _ => self.sched_last_time,
+                };
+                Schedule::Daily { time }
+            }
+            SchedMode::Weekly => {
+                let (weekdays, time) = match from {
+                    Some(Schedule::Weekly { weekdays, time }) => (weekdays.clone(), *time),
+                    Some(Schedule::Daily { time }) => (self.sched_last_weekdays.clone(), *time),
+                    Some(Schedule::Once { at }) => (
+                        self.sched_last_weekdays.clone(),
+                        at.with_timezone(&tz).time(),
+                    ),
+                    _ => (self.sched_last_weekdays.clone(), self.sched_last_time),
+                };
+                let weekdays = if weekdays.is_empty() {
+                    vec![0]
+                } else {
+                    weekdays
+                };
+                Schedule::Weekly { weekdays, time }
+            }
+            SchedMode::Once => {
+                // Tomorrow at the current wall time, in the scenario
+                // timezone (today if that time has not passed yet).
+                let now_tz = chrono::Local::now().with_timezone(&tz);
+                let time = match from {
+                    Some(Schedule::Daily { time }) | Some(Schedule::Weekly { time, .. }) => *time,
+                    Some(Schedule::Once { at }) => at.with_timezone(&tz).time(),
+                    _ => self.sched_last_time,
+                };
+                let mut date = now_tz.date_naive();
+                if time <= now_tz.time() {
+                    date += chrono::Duration::days(1);
+                }
+                let at = crate::scenario::resolve_wall_time(date, time, tz)
+                    .map(|t| t.with_timezone(&chrono::Utc))
+                    .unwrap_or_else(|| {
+                        // Gap day (spring-forward): try the next day.
+                        let d2 = date + chrono::Duration::days(1);
+                        crate::scenario::resolve_wall_time(d2, time, tz)
+                            .map(|t| t.with_timezone(&chrono::Utc))
+                            .unwrap_or_else(|| chrono::Utc::now() + chrono::Duration::days(1))
+                    });
+                Schedule::Once { at }
+            }
+            SchedMode::Custom => {
+                let seconds = match from {
+                    Some(Schedule::EverySeconds { seconds }) => *seconds,
+                    Some(Schedule::EveryMinutes { minutes }) => minutes.saturating_mul(60),
+                    Some(Schedule::EveryHours { hours }) => hours.saturating_mul(3600),
+                    _ => self.sched_last_seconds,
+                };
+                Schedule::EverySeconds {
+                    seconds: seconds.max(crate::scenario::MIN_EVERY_SECONDS),
+                }
+            }
+            SchedMode::Cron => match from {
+                Some(Schedule::Cron { expr }) => Schedule::Cron { expr: expr.clone() },
+                _ => Schedule::Cron {
+                    expr: "0 9 * * *".to_string(),
+                },
+            },
+        }
+    }
+
     fn show_schedule_editor(&mut self, ui: &mut egui::Ui, i: usize) {
-        let (mut schedule, mut timezone) = self
+        // In-progress draft, keyed by (list index, scenario id):
+        // the editor used to re-clone the schedule from storage
+        // every frame and only write back when valid, so a
+        // half-typed value (a fresh cron expression, a new time)
+        // was reverted on the very next frame and could never be
+        // typed. The draft survives invalid frames; the scenario
+        // is only updated on a valid write-back below.
+        let scenario_id = self
             .scenarios
             .lock()
-            .map(|l| {
-                l.get(i)
-                    .map(|s| (s.schedule.clone(), s.timezone.clone()))
-                    .unwrap_or((None, "Asia/Ho_Chi_Minh".to_string()))
-            })
+            .map(|l| l.get(i).map(|s| s.id.clone()))
+            .unwrap_or_default();
+        let draft_key = scenario_id.map(|id| (i, id));
+        if self.sched_draft_for != draft_key {
+            let (schedule, timezone) = self
+                .scenarios
+                .lock()
+                .map(|l| {
+                    l.get(i)
+                        .map(|s| (s.schedule.clone(), s.timezone.clone()))
+                        .unwrap_or((None, "Asia/Ho_Chi_Minh".to_string()))
+                })
+                .unwrap_or((None, "Asia/Ho_Chi_Minh".to_string()));
+            self.sched_draft = Some((schedule, timezone));
+            self.sched_draft_for = draft_key;
+        }
+        let (mut schedule, mut timezone) = self
+            .sched_draft
+            .clone()
             .unwrap_or((None, "Asia/Ho_Chi_Minh".to_string()));
         let mut changed = false;
         let mut error: Option<String> = None;
@@ -4277,61 +4563,114 @@ impl NicordApp {
                 }
             });
             ui.separator();
-            // Type selector.
-            let type_labels = ["Hàng ngày", "Hàng tuần", "Mỗi N phút", "Mỗi N giờ", "Cron"];
-            let current_type = match &schedule {
-                Some(Schedule::Daily { .. }) => 0,
-                Some(Schedule::Weekly { .. }) => 1,
-                Some(Schedule::EveryMinutes { .. }) => 2,
-                Some(Schedule::EveryHours { .. }) => 3,
-                Some(Schedule::Cron { .. }) => 4,
-                Some(Schedule::Once { .. }) | None => 0,
-            };
-            let mut type_idx = current_type;
-            egui::ComboBox::from_id_salt("schedule_type")
-                .selected_text(type_labels[type_idx])
-                .show_ui(ui, |ui| {
-                    for (idx, label) in type_labels.iter().enumerate() {
-                        ui.selectable_value(&mut type_idx, idx, *label);
+            // Mode chips in plain language (no cron jargon on the
+            // main screen). The mode is derived from the draft
+            // schedule every frame, so a preset click or a loaded
+            // scenario always shows the right chip.
+            let mode = sched_mode(&schedule);
+            ui.label("Chạy khi nào:");
+            ui.horizontal_wrapped(|ui| {
+                for (m, label) in [
+                    (SchedMode::Minutes, "Mỗi vài phút"),
+                    (SchedMode::Hours, "Mỗi vài giờ"),
+                    (SchedMode::Daily, "Hàng ngày"),
+                    (SchedMode::Weekly, "Hàng tuần"),
+                    (SchedMode::Once, "Một lần"),
+                    (SchedMode::Custom, "Tùy chỉnh (giây)"),
+                    (SchedMode::Cron, "Nâng cao (Cron)"),
+                ] {
+                    let chip = ui.selectable_label(mode == m, label);
+                    let chip = if m == SchedMode::Cron {
+                        chip.on_hover_text("Biểu thức Cron cho lịch phức tạp — chỉ dùng khi cần.")
+                    } else {
+                        chip
+                    };
+                    if chip.clicked() {
+                        if m == SchedMode::Cron && mode == SchedMode::Cron {
+                            // Already a cron schedule: the chip
+                            // toggles the advanced section.
+                            let open = self.sched_cron_open.unwrap_or(true);
+                            self.sched_cron_open = Some(!open);
+                        } else if mode != m {
+                            schedule = Some(self.sched_convert(&schedule, m, &timezone));
+                            if m == SchedMode::Cron {
+                                self.sched_cron_open = Some(true);
+                            }
+                            changed = true;
+                        }
                     }
-                });
-            if type_idx != current_type {
-                schedule = Some(match type_idx {
-                    1 => Schedule::Weekly {
-                        weekdays: vec![0],
-                        time: chrono::NaiveTime::from_hms_opt(9, 0, 0).unwrap_or_default(),
-                    },
-                    2 => Schedule::EveryMinutes { minutes: 30 },
-                    3 => Schedule::EveryHours { hours: 1 },
-                    4 => Schedule::Cron {
-                        expr: "0 9 * * *".to_string(),
-                    },
-                    _ => Schedule::Daily {
-                        time: chrono::NaiveTime::from_hms_opt(9, 0, 0).unwrap_or_default(),
-                    },
-                });
-                changed = true;
-            }
-            // Per-type fields.
+                }
+            });
+            // Per-mode fields (only the active mode's inputs show).
             match &mut schedule {
+                Some(Schedule::EveryMinutes { minutes }) => {
+                    ui.horizontal(|ui| {
+                        ui.label("Cứ mỗi");
+                        if ui
+                            .add(egui::DragValue::new(minutes).range(1..=1440))
+                            .changed()
+                        {
+                            self.sched_last_minutes = *minutes;
+                            changed = true;
+                        }
+                        ui.label("phút gửi một lần.");
+                    });
+                }
+                Some(Schedule::EveryHours { hours }) => {
+                    ui.horizontal(|ui| {
+                        ui.label("Cứ mỗi");
+                        if ui.add(egui::DragValue::new(hours).range(1..=24)).changed() {
+                            self.sched_last_hours = *hours;
+                            changed = true;
+                        }
+                        ui.label("giờ gửi một lần.");
+                    });
+                }
+                Some(Schedule::EverySeconds { seconds }) => {
+                    ui.horizontal(|ui| {
+                        ui.label("Cứ mỗi");
+                        if ui
+                            .add(egui::DragValue::new(seconds).range(60..=86400))
+                            .changed()
+                        {
+                            self.sched_last_seconds = *seconds;
+                            changed = true;
+                        }
+                        ui.label("giây gửi một lần.");
+                    });
+                    ui.label(
+                        RichText::new(format!("= {}", crate::scenario::describe_seconds(*seconds)))
+                            .small()
+                            .color(theme::palette().text_muted),
+                    )
+                    .on_hover_text(
+                        "Tối thiểu 60 giây: mỗi kênh chỉ gửi tối đa 1 lần/phút theo mặc định.",
+                    );
+                }
                 Some(Schedule::Daily { time }) => {
                     let mut text = time.format("%H:%M").to_string();
                     ui.horizontal(|ui| {
-                        ui.label("Giờ (HH:MM):");
-                        if ui.text_edit_singleline(&mut text).changed() {
+                        ui.label("Vào lúc");
+                        if ui
+                            .add(egui::TextEdit::singleline(&mut text).desired_width(64.0))
+                            .changed()
+                        {
                             match chrono::NaiveTime::parse_from_str(&text, "%H:%M") {
                                 Ok(t) => {
                                     *time = t;
+                                    self.sched_last_time = t;
                                     changed = true;
                                 }
                                 Err(_) => error = Some("Giờ phải là HH:MM (24h).".to_string()),
                             }
                         }
+                        ui.label("hàng ngày.");
                     });
                 }
                 Some(Schedule::Weekly { weekdays, time }) => {
                     let names = ["T2", "T3", "T4", "T5", "T6", "T7", "CN"];
-                    ui.horizontal(|ui| {
+                    ui.label("Vào những ngày:");
+                    ui.horizontal_wrapped(|ui| {
                         for (day, name) in names.iter().enumerate() {
                             let mut on = weekdays.contains(&(day as u8));
                             if ui.checkbox(&mut on, *name).changed() {
@@ -4341,6 +4680,7 @@ impl NicordApp {
                                 } else {
                                     weekdays.retain(|d| *d != day as u8);
                                 }
+                                self.sched_last_weekdays = weekdays.clone();
                                 changed = true;
                             }
                         }
@@ -4350,54 +4690,108 @@ impl NicordApp {
                     }
                     let mut text = time.format("%H:%M").to_string();
                     ui.horizontal(|ui| {
-                        ui.label("Giờ (HH:MM):");
-                        if ui.text_edit_singleline(&mut text).changed() {
+                        ui.label("Vào lúc");
+                        if ui
+                            .add(egui::TextEdit::singleline(&mut text).desired_width(64.0))
+                            .changed()
+                        {
                             match chrono::NaiveTime::parse_from_str(&text, "%H:%M") {
                                 Ok(t) => {
                                     *time = t;
+                                    self.sched_last_time = t;
                                     changed = true;
+                                }
+                                Err(_) => error = Some("Giờ phải là HH:MM (24h).".to_string()),
+                            }
+                        }
+                        ui.label("hàng tuần.");
+                    });
+                }
+                Some(Schedule::Once { at }) => {
+                    let tz = crate::scenario::tz_from_name(&timezone);
+                    let at_tz = at.with_timezone(&tz);
+                    let mut date_text = at_tz.format("%d/%m/%Y").to_string();
+                    let mut time_text = at_tz.format("%H:%M").to_string();
+                    ui.horizontal(|ui| {
+                        ui.label("Ngày (DD/MM/YYYY):");
+                        if ui
+                            .add(egui::TextEdit::singleline(&mut date_text).desired_width(96.0))
+                            .changed()
+                        {
+                            match chrono::NaiveDate::parse_from_str(&date_text, "%d/%m/%Y") {
+                                Ok(d) => {
+                                    match crate::scenario::resolve_wall_time(d, at_tz.time(), tz) {
+                                        Some(t) => {
+                                            *at = t.with_timezone(&chrono::Utc);
+                                            changed = true;
+                                        }
+                                        None => {
+                                            error = Some(
+                                                "Ngày/giờ này không tồn tại (đổi giờ mùa hè)."
+                                                    .to_string(),
+                                            )
+                                        }
+                                    }
+                                }
+                                Err(_) => error = Some("Ngày phải là DD/MM/YYYY.".to_string()),
+                            }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Giờ (HH:MM):");
+                        if ui
+                            .add(egui::TextEdit::singleline(&mut time_text).desired_width(64.0))
+                            .changed()
+                        {
+                            match chrono::NaiveTime::parse_from_str(&time_text, "%H:%M") {
+                                Ok(t) => {
+                                    match crate::scenario::resolve_wall_time(
+                                        at_tz.date_naive(),
+                                        t,
+                                        tz,
+                                    ) {
+                                        Some(res) => {
+                                            *at = res.with_timezone(&chrono::Utc);
+                                            changed = true;
+                                        }
+                                        None => {
+                                            error = Some(
+                                                "Ngày/giờ này không tồn tại (đổi giờ mùa hè)."
+                                                    .to_string(),
+                                            )
+                                        }
+                                    }
                                 }
                                 Err(_) => error = Some("Giờ phải là HH:MM (24h).".to_string()),
                             }
                         }
                     });
                 }
-                Some(Schedule::EveryMinutes { minutes }) => {
-                    ui.horizontal(|ui| {
-                        ui.label("Mỗi (phút):");
-                        if ui
-                            .add(egui::DragValue::new(minutes).range(1..=1440))
-                            .changed()
-                        {
-                            changed = true;
-                        }
-                    });
-                }
-                Some(Schedule::EveryHours { hours }) => {
-                    ui.horizontal(|ui| {
-                        ui.label("Mỗi (giờ):");
-                        if ui.add(egui::DragValue::new(hours).range(1..=24)).changed() {
-                            changed = true;
-                        }
-                    });
-                }
                 Some(Schedule::Cron { expr }) => {
-                    ui.horizontal(|ui| {
-                        ui.label("Cron (5 trường):");
-                        if ui.text_edit_singleline(expr).changed() {
-                            changed = true;
-                        }
-                    });
-                    theme::muted(ui, "Ví dụ: 0 9 * * * = 9:00 hàng ngày.");
-                }
-                Some(Schedule::Once { at }) => {
-                    theme::muted(
-                        ui,
-                        &format!(
-                            "Chạy một lần: {} (không sửa được ở đây — import JSON để đổi).",
-                            at.format("%Y-%m-%d %H:%M UTC")
-                        ),
-                    );
+                    // Advanced only: behind the "Nâng cao (Cron)"
+                    // chip above, auto-open when the draft schedule
+                    // is already Cron, so an old cron is never hidden
+                    // silently. (No second toggle here: the chip
+                    // already toggles it, and two identical controls
+                    // stacked read as a bug.)
+                    if self.sched_cron_open.unwrap_or(true) {
+                        ui.horizontal(|ui| {
+                            ui.label("Biểu thức Cron:");
+                            if ui.text_edit_singleline(expr).changed() {
+                                changed = true;
+                            }
+                        });
+                        theme::muted(ui, "Ví dụ: 0 9 * * * = 9:00 hàng ngày.");
+                    }
+                    // Inline validation on every frame (not only on
+                    // change): without it, a half-typed expression
+                    // reaches the write-back, fails validate(), and
+                    // leaves a stale "Lịch không hợp lệ — chưa lưu"
+                    // status banner even after the user fixes it and
+                    // the value saves.
+                    if let Err(e) = crate::scenario::parse_cron(expr) {
+                        error = Some(e);
+                    }
                 }
                 None => {
                     theme::muted(ui, "Chưa có lịch — chọn một mẫu nhanh ở trên.");
@@ -4519,6 +4913,12 @@ impl NicordApp {
                 ui.label(RichText::new(e).color(theme::palette().danger));
             }
         });
+        // Keep the session draft in sync with the editor, valid
+        // or not, so an invalid half-typed value is kept for the
+        // next frame instead of reverting to the saved schedule.
+        // (Before the write-back below: its early returns must not
+        // skip the sync.)
+        self.sched_draft = Some((schedule.clone(), timezone.clone()));
         // Write back (only when valid: schedule validates + timezone parses).
         if changed && error.is_none() {
             if timezone.parse::<chrono_tz::Tz>().is_err() {
