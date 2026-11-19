@@ -190,6 +190,15 @@ pub struct NicordApp {
     pub load_warnings: Vec<String>,
     /// Result of the last "Kiểm tra token" (Token Validator).
     pub token_info: Arc<Mutex<Option<Me>>>,
+    /// Whether the stored account token actually resolves
+    /// (`load_secret` succeeds). Session-only derived state,
+    /// recomputed in `refresh_health()` (startup, Settings save,
+    /// token save): a `kr:` read can block up to 10 s on a hung
+    /// platform store, so it must never run in the render path.
+    /// The Settings "Token đã lưu" line shows only when this is
+    /// true, so a corrupt leftover blob (or stale `token_last4`)
+    /// reads as "no token" instead of a saved one.
+    pub token_valid: bool,
     /// Auto-update state, shared with the background check/download
     /// threads (see `crate::updater`).
     pub update_status: Arc<Mutex<updater::UpdateStatus>>,
@@ -689,6 +698,7 @@ impl NicordApp {
             health_dismissed: false,
             load_warnings,
             token_info: Arc::new(Mutex::new(None)),
+            token_valid: false,
             update_status: Arc::new(Mutex::new(updater::UpdateStatus::default())),
             #[cfg(target_os = "windows")]
             tray: if tray_enabled {
@@ -746,6 +756,10 @@ impl NicordApp {
     }
 
     fn refresh_health(&mut self) {
+        // Token validity for the Settings account card (see the
+        // `token_valid` field docs). Runs here on demand, never
+        // per frame: a `kr:` read can block on the platform store.
+        self.token_valid = load_secret(&self.config.encrypted_token).is_ok();
         let destinations = self.store.load_destinations().unwrap_or_default();
         let scenarios = self.scenarios.lock().map(|l| l.clone()).unwrap_or_default();
         self.health_issues = crate::health::startup_checks(&self.config, &destinations, &scenarios);
@@ -944,6 +958,44 @@ impl NicordApp {
                 };
             }
         });
+    }
+
+    /// Save the token typed in Settings — the same save the
+    /// onboarding screen does, minus the first-run steps (no ToS
+    /// flip, no mode/screen change). Saves immediately on click,
+    /// not with the page's "Lưu cài đặt": a token is sensitive,
+    /// saving it at once is unambiguous. Refreshes health so the
+    /// stale banner and the health error clear right away.
+    fn save_token_from_settings(&mut self) {
+        if self.token_input.trim().is_empty() {
+            self.set_status("Token đang trống.");
+            return;
+        }
+        match store_secret(ENTRY_ACCOUNT_TOKEN, self.token_input.trim()) {
+            Ok(enc) => {
+                // SECURITY: store ONLY the last 4 chars for display.
+                // The full token must never be written to config.json
+                // in plaintext (Spec §9).
+                let tok = self.token_input.trim();
+                self.config.token_last4 = tok
+                    .chars()
+                    .rev()
+                    .take(4)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                self.config.encrypted_token = enc;
+                if save_config(&self.config).is_ok() {
+                    self.token_input.clear();
+                    self.refresh_health();
+                    self.set_status("Đã lưu token (mã hóa, chỉ trên máy này).");
+                } else {
+                    self.set_status("Không lưu được cấu hình.");
+                }
+            }
+            Err(e) => self.set_status(&format!("Không mã hóa được token: {e}")),
+        }
     }
 
     /// Token Validator: check the stored token with
@@ -7225,12 +7277,8 @@ impl NicordApp {
                     ui.label("Chưa có webhook URL — dán URL ở dưới và lưu lại.");
                 }
             }
-            if self.config.send_mode == SendMode::UserToken
-                && self.config.encrypted_token.is_empty()
-            {
-                ui.label(
-                    "Chưa có token — quay lại màn hình thiết lập để lưu token, hoặc chọn Webhook.",
-                );
+            if self.config.send_mode == SendMode::UserToken && !self.token_valid {
+                ui.label("Chưa có token — dán token mới ở dưới, hoặc chọn Webhook.");
             }
         });
         ui.add_space(12.0);
@@ -7352,6 +7400,34 @@ impl NicordApp {
         // show the account behind it. The token itself is never shown.
         theme::card(ui, |ui| {
             theme::section_title(ui, t(self.lang(), "settings.account"));
+            // Token entry lives here now, not only in onboarding:
+            // without it there was no way to (re-)enter a token
+            // once Settings was reached (the only way back to
+            // onboarding was wiping all local data). Shown only
+            // in UserToken mode; the card itself is shared with
+            // Webhook mode, where the button below still checks
+            // whatever token is stored.
+            if self.config.send_mode == SendMode::UserToken {
+                // Show the saved tail only when the stored value
+                // actually resolves — a corrupt blob or a stale
+                // `token_last4` must read as "no token".
+                if self.token_valid && !self.config.token_last4.is_empty() {
+                    ui.label(format!(
+                        "Token đã lưu: {}",
+                        mask_token(&self.config.token_last4)
+                    ));
+                }
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.token_input)
+                            .password(true)
+                            .hint_text("dán token mới vào đây"),
+                    );
+                    if theme::primary_button(ui, "Lưu token").clicked() {
+                        self.save_token_from_settings();
+                    }
+                });
+            }
             ui.horizontal(|ui| {
                 if theme::primary_button(ui, "Kiểm tra token").clicked() {
                     self.check_token();

@@ -1671,3 +1671,34 @@ batch; sending behavior is untouched (display only).
   theme dropdown the reviewer could not open by clicking —
   unconfirmed as an app bug, to be re-tested by hand during
   GUI verification.
+
+## Token entry in Settings (2026-11-19)
+
+- **Gap:** the token input existed only in onboarding
+  (`show_onboarding_token`). Once past first launch, Settings had
+  no place to (re-)enter a token — the "Tài khoản" card only had
+  "Kiểm tra token" (validates the *stored* token). The only way
+  back to onboarding was "Xóa toàn bộ dữ liệu cục bộ", which also
+  deletes scenarios. Fixed: the "Tài khoản" card (UserToken mode
+  only) now has a token field (hint "dán token mới vào đây") +
+  "Lưu token" button, mirroring the onboarding save exactly:
+  `store_secret(ENTRY_ACCOUNT_TOKEN, …)`, only the last 4 chars
+  kept for display (`token_last4`), `save_config`, input cleared,
+  `refresh_health()`, status "Đã lưu token (mã hóa, chỉ trên máy
+  này).". It saves immediately on click, not with the page's
+  "Lưu cài đặt" — a token is sensitive, saving at once is
+  unambiguous. The shared `token_input` session state is reused
+  (no new field). The stale line "Chưa có token — quay lại màn
+  hình thiết lập…" now reads "Chưa có token — dán token mới ở
+  dưới, hoặc chọn Webhook."
+- **"Token đã lưu" gate:** the line shows only when the stored
+  value actually resolves. A new session-only `token_valid: bool`
+  is recomputed in `refresh_health()` (startup, Settings save,
+  token save) via `load_secret(…).is_ok()` — never in the render
+  path, because a `kr:` read can block up to 10 s on a hung
+  platform store. A corrupt leftover blob (or stale `token_last4`)
+  therefore reads as "no token" instead of a saved one. The
+  status banner ("Không có token hợp lệ đã lưu: …") is just the
+  last status string; saving overwrites it with the confirmation,
+  and `refresh_health()` also clears the matching health error.
+- **No new persisted state** (`token_valid` is derived).
