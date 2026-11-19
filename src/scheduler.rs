@@ -738,6 +738,12 @@ impl Engine {
             .filter(|c| !c.is_empty())
             .unwrap_or_else(|| scenario.channel_id.clone());
         for node in &scenario.nodes {
+            // Disabled data-fetch steps never fetch (validation
+            // already skips them; this guards direct callers and
+            // config edits between validation and fetch).
+            if !node.enabled {
+                continue;
+            }
             if node.kind != NodeKind::UtilityCallApi {
                 continue;
             }
@@ -2501,5 +2507,29 @@ mod tests {
         assert!(engine.record_dest_error("d1"));
         engine.reset_dest_errors("d1");
         assert!(!engine.record_dest_error("d1"));
+    }
+
+    #[tokio::test]
+    async fn fetch_api_vars_skips_disabled_nodes() {
+        // Bật/Tắt từng bước: a disabled data-fetch step never
+        // fetches — even with an invalid config that would fail
+        // validation if it ran. No network is touched either way:
+        // the enabled control fails at structural validation,
+        // before any fetch.
+        let store = Arc::new(Store::open_memory().unwrap());
+        let engine = Engine::new(store, AntiBanConfig::default(), 300, 3);
+        let mut scenario = Scenario::new("t");
+        let mut node = Node::new(NodeKind::UtilityCallApi);
+        node.config = serde_json::json!({
+            "variable": "weather",
+            "field_path": "temp",
+        });
+        node.enabled = false;
+        scenario.nodes.push(node);
+        let vars = engine.fetch_api_vars(&scenario, None).await.unwrap();
+        assert!(vars.is_empty());
+        // The same node, enabled, fails closed before fetching.
+        scenario.nodes[2].enabled = true;
+        assert!(engine.fetch_api_vars(&scenario, None).await.is_err());
     }
 }

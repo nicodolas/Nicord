@@ -635,11 +635,12 @@ fn apply_import_with(
         // exported node carries only a reference, which will not
         // resolve on this machine. The scenario still imports —
         // the node fails closed at send time — but warn so the
-        // user re-enters the URL before relying on it.
+        // user re-enters the URL before relying on it. Disabled
+        // steps never fetch, so they need no URL re-entry.
         let api_nodes = s
             .nodes
             .iter()
-            .filter(|n| n.kind == crate::scenario::NodeKind::UtilityCallApi)
+            .filter(|n| n.enabled && n.kind == crate::scenario::NodeKind::UtilityCallApi)
             .filter(|n| {
                 !crate::scenario::ApiCallConfig::from_node(n)
                     .url_ref

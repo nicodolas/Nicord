@@ -685,6 +685,17 @@ pub struct Node {
     pub kind: NodeKind,
     #[serde(default)]
     pub config: serde_json::Value,
+    /// Whether this step runs. Old configs (no field) read as
+    /// enabled. A disabled step is skipped as if it did not exist:
+    /// never validated, never run (see `validate_inner` and the
+    /// scheduler). The trigger step can never be disabled — the
+    /// UI hides its toggle and validation rejects it.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Node {
@@ -693,6 +704,7 @@ impl Node {
             id: Uuid::new_v4().to_string(),
             kind,
             config: serde_json::json!({}),
+            enabled: true,
         }
     }
 }
@@ -1448,7 +1460,23 @@ impl Scenario {
                 triggers
             ));
         }
+        // A disabled trigger (only possible via a hand-edited
+        // config — the UI never offers the toggle for it) leaves
+        // the scenario with no live trigger: fail closed with a
+        // clear error instead of a scenario that never fires.
+        if let Some(trigger) = self.nodes.iter().find(|n| n.kind.group() == "Trigger") {
+            if !trigger.enabled {
+                return Err(
+                    "Bước Kích hoạt đang tắt — bật lại bước này thì kịch bản mới chạy được".into(),
+                );
+            }
+        }
         for node in &self.nodes {
+            // A disabled step is skipped as if it did not exist:
+            // its config is never validated and it never runs.
+            if !node.enabled {
+                continue;
+            }
             if !node.kind.is_executed() {
                 return Err(format!(
                     "Bước '{}' chưa được làm trong phiên bản này — hãy xóa nó \
@@ -1483,10 +1511,11 @@ impl Scenario {
         }
         // Two Call API nodes feeding the same variable would make
         // the template value depend on node order — reject it.
+        // Disabled nodes are skipped (they never fetch).
         {
             let mut seen: Vec<String> = Vec::new();
             for node in &self.nodes {
-                if node.kind != NodeKind::UtilityCallApi {
+                if !node.enabled || node.kind != NodeKind::UtilityCallApi {
                     continue;
                 }
                 let name = ApiCallConfig::from_node(node).variable.trim().to_string();
@@ -1518,6 +1547,11 @@ impl Scenario {
             );
         }
         for node in &self.nodes {
+            // Disabled message nodes are ignored at runtime, so
+            // their (absent) content must not fail validation.
+            if !node.enabled {
+                continue;
+            }
             if node.kind == NodeKind::ActionSendMessage || node.kind == NodeKind::ActionSendEmbed {
                 let content = node_content(node);
                 // A poll alone satisfies the node: Discord accepts
@@ -1579,6 +1613,11 @@ impl Scenario {
             }
         }
         for node in &self.nodes {
+            // Disabled nodes never send, so their content length
+            // is irrelevant.
+            if !node.enabled {
+                continue;
+            }
             if node.kind == NodeKind::ActionSendMessage || node.kind == NodeKind::ActionSendEmbed {
                 let content = node_content(node);
                 if char_count(&content) > DISCORD_CONTENT_LIMIT {
@@ -1593,22 +1632,25 @@ impl Scenario {
         Ok(())
     }
 
-    /// First `ActionSendCommand` node, if any. Kept for validation
-    /// (message nodes are ignored when a command exists) — the
-    /// scheduler runs ALL command nodes via `command_nodes`.
+    /// First ENABLED `ActionSendCommand` node, if any. Kept for
+    /// validation (message nodes are ignored when a command exists)
+    /// — the scheduler runs ALL command nodes via `command_nodes`.
+    /// A disabled command node is invisible here: it neither
+    /// counts as "this scenario runs a command" nor runs.
     pub fn command_node(&self) -> Option<&Node> {
         self.nodes
             .iter()
-            .find(|n| n.kind == NodeKind::ActionSendCommand)
+            .find(|n| n.enabled && n.kind == NodeKind::ActionSendCommand)
     }
 
-    /// All `ActionSendCommand` nodes, in node order. One scheduled
-    /// firing runs all of them in order (see `Engine::send_commands`
-    /// in scheduler.rs for the retry-safety rule).
+    /// All ENABLED `ActionSendCommand` nodes, in node order. One
+    /// scheduled firing runs all of them in order (see
+    /// `Engine::send_commands` in scheduler.rs for the
+    /// retry-safety rule). Disabled command nodes are skipped.
     pub fn command_nodes(&self) -> Vec<&Node> {
         self.nodes
             .iter()
-            .filter(|n| n.kind == NodeKind::ActionSendCommand)
+            .filter(|n| n.enabled && n.kind == NodeKind::ActionSendCommand)
             .collect()
     }
 
@@ -1743,7 +1785,9 @@ impl Scenario {
         self.nodes
             .iter()
             .filter(|n| {
-                n.kind == NodeKind::ActionSendMessage || n.kind == NodeKind::ActionSendEmbed
+                n.enabled
+                    && (n.kind == NodeKind::ActionSendMessage
+                        || n.kind == NodeKind::ActionSendEmbed)
             })
             .filter_map(|n| {
                 let c = node_content(n);
@@ -1756,23 +1800,28 @@ impl Scenario {
             .next()
     }
 
-    /// Total extra wait (seconds) requested by UtilityWait nodes (capped).
+    /// Total extra wait (seconds) requested by ENABLED UtilityWait
+    /// nodes (capped). Disabled wait nodes add no delay.
     /// Saturating: crafted node configs with huge `seconds` values
     /// must not overflow the sum (debug panic / release wrap).
     pub fn wait_seconds(&self) -> u64 {
         let total: u64 = self
             .nodes
             .iter()
-            .filter(|n| n.kind == NodeKind::UtilityWait)
+            .filter(|n| n.enabled && n.kind == NodeKind::UtilityWait)
             .filter_map(|n| n.config.get("seconds").and_then(|v| v.as_u64()))
             .fold(0u64, |acc, v| acc.saturating_add(v));
         total.min(300)
     }
 
-    /// Check ConditionTimeWindow nodes against `now` (local time).
-    /// Returns Err (skip reason) when outside the window.
+    /// Check ENABLED ConditionTimeWindow nodes against `now`
+    /// (local time). Returns Err (skip reason) when outside the
+    /// window. Disabled windows never block a run.
     pub fn check_time_windows(&self, now: DateTime<Local>) -> Result<(), String> {
         for node in &self.nodes {
+            if !node.enabled {
+                continue;
+            }
             if node.kind != NodeKind::ConditionTimeWindow {
                 continue;
             }
@@ -1795,10 +1844,14 @@ impl Scenario {
         Ok(())
     }
 
-    /// Variables contributed by UtilitySetVariable nodes (name → value).
+    /// Variables contributed by ENABLED UtilitySetVariable nodes
+    /// (name → value). Disabled nodes contribute nothing.
     pub fn set_variable_overrides(&self) -> HashMap<String, String> {
         let mut out = HashMap::new();
         for node in &self.nodes {
+            if !node.enabled {
+                continue;
+            }
             if node.kind != NodeKind::UtilitySetVariable {
                 continue;
             }
@@ -2106,11 +2159,12 @@ pub fn analyze_import(text: &str, is_webhook: bool) -> (Option<Scenario>, Vec<St
     }
     // Call API URLs (idea #5) are per-machine secrets: the exported
     // node carries only a reference, so the URL must be re-entered
-    // on this machine before the node can fetch.
+    // on this machine before the node can fetch. Disabled steps
+    // never fetch, so they need no URL re-entry.
     let api_nodes = scenario
         .nodes
         .iter()
-        .filter(|n| n.kind == NodeKind::UtilityCallApi)
+        .filter(|n| n.enabled && n.kind == NodeKind::UtilityCallApi)
         .filter(|n| !ApiCallConfig::from_node(n).url_ref.trim().is_empty())
         .count();
     if api_nodes > 0 {
@@ -3128,6 +3182,125 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert_eq!(CommandConfig::from_node(all[0]).name, "first");
         assert_eq!(CommandConfig::from_node(all[1]).name, "second");
+    }
+
+    #[test]
+    fn node_enabled_defaults_true_for_old_configs() {
+        // Bật/Tắt từng bước: configs saved before the toggle existed
+        // have no "enabled" field and must read as enabled.
+        let node: Node = serde_json::from_value(serde_json::json!({
+            "id": "x",
+            "type": "action_send_message",
+            "config": {},
+        }))
+        .unwrap();
+        assert!(node.enabled);
+        let node: Node = serde_json::from_value(serde_json::json!({
+            "id": "x",
+            "type": "action_send_message",
+            "config": {},
+            "enabled": false,
+        }))
+        .unwrap();
+        assert!(!node.enabled);
+        assert!(Node::new(NodeKind::ActionSendMessage).enabled);
+    }
+
+    #[test]
+    fn disabled_steps_are_skipped_by_validation() {
+        // A disabled command node with an empty name is invalid —
+        // but skipped, so the scenario still validates. Enabling
+        // the same node makes validation fail.
+        let mut s = Scenario::new("t");
+        s.channel_id = "123".to_string();
+        let mut cmd = Node::new(NodeKind::ActionSendCommand);
+        cmd.config = serde_json::json!({"kind": "slash", "name": "", "application_id": ""});
+        cmd.enabled = false;
+        s.nodes.push(cmd);
+        assert!(s.validate().is_ok());
+        s.nodes[2].enabled = true;
+        assert!(s.validate().is_err());
+    }
+
+    #[test]
+    fn disabled_trigger_is_rejected() {
+        // A scenario needs exactly one LIVE trigger: a disabled
+        // trigger (only possible via a hand-edited config — the UI
+        // never offers its toggle) fails closed with a clear error.
+        let mut s = Scenario::new("t");
+        s.channel_id = "123".to_string();
+        s.nodes[0].enabled = false;
+        let err = s.validate().unwrap_err();
+        assert!(
+            err.contains("Kích hoạt đang tắt"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn command_detection_ignores_disabled_commands() {
+        // A disabled command node neither counts as "this scenario
+        // runs a command" nor runs.
+        let mut s = Scenario::new("cmd");
+        let mut cmd = Node::new(NodeKind::ActionSendCommand);
+        cmd.config = serde_json::json!({"kind": "prefix", "name": "daily"});
+        cmd.enabled = false;
+        s.nodes.push(cmd);
+        assert!(s.command_node().is_none());
+        assert!(s.command_nodes().is_empty());
+        s.nodes[2].enabled = true;
+        assert_eq!(
+            CommandConfig::from_node(s.command_node().unwrap()).name,
+            "daily"
+        );
+        assert_eq!(s.command_nodes().len(), 1);
+    }
+
+    #[test]
+    fn disabled_runtime_helpers_ignore_disabled_nodes() {
+        // Disabled wait / time-window / set-variable / message
+        // nodes contribute nothing at runtime.
+        let mut s = Scenario::new("h");
+        let mut wait = Node::new(NodeKind::UtilityWait);
+        wait.config = serde_json::json!({"seconds": 30});
+        wait.enabled = false;
+        s.nodes.push(wait);
+        assert_eq!(s.wait_seconds(), 0);
+        s.nodes[2].enabled = true;
+        assert_eq!(s.wait_seconds(), 30);
+
+        let mut win = Node::new(NodeKind::ConditionTimeWindow);
+        win.config = serde_json::json!({"start": "00:00", "end": "00:01"});
+        win.enabled = false;
+        s.nodes.push(win);
+        // Noon is outside 00:00–00:01, but the disabled window
+        // must not block the run.
+        let noon = chrono::NaiveDate::from_ymd_opt(2026, 11, 19)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .and_local_timezone(chrono::Local)
+            .unwrap();
+        assert!(s.check_time_windows(noon).is_ok());
+        s.nodes[3].enabled = true;
+        assert!(s.check_time_windows(noon).is_err());
+
+        let mut var = Node::new(NodeKind::UtilitySetVariable);
+        var.config = serde_json::json!({"name": "x", "value": "y"});
+        var.enabled = false;
+        s.nodes.push(var);
+        assert!(s.set_variable_overrides().is_empty());
+        s.nodes[4].enabled = true;
+        assert_eq!(
+            s.set_variable_overrides().get("x").map(String::as_str),
+            Some("y")
+        );
+
+        s.nodes[1].config = serde_json::json!({"content": "hello"});
+        s.nodes[1].enabled = false;
+        assert!(s.node_message().is_none());
+        s.nodes[1].enabled = true;
+        assert_eq!(s.node_message().as_deref(), Some("hello"));
     }
 
     #[test]

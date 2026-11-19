@@ -270,6 +270,23 @@ UtilityRandomPick (rotation) and UtilitySetVariable (template vars). Any
 other node kind is rejected by `Scenario::validate` with a clear error —
 never silently ignored.
 
+Per-step on/off (`Node.enabled`, serde default true — old configs read as
+enabled, and the flag is stored in the node's JSON so it is persisted and
+exported with the scenario): a disabled step is skipped as if it did not
+exist. Validation ignores it (a disabled command step with a bad config
+does not block the scenario; a disabled Call API step does not count for
+duplicate-variable checks), the scheduler never runs it (no message, no
+command, no wait, no time-window block, no variable, no data fetch), and
+the run preview / warnings do not count it. The trigger step can never be
+disabled — the Builder hides its toggle, and validation fails closed with
+a clear error if a hand-edited config disables it (a scenario needs
+exactly one live trigger). In the Builder, a disabled step reads as OFF
+(muted text + a "(tắt)" suffix) so it cannot be mistaken for the blue
+"selected for editing" state; the same toggle also sits at the top of the
+step inspector ("Chi tiết bước"). Manually testing a single command step
+("Test lệnh") still runs that step even when disabled — it is an explicit
+manual action on that step, not a scheduled run.
+
 Warm-up / caps: the daily cap is 300/day for everyone, resetting at
 00:00 UTC. The bucket is the UTC date everywhere — engine and persisted
 send log — so changing the machine timezone cannot grant extra messages.

@@ -3744,7 +3744,7 @@ impl NicordApp {
         &mut self,
         ui: &mut egui::Ui,
         i: usize,
-        nodes: &[(NodeKind, String, String)],
+        nodes: &[(NodeKind, String, String, bool)],
     ) {
         // Workflow overview (redesign): the step list sits right
         // after the compose area, so the scenario's shape is visible
@@ -3760,11 +3760,12 @@ impl NicordApp {
             // schedule section below.
             let trigger_count = nodes
                 .iter()
-                .filter(|(k, _, _)| k.group() == "Trigger")
+                .filter(|(k, _, _, _)| k.group() == "Trigger")
                 .count();
             let mut node_delete: Option<String> = None;
             let mut node_move: Option<(String, bool)> = None;
-            for (pos, (kind, id, cmd_name)) in nodes.iter().enumerate() {
+            let mut node_toggle: Option<(String, bool)> = None;
+            for (pos, (kind, id, cmd_name, step_enabled)) in nodes.iter().enumerate() {
                 // One clickable chip per step, showing the full
                 // label ("Kích hoạt: Theo lịch"): the old badge +
                 // separate short name read as two buttons, and the
@@ -3779,24 +3780,50 @@ impl NicordApp {
                 // A long command name must not widen the card (the
                 // editor ScrollArea follows content width); the
                 // full name stays on hover.
-                let full_shown = truncate_display(&full, 36);
+                // A disabled step must read as OFF, never as
+                // selected: muted text + a "(tắt)" suffix that
+                // survives truncation (the base is cut shorter so
+                // the suffix always fits), while the blue selected
+                // state stays the "being edited" marker.
+                let full_shown = if *step_enabled {
+                    truncate_display(&full, 36)
+                } else {
+                    format!("{} (tắt)", truncate_display(&full, 30))
+                };
                 // Two rows, like the scenario and destination rows:
                 // name first, actions below, so names never clip at
                 // narrow windows.
                 ui.horizontal(|ui| {
+                    let label = if *step_enabled {
+                        egui::RichText::new(full_shown)
+                    } else {
+                        egui::RichText::new(full_shown).color(theme::palette().text_muted)
+                    };
                     if ui
-                        .selectable_label(
-                            self.selected_node.as_deref() == Some(id.as_str()),
-                            full_shown,
-                        )
+                        .selectable_label(self.selected_node.as_deref() == Some(id.as_str()), label)
                         .on_hover_text(full)
                         .clicked()
                     {
                         self.selected_node = Some(id.clone());
                     }
                 });
-                ui.horizontal(|ui| {
+                // Wrapped: four buttons (Bật/Tắt, Xóa, Lên,
+                // Xuống) exceed the editor column at narrow
+                // windows — a plain horizontal row would widen the
+                // whole screen through the ScrollArea feedback
+                // loop, so the row wraps instead.
+                ui.horizontal_wrapped(|ui| {
                     let is_only_trigger = kind.group() == "Trigger" && trigger_count == 1;
+                    // The trigger has no toggle at all: a scenario
+                    // needs exactly one live trigger (validation
+                    // rejects a disabled one too).
+                    if kind.group() != "Trigger"
+                        && ui
+                            .button(if *step_enabled { "Tắt" } else { "Bật" })
+                            .clicked()
+                    {
+                        node_toggle = Some((id.clone(), !*step_enabled));
+                    }
                     // The only trigger has no Xóa button at all, and
                     // only the move buttons that apply are rendered:
                     // a disabled button is near-invisible in this
@@ -3871,13 +3898,28 @@ impl NicordApp {
                 }
                 self.save_scenarios();
             }
+            if let Some((id, enabled)) = node_toggle {
+                if let Ok(mut list) = self.scenarios.lock() {
+                    if let Some(s) = list.get_mut(i) {
+                        if let Some(n) = s.nodes.iter_mut().find(|n| n.id == id) {
+                            // Defense in depth: the trigger can
+                            // never be disabled (validation rejects
+                            // it too); the UI never offers its toggle.
+                            if n.kind.group() != "Trigger" {
+                                n.enabled = enabled;
+                            }
+                        }
+                    }
+                }
+                self.save_scenarios();
+            }
         });
         ui.add_space(6.0);
         // Context inspector: the selected command / data-fetch
         // step's editor, in the secondary surface, directly under
         // the list. Other step kinds have no editor, so no empty
         // panel shows.
-        let inspector_open = nodes.iter().any(|(kind, id, _)| {
+        let inspector_open = nodes.iter().any(|(kind, id, _, _)| {
             self.selected_node.as_deref() == Some(id.as_str())
                 && matches!(kind, NodeKind::ActionSendCommand | NodeKind::UtilityCallApi)
         });
@@ -3885,6 +3927,7 @@ impl NicordApp {
             theme::inspector_frame().show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 theme::section_title(ui, "Chi tiết bước");
+                self.show_step_toggle(ui, i);
                 self.show_command_editor(ui, i);
                 self.show_api_editor(ui, i);
             });
@@ -3892,12 +3935,64 @@ impl NicordApp {
         }
     }
 
+    /// Bật/Tắt toggle for the selected step, at the top of the
+    /// inspector (the same control as the row button in "Các bước
+    /// chạy"). The trigger never gets one: a scenario needs
+    /// exactly one live trigger.
+    fn show_step_toggle(&mut self, ui: &mut egui::Ui, i: usize) {
+        let Some(sel_id) = self.selected_node.clone() else {
+            return;
+        };
+        let mut state: Option<(bool, bool)> = None; // (enabled, is_trigger)
+        if let Ok(list) = self.scenarios.lock() {
+            if let Some(s) = list.get(i) {
+                if let Some(n) = s.nodes.iter().find(|n| n.id == sel_id) {
+                    state = Some((n.enabled, n.kind.group() == "Trigger"));
+                }
+            }
+        }
+        let Some((enabled, is_trigger)) = state else {
+            return;
+        };
+        if is_trigger {
+            return;
+        }
+        ui.horizontal_wrapped(|ui| {
+            theme::muted(
+                ui,
+                if enabled {
+                    "Bước này đang bật."
+                } else {
+                    "Bước này đang tắt — các lần chạy sẽ bỏ qua nó."
+                },
+            );
+            if ui
+                .button(if enabled {
+                    "Tắt bước này"
+                } else {
+                    "Bật lại bước này"
+                })
+                .clicked()
+            {
+                if let Ok(mut list) = self.scenarios.lock() {
+                    if let Some(s) = list.get_mut(i) {
+                        if let Some(n) = s.nodes.iter_mut().find(|n| n.id == sel_id) {
+                            n.enabled = !enabled;
+                        }
+                    }
+                }
+                self.save_scenarios();
+            }
+        });
+    }
+
     fn show_builder_editor(&mut self, ui: &mut egui::Ui, i: usize) {
         let mut channel_id = String::new();
         let mut scenario_id = String::new();
         let mut messages: Vec<String> = Vec::new();
-        // (kind, id, command display name — "" for non-command nodes).
-        let mut nodes: Vec<(NodeKind, String, String)> = Vec::new();
+        // (kind, id, command display name — "" for non-command
+        // nodes, whether the step is enabled).
+        let mut nodes: Vec<(NodeKind, String, String, bool)> = Vec::new();
         if let Ok(list) = self.scenarios.lock() {
             if let Some(s) = list.get(i) {
                 channel_id = s.channel_id.clone();
@@ -3912,7 +4007,7 @@ impl NicordApp {
                         } else {
                             String::new()
                         };
-                        (n.kind.clone(), n.id.clone(), cmd)
+                        (n.kind.clone(), n.id.clone(), cmd, n.enabled)
                     })
                     .collect();
             }
