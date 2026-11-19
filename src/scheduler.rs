@@ -15,8 +15,8 @@ use crate::{
     discord::{build_interaction_payload, make_nonce, DiscordClient, DiscordError},
     gateway::{Gateway, SESSION_WAIT_SECS},
     scenario::{
-        due_time, render_template_with_vars, ApiCallConfig, CommandConfig, NodeKind, Scenario,
-        Schedule,
+        due_time, render_template_with_vars, ApiCallConfig, CommandConfig, Node, NodeKind,
+        Scenario, Schedule,
     },
     spintax::{apply_spintax, vary_message},
     store::Store,
@@ -135,6 +135,12 @@ pub struct Engine {
     /// Gateway client for slash commands (lazy: connects only when a
     /// slash command actually fires).
     gateway: Arc<Gateway>,
+    /// Guild id per channel, resolved from `GET /channels/{id}` the
+    /// first time a slash command fires in that channel. Session-only
+    /// (a restart re-resolves): a failed channel read falls back to
+    /// the cached value, and only fails the send when both are
+    /// missing. None = a DM channel (no guild).
+    guild_cache: std::sync::Mutex<HashMap<String, Option<String>>>,
     /// Failed sends this session (dashboard success rate). Skips
     /// ("skip: ...") are not failures and are never counted here.
     /// Messages deleted by Auto Delete this session.
@@ -277,6 +283,23 @@ fn is_hard_broadcast_error(e: &str) -> bool {
     !(e.starts_with("defer:") || e.starts_with("skip:") || e.starts_with("invalid scenario:"))
 }
 
+/// Demote a "defer:" error to a hard error once earlier commands
+/// already ran in this firing: retrying the firing would re-run
+/// them. With nothing run yet, the "defer:" passes through so the
+/// run retries later as before (see `Engine::send_commands`).
+fn demote_defer_after_partial(ran: usize, e: String) -> String {
+    if ran == 0 {
+        return e;
+    }
+    match e.strip_prefix("defer:") {
+        Some(rest) => format!(
+            "đã chạy {ran} lệnh rồi, lệnh tiếp theo bị hoãn nên không chạy lại được: {}",
+            rest.trim()
+        ),
+        None => e,
+    }
+}
+
 /// Fold per-target results into one outcome. Precedence: any
 /// success wins; otherwise a defer wins (a retryable target must
 /// never be consumed as failed); otherwise a hard failure wins
@@ -355,6 +378,7 @@ impl Engine {
                 next_break_at: 0,
             }),
             gateway: Arc::new(Gateway::new()),
+            guild_cache: std::sync::Mutex::new(HashMap::new()),
             deleted_today: std::sync::Mutex::new(0),
             started_at: Instant::now(),
             last_persist_error: std::sync::Mutex::new(None),
@@ -913,21 +937,28 @@ impl Engine {
             }
         }
 
-        // A Send Command node takes precedence over message nodes: one
-        // scheduled firing runs exactly the first command node (see
-        // `Scenario::command_node` for why only the first one runs).
-        // Webhook mode rejects commands defensively here too, even
-        // though validation above already rejects them.
-        if let Some(cmd_node) = scenario.command_node() {
+        // Send Command nodes take precedence over message nodes: one
+        // scheduled firing runs ALL command nodes in node order (see
+        // `send_commands` for the retry-safety rule). Webhook mode
+        // rejects commands defensively here too, even though
+        // validation above already rejects them.
+        let cmd_nodes = scenario.command_nodes();
+        if !cmd_nodes.is_empty() {
             if sender.is_webhook() {
                 return Err(
                     "chế độ Webhook không gửi được lệnh — dùng kịch bản tin nhắn hoặc chuyển lại chế độ Tài khoản"
                         .into(),
                 );
             }
-            let cfg = CommandConfig::from_node(cmd_node);
             return self
-                .send_command(scenario, &cfg, sender, username, server_name, &antiban)
+                .send_commands(
+                    scenario,
+                    &cmd_nodes,
+                    sender,
+                    username,
+                    server_name,
+                    &antiban,
+                )
                 .await;
         }
         // Node execution (in node order): a Send Message / Send Embed node
@@ -1553,7 +1584,59 @@ impl Engine {
         Ok(())
     }
 
-    /// Execute the first `ActionSendCommand` node of a scenario.
+    /// Session-only guild cache (see the `guild_cache` field).
+    /// Outer None = never resolved for this channel; inner None =
+    /// a cached DM channel (no guild).
+    fn cached_guild_id(&self, channel_id: &str) -> Option<Option<String>> {
+        self.guild_cache.lock().ok()?.get(channel_id).cloned()
+    }
+
+    fn cache_guild_id(&self, channel_id: &str, guild_id: Option<String>) {
+        if let Ok(mut cache) = self.guild_cache.lock() {
+            cache.insert(channel_id.to_string(), guild_id);
+        }
+    }
+
+    /// Run ALL `ActionSendCommand` nodes of a scenario, in node
+    /// order, and return the last command's result (a message id for
+    /// prefix commands, a summary for slash). Retry safety: a
+    /// "defer:" error (rate limit / cooldown) means the run is
+    /// retried later — safe only while nothing has run yet. Once a
+    /// command already succeeded in this firing, a later command's
+    /// "defer:" is demoted to a hard error (run consumed, failure
+    /// row, no retry) so the earlier command is never sent twice.
+    /// "skip:" / hard errors already consume the run, so they pass
+    /// through unchanged.
+    async fn send_commands(
+        &self,
+        scenario: &Scenario,
+        cmd_nodes: &[&Node],
+        sender: &MessageSender,
+        username: &str,
+        server_name: &str,
+        antiban: &AntiBanConfig,
+    ) -> Result<String, String> {
+        let mut last_ok = String::new();
+        let mut ran = 0usize;
+        for node in cmd_nodes {
+            let cfg = CommandConfig::from_node(node);
+            match self
+                .send_command(scenario, &cfg, sender, username, server_name, antiban)
+                .await
+            {
+                Ok(summary) => {
+                    last_ok = summary;
+                    ran += 1;
+                }
+                Err(e) => {
+                    return Err(demote_defer_after_partial(ran, e));
+                }
+            }
+        }
+        Ok(last_ok)
+    }
+
+    /// Execute one `ActionSendCommand` node (one config).
     /// Prefix commands flow through the normal message pipeline
     /// (template vars, sanitize, slot, typing, retry, auto-delete,
     /// auto-break) — but NOT Smart Templates variation, which would
@@ -1662,11 +1745,23 @@ impl Engine {
             return Err("đã bấm dừng khẩn cấp trong lúc chờ".into());
         }
         // Guild of the channel (None for DMs — the payload omits it).
-        let guild_id = match client.get_channel(&scenario.channel_id).await {
-            Ok(ch) => ch.guild_id,
-            Err(e) => {
-                return Err(format!("không đọc được kênh cho lệnh slash: {e}"));
-            }
+        // Session cache first: a failed channel read must not fail
+        // the whole send when a previous firing already resolved it.
+        let guild_id = match self.cached_guild_id(&scenario.channel_id) {
+            Some(g) => g,
+            None => match client.get_channel(&scenario.channel_id).await {
+                Ok(ch) => {
+                    let g = ch.guild_id.clone();
+                    self.cache_guild_id(&scenario.channel_id, g.clone());
+                    g
+                }
+                Err(e) => match self.cached_guild_id(&scenario.channel_id) {
+                    Some(g) => g,
+                    None => {
+                        return Err(format!("không đọc được kênh cho lệnh slash: {e}"));
+                    }
+                },
+            },
         };
         // Command ID / version: config first, else auto-resolve by name.
         let (command_id, version) = if !cfg.command_id.trim().is_empty() {
@@ -1716,12 +1811,8 @@ impl Engine {
                 }
             }
         };
-        // Options: name/type/value triples from the node config.
-        let options: Vec<(String, u8, String)> = cfg
-            .options
-            .iter()
-            .map(|o| (o.name.clone(), o.kind, o.value.clone()))
-            .collect();
+        // Options: the node's `SlashOption`s (nested for subcommands);
+        // a bad leaf value fails here, before anything reaches Discord.
         let payload = build_interaction_payload(
             cfg.application_id.trim(),
             guild_id.as_deref(),
@@ -1731,8 +1822,9 @@ impl Engine {
             &command_id,
             cfg.name.trim(),
             &version,
-            &options,
-        );
+            &cfg.options,
+        )
+        .map_err(|e| format!("lệnh slash không hợp lệ: {e}"))?;
         // Retry like a message send: 429 waits, 401/403 stop at once.
         let mut attempt = 0;
         loop {
@@ -2197,6 +2289,35 @@ mod tests {
             BroadcastOutcome::Failed(detail) => assert!(detail.contains("a: boom")),
             _ => panic!("expected Failed"),
         }
+    }
+
+    #[test]
+    fn demote_defer_after_partial_never_retries_a_ran_command() {
+        // Nothing ran yet: a "defer:" passes through untouched, so
+        // the run retries later (same as a single-command firing).
+        assert_eq!(
+            demote_defer_after_partial(0, "defer: cooling down".to_string()),
+            "defer: cooling down"
+        );
+        // One command already ran: the "defer:" loses its prefix, so
+        // the run is consumed as a hard failure instead of retrying
+        // (which would send the first command twice).
+        let demoted = demote_defer_after_partial(1, "defer: Discord giới hạn".to_string());
+        assert!(
+            !demoted.starts_with("defer:"),
+            "demoted error must not retry: {demoted}"
+        );
+        assert!(demoted.contains("1 lệnh"), "detail: {demoted}");
+        assert!(demoted.contains("Discord giới hạn"), "detail: {demoted}");
+        // Hard errors and skips pass through unchanged either way.
+        assert_eq!(
+            demote_defer_after_partial(2, "network error".to_string()),
+            "network error"
+        );
+        assert_eq!(
+            demote_defer_after_partial(1, "skip: cap reached".to_string()),
+            "skip: cap reached"
+        );
     }
 
     #[test]

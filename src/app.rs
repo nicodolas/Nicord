@@ -18,7 +18,7 @@ use crate::{
     preview::{char_count, expand_shortcodes, over_limit, parse_markdown},
     scenario::{
         analyze_import, slash_option_kind_label, ApiCallConfig, CommandConfig, Node, NodeKind,
-        Scenario, Schedule, SlashOption, SLASH_OPTION_KINDS,
+        Scenario, Schedule, SlashOption, SLASH_LEAF_OPTION_KINDS, SLASH_OPTION_KINDS,
     },
     scheduler::{channels_violation, format_bytes, Engine},
     secret_store::{
@@ -5679,14 +5679,23 @@ impl NicordApp {
             });
             ui.label("Tham số:");
             let mut opt_remove: Option<usize> = None;
-            for (oi, opt) in cfg.options.iter_mut().enumerate() {
+            let mut child_remove: Option<(usize, usize)> = None;
+            let mut child_add: Option<(usize, u8)> = None;
+            for oi in 0..cfg.options.len() {
+                let top_kind = cfg.options[oi].kind;
+                let is_container = matches!(top_kind, 1 | 2);
                 // Wrapped: name + kind + value + remove exceeds
                 // the editor column at narrow windows (same
                 // ScrollArea feedback-loop class).
                 ui.horizontal_wrapped(|ui| {
+                    let opt = &mut cfg.options[oi];
                     ui.add(
                         egui::TextEdit::singleline(&mut opt.name)
-                            .hint_text("tên")
+                            .hint_text(if is_container {
+                                "tên lệnh con"
+                            } else {
+                                "tên"
+                            })
                             .desired_width(90.0),
                     );
                     let mut kind = opt.kind;
@@ -5697,26 +5706,115 @@ impl NicordApp {
                                 ui.selectable_value(&mut kind, *k, *label);
                             }
                         });
-                    opt.kind = kind;
-                    ui.add(
-                        egui::TextEdit::singleline(&mut opt.value)
-                            .hint_text("giá trị")
-                            .desired_width(110.0),
-                    );
+                    // Kind switched to/from a container: drop the
+                    // stale side (a container carries no value; a
+                    // leaf carries no children).
+                    if kind != opt.kind {
+                        if matches!(kind, 1 | 2) {
+                            opt.value.clear();
+                        } else {
+                            opt.options.clear();
+                        }
+                        opt.kind = kind;
+                    }
+                    if !matches!(opt.kind, 1 | 2) {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut opt.value)
+                                .hint_text("giá trị")
+                                .desired_width(110.0),
+                        );
+                    }
                     if ui.button("x").clicked() {
                         opt_remove = Some(oi);
                     }
+                });
+                if is_container {
+                    // Children, indented: leaf kinds inside a
+                    // subcommand, only subcommands inside a group.
+                    let child_kinds: &[(u8, &str)] = if top_kind == 2 {
+                        &[(1, "Lệnh con")]
+                    } else {
+                        SLASH_LEAF_OPTION_KINDS
+                    };
+                    for ci in 0..cfg.options[oi].options.len() {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.add_space(16.0);
+                            let child = &mut cfg.options[oi].options[ci];
+                            ui.add(
+                                egui::TextEdit::singleline(&mut child.name)
+                                    .hint_text("tên")
+                                    .desired_width(90.0),
+                            );
+                            let mut kind = child.kind;
+                            egui::ComboBox::from_id_salt(format!("cmd_opt_child_kind_{oi}_{ci}"))
+                                .selected_text(slash_option_kind_label(kind))
+                                .show_ui(ui, |ui| {
+                                    for (k, label) in child_kinds {
+                                        ui.selectable_value(&mut kind, *k, *label);
+                                    }
+                                });
+                            if kind != child.kind {
+                                if matches!(kind, 1 | 2) {
+                                    child.value.clear();
+                                } else {
+                                    child.options.clear();
+                                }
+                                child.kind = kind;
+                            }
+                            if !matches!(child.kind, 1 | 2) {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut child.value)
+                                        .hint_text("giá trị")
+                                        .desired_width(110.0),
+                                );
+                            }
+                            if ui.button("x").clicked() {
+                                child_remove = Some((oi, ci));
+                            }
+                        });
+                    }
+                    let (add_label, add_kind) = if top_kind == 2 {
+                        ("+ Thêm lệnh con", 1u8)
+                    } else {
+                        ("+ Thêm tham số con", 3u8)
+                    };
+                    if ui.button(add_label).clicked() {
+                        child_add = Some((oi, add_kind));
+                    }
+                }
+            }
+            if let Some((oi, ci)) = child_remove {
+                cfg.options[oi].options.remove(ci);
+            }
+            if let Some((oi, kind)) = child_add {
+                cfg.options[oi].options.push(SlashOption {
+                    kind,
+                    ..Default::default()
                 });
             }
             if let Some(oi) = opt_remove {
                 cfg.options.remove(oi);
             }
-            if ui.button("+ Thêm tham số").clicked() {
-                cfg.options.push(SlashOption::default());
-            }
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("+ Thêm tham số").clicked() {
+                    cfg.options.push(SlashOption::default());
+                }
+                if ui.button("+ Thêm lệnh con").clicked() {
+                    cfg.options.push(SlashOption {
+                        kind: 1,
+                        ..Default::default()
+                    });
+                }
+                if ui.button("+ Thêm nhóm lệnh con").clicked() {
+                    cfg.options.push(SlashOption {
+                        kind: 2,
+                        ..Default::default()
+                    });
+                }
+            });
             theme::muted(
                 ui,
-                "Lệnh slash cần Application ID của bot. Command ID để trống sẽ tự tìm theo tên; nếu không tìm được, hãy dán ID thủ công. Chỉ lệnh đầu tiên trong kịch bản được chạy mỗi lần.",
+                "Lệnh slash cần Application ID của bot. Command ID để trống sẽ tự tìm theo tên; nếu không tìm được, hãy dán ID thủ công. Mỗi lần chạy sẽ chạy tất cả các bước Gửi lệnh theo thứ tự.",
             );
         } else {
             ui.horizontal(|ui| {

@@ -154,8 +154,10 @@ node to edit it):
 - **Slash command** (`/daily`): fields `application_id` (the bot's
   application ID, required), `name`, `command_id` (optional),
   `version` (optional), `options` (list of name/type/value; types:
-  3 string, 4 integer, 5 boolean, 6 user, 7 channel, 8 role,
-  10 number). Sent via `POST /interactions` (type 2) with
+  1 subcommand, 2 subcommand group, 3 string, 4 integer, 5 boolean,
+  6 user, 7 channel, 8 role, 9 mentionable, 10 number). A
+  subcommand (1) nests leaf options; a group (2) nests subcommands
+  only. Sent via `POST /interactions` (type 2) with
   `guild_id` (resolved from the channel via `GET /channels/{id}`;
   omitted for DMs), `session_id`, and a snowflake nonce.
 
@@ -181,10 +183,17 @@ exist.
 
 Slash invocations count toward the 300/day cap and `sent_today`
 (logged with status `sent`, detail `slash /name`) and run the Auto
-Break layer. One scheduled firing runs exactly the FIRST command
-node in a scenario (message nodes are ignored when a command node
-exists) — running several commands per firing would duplicate earlier
-commands when a later one fails and the run is retried.
+Break layer. One scheduled firing runs ALL command nodes in a
+scenario, in node order (message nodes are ignored when a command
+node exists). Retry safety: a `defer:` error (rate limit /
+cooldown) retries the run later — but only while nothing has run
+yet. Once a command already succeeded in this firing, a later
+command's `defer:` is demoted to a hard error (run consumed,
+failure row, no retry) so the earlier command is never sent twice;
+`skip:` / hard errors already consume the run. Each command counts
+toward the daily cap; the cap is checked at firing start, so a
+multi-command firing can overshoot the cap by at most the number of
+commands in that firing.
 
 What the user must provide for slash: the bot's Application ID
 (from the bot's Discord developer page / the app's info); the
@@ -204,35 +213,45 @@ send). Findings, all addressed or documented:
   parses to the default (empty name), which validation rejects
   — a corrupt row can never send a bare prefix.
 - Slash options are now validated: non-empty names, type codes
-  limited to the supported set (3, 4, 5, 6, 7, 8, 10), no
-  duplicate names (case-insensitive). Previously a bad option
-  produced a malformed payload and a cryptic Discord 400.
+  limited to the supported set (1, 2, 3, 4, 5, 6, 7, 8, 9, 10),
+  no duplicate names (case-insensitive, per level including inside
+  subcommands). Containers (1/2) must carry ≥1 child and no value;
+  a subcommand's children are leaf kinds only, a group's children
+  are subcommands only. Leaf number/bool values must parse —
+  previously a bad option produced a malformed payload and a
+  cryptic Discord 400, and a bad integer silently became 0.
   Prefix commands ignore options, so stale options on a prefix
   config do not fail validation. Note: a scenario saved with an
   empty option row now fails validation with a clear error
   instead of silently dropping that option — fill in or remove
   the row.
-- Known limits (by design, unchanged): one firing runs only the
-  FIRST command node; no subcommand/subcommand-group option
-  types (1/2); no component interactions (the bot's reply
-  buttons/selects cannot be clicked); option values that fail
-  to parse fall back silently (bad integer → 0, bad number →
-  0.0, unrecognized boolean → false); a failed channel read
-  fails the whole slash send (no guild cache).
-- Test coverage: validation, prefix composition, first-node
-  routing, fail-closed malformed configs, interaction payload
-  shapes (guild/DM, version, typed options), search-response
-  parsing, option-value fallbacks, nonce shape, and gateway
-  payload/sequence parsing. The live retry loop and gateway
-  session flow have no unit tests (no mock client) and need
-  the live checks below.
+- Known limits (by design, unchanged): type 11 (attachment) is
+  NOT supported — the interaction endpoint sends JSON only, and
+  attachments would need a multipart upload; validation rejects
+  it with a clear message. No component interactions (the bot's
+  reply buttons/selects cannot be clicked). A failed channel read
+  falls back to the session-only guild cache (resolved on an
+  earlier firing); only when both are missing does the slash send
+  fail.
+- Test coverage: validation, prefix composition, command-node
+  routing (all nodes in order), the defer-demotion rule
+  (`demote_defer_after_partial`), fail-closed malformed configs,
+  interaction payload shapes (guild/DM, version, typed options,
+  nested subcommand/group, fail-fast bad values), search-response
+  parsing, nonce shape, and gateway payload/sequence parsing. The
+  live retry loop and gateway session flow have no unit tests (no
+  mock client) and need the live checks below.
 - **Live verification checklist (user, account mode):** one
   real prefix command; one real slash command with auto-resolved
   ID; one slash with a manually pasted Command ID; one slash
-  with options of several types; one unknown command name (must
-  fail with the "paste its Command ID" error); one run with the
-  gateway unreachable (must fail with the gateway error while
-  message sends keep working).
+  with options of several types; one slash with a subcommand
+  (`/music play <song>`); one slash with a subcommand group
+  (`/settings admin set …`); one firing with two command nodes
+  (both must run, in order); one slash with a bad integer value
+  (must fail with the parameter name, not send 0); one unknown
+  command name (must fail with the "paste its Command ID" error);
+  one run with the gateway unreachable (must fail with the gateway
+  error while message sends keep working).
 
 ## Scheduler — fires exactly once per scheduled time
 
@@ -245,7 +264,7 @@ a real 5-field parser (minute hour day month weekday), not hourly.
 
 Node execution: the scheduler runs Send Message / Send Embed nodes (first
 non-empty content in node order wins over the message list), Send Command
-nodes (first command node wins over message nodes), UtilityWait
+nodes (all command nodes run in order, winning over message nodes), UtilityWait
 (delay before sending), ConditionTimeWindow (skip outside the window),
 UtilityRandomPick (rotation) and UtilitySetVariable (template vars). Any
 other node kind is rejected by `Scenario::validate` with a clear error —

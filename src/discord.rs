@@ -10,6 +10,7 @@
 //! channel picker. No email/password login anywhere — the user pastes their
 //! own token, which is stored encrypted (see crypto.rs).
 
+use crate::scenario::SlashOption;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 
@@ -723,24 +724,63 @@ pub fn parse_application_commands(v: &serde_json::Value) -> Vec<SlashCommandInfo
 
 /// Convert one slash option's raw text value to its JSON value, per
 /// Discord option type code (3 string, 4 integer, 5 boolean, 6 user,
-/// 7 channel, 8 role, 10 number). Unparseable numbers/bools fall back
-/// to 0 / false rather than failing the whole invocation.
-pub fn slash_option_value(kind: u8, raw: &str) -> serde_json::Value {
+/// 7 channel, 8 role, 9 mentionable, 10 number). Unparseable
+/// numbers/bools are an ERROR naming the parameter (fail fast)
+/// instead of silently sending 0 / 0.0 / false.
+pub fn slash_option_value(kind: u8, name: &str, raw: &str) -> Result<serde_json::Value, String> {
     let raw = raw.trim();
     match kind {
-        4 => serde_json::Value::from(raw.parse::<i64>().unwrap_or(0)),
-        10 => serde_json::Value::from(raw.parse::<f64>().unwrap_or(0.0)),
-        5 => serde_json::Value::from(matches!(
-            raw.to_ascii_lowercase().as_str(),
-            "true" | "1" | "yes" | "co" | "có"
-        )),
-        _ => serde_json::Value::from(raw),
+        4 => raw
+            .parse::<i64>()
+            .map(serde_json::Value::from)
+            .map_err(|_| format!("tham số '{name}' không phải số nguyên ('{raw}')")),
+        10 => raw
+            .parse::<f64>()
+            .map(serde_json::Value::from)
+            .map_err(|_| format!("tham số '{name}' không phải số thực ('{raw}')")),
+        5 => match raw.to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "co" | "có" => Ok(serde_json::Value::from(true)),
+            "false" | "0" | "no" | "không" | "khong" => Ok(serde_json::Value::from(false)),
+            _ => Err(format!("tham số '{name}' không phải đúng/sai ('{raw}')")),
+        },
+        _ => Ok(serde_json::Value::from(raw)),
     }
+}
+
+/// Serialize one level of slash options, recursively: containers
+/// (kind 1 subcommand / 2 group) carry nested `options` and no
+/// `value`; leaves carry a parsed `value`. Empty-named options are
+/// skipped (validation rejects them first; this is defence in depth
+/// for hand-built payloads).
+fn serialize_slash_options(options: &[SlashOption]) -> Result<Vec<serde_json::Value>, String> {
+    let mut out = Vec::new();
+    for opt in options {
+        let name = opt.name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        if crate::scenario::is_container_option_kind(opt.kind) {
+            out.push(serde_json::json!({
+                "name": name,
+                "type": opt.kind,
+                "options": serialize_slash_options(&opt.options)?,
+            }));
+        } else {
+            out.push(serde_json::json!({
+                "name": name,
+                "type": opt.kind,
+                "value": slash_option_value(opt.kind, name, &opt.value)?,
+            }));
+        }
+    }
+    Ok(out)
 }
 
 /// Build a slash-command interaction payload (type 2). `command_id`
 /// must already be resolved (from config or the search endpoint).
 /// `guild_id` is None for DM channels — the field is then omitted.
+/// Returns Err (naming the parameter) when a leaf value does not
+/// parse — the send fails before anything reaches Discord.
 #[allow(clippy::too_many_arguments)]
 pub fn build_interaction_payload(
     application_id: &str,
@@ -751,19 +791,9 @@ pub fn build_interaction_payload(
     command_id: &str,
     command_name: &str,
     version: &str,
-    options: &[(String, u8, String)],
-) -> serde_json::Value {
-    let opts: Vec<serde_json::Value> = options
-        .iter()
-        .filter(|(name, _, _)| !name.trim().is_empty())
-        .map(|(name, kind, value)| {
-            serde_json::json!({
-                "name": name.trim(),
-                "type": kind,
-                "value": slash_option_value(*kind, value),
-            })
-        })
-        .collect();
+    options: &[SlashOption],
+) -> Result<serde_json::Value, String> {
+    let opts = serialize_slash_options(options)?;
     let mut data = serde_json::json!({
         "id": command_id,
         "name": command_name,
@@ -786,7 +816,7 @@ pub fn build_interaction_payload(
             payload["guild_id"] = serde_json::Value::from(g);
         }
     }
-    payload
+    Ok(payload)
 }
 
 /// Interaction nonce: a snowflake-style unique decimal string
@@ -905,15 +935,25 @@ mod tests {
         assert!(!voice.is_text());
     }
 
+    fn opt(name: &str, kind: u8, value: &str) -> SlashOption {
+        SlashOption {
+            name: name.to_string(),
+            kind,
+            value: value.to_string(),
+            options: Vec::new(),
+        }
+    }
+
     #[test]
     fn slash_payload_has_type_2_and_typed_options() {
         let options = vec![
-            ("user".to_string(), 6u8, "123456".to_string()),
-            ("count".to_string(), 4u8, "5".to_string()),
-            ("amount".to_string(), 10u8, "2.5".to_string()),
-            ("loud".to_string(), 5u8, "true".to_string()),
-            ("text".to_string(), 3u8, "hello".to_string()),
-            ("".to_string(), 3u8, "nameless skipped".to_string()),
+            opt("user", 6, "123456"),
+            opt("count", 4, "5"),
+            opt("amount", 10, "2.5"),
+            opt("loud", 5, "true"),
+            opt("text", 3, "hello"),
+            opt("target", 9, "998877"),
+            opt("", 3, "nameless skipped"),
         ];
         let p = build_interaction_payload(
             "app1",
@@ -925,7 +965,8 @@ mod tests {
             "daily",
             "v3",
             &options,
-        );
+        )
+        .unwrap();
         assert_eq!(p["type"], 2);
         assert_eq!(p["application_id"], "app1");
         assert_eq!(p["guild_id"], "guild1");
@@ -937,12 +978,16 @@ mod tests {
         assert_eq!(p["data"]["type"], 1);
         assert_eq!(p["data"]["version"], "v3");
         let opts = p["data"]["options"].as_array().unwrap();
-        assert_eq!(opts.len(), 5, "empty-named option is skipped");
+        assert_eq!(opts.len(), 6, "empty-named option is skipped");
         assert_eq!(opts[0]["value"], "123456");
         assert_eq!(opts[1]["value"], 5);
         assert_eq!(opts[2]["value"], 2.5);
         assert_eq!(opts[3]["value"], true);
         assert_eq!(opts[4]["value"], "hello");
+        assert_eq!(
+            opts[5]["value"], "998877",
+            "mentionable stays a snowflake string"
+        );
         // DM channel: no guild_id field at all.
         let dm = build_interaction_payload(
             "app1",
@@ -954,19 +999,103 @@ mod tests {
             "daily",
             "",
             &[],
-        );
+        )
+        .unwrap();
         assert!(dm.get("guild_id").is_none());
         assert!(dm["data"].get("version").is_none(), "empty version omitted");
     }
 
     #[test]
-    fn slash_option_values_fall_back_gracefully() {
-        assert_eq!(slash_option_value(4, "abc"), 0);
-        assert_eq!(slash_option_value(10, "xyz"), 0.0);
-        assert_eq!(slash_option_value(5, "false"), false);
-        assert_eq!(slash_option_value(5, "có"), true);
-        assert_eq!(slash_option_value(3, " hi "), "hi");
-        assert_eq!(slash_option_value(7, "998877"), "998877");
+    fn slash_payload_nests_subcommands_and_groups() {
+        // /music play <song> + /music stop, and /settings admin set <key> <value>.
+        let options = vec![
+            SlashOption {
+                name: "play".into(),
+                kind: 1,
+                value: String::new(),
+                options: vec![opt("song", 3, "never gonna")],
+            },
+            SlashOption {
+                name: "admin".into(),
+                kind: 2,
+                value: String::new(),
+                options: vec![SlashOption {
+                    name: "set".into(),
+                    kind: 1,
+                    value: String::new(),
+                    options: vec![opt("key", 3, "volume"), opt("value", 4, "7")],
+                }],
+            },
+        ];
+        let p = build_interaction_payload(
+            "app1",
+            Some("guild1"),
+            "chan1",
+            "sess1",
+            "nonce1",
+            "cmd1",
+            "music",
+            "",
+            &options,
+        )
+        .unwrap();
+        let opts = p["data"]["options"].as_array().unwrap();
+        assert_eq!(opts.len(), 2);
+        // A subcommand carries nested options and NO value.
+        assert_eq!(opts[0]["type"], 1);
+        assert!(opts[0].get("value").is_none(), "container has no value");
+        let play_opts = opts[0]["options"].as_array().unwrap();
+        assert_eq!(play_opts.len(), 1);
+        assert_eq!(play_opts[0]["name"], "song");
+        assert_eq!(play_opts[0]["value"], "never gonna");
+        // A group nests subcommands, which nest leaves.
+        assert_eq!(opts[1]["type"], 2);
+        assert!(opts[1].get("value").is_none(), "group has no value");
+        let admin_opts = opts[1]["options"].as_array().unwrap();
+        assert_eq!(admin_opts.len(), 1);
+        assert_eq!(admin_opts[0]["type"], 1);
+        let set_opts = admin_opts[0]["options"].as_array().unwrap();
+        assert_eq!(set_opts.len(), 2);
+        assert_eq!(set_opts[1]["value"], 7);
+    }
+
+    #[test]
+    fn slash_payload_fails_on_bad_leaf_value() {
+        let options = vec![opt("count", 4, "abc")];
+        let err = build_interaction_payload(
+            "app1",
+            Some("guild1"),
+            "chan1",
+            "sess1",
+            "nonce1",
+            "cmd1",
+            "daily",
+            "",
+            &options,
+        )
+        .unwrap_err();
+        assert!(err.contains("count"), "error names the parameter: {err}");
+        assert!(err.contains("số nguyên"), "error says what is wrong: {err}");
+    }
+
+    #[test]
+    fn slash_option_values_fail_fast() {
+        // Bad numbers/bools are errors naming the parameter — never a
+        // silent 0 / 0.0 / false.
+        assert!(slash_option_value(4, "count", "abc").is_err());
+        assert!(slash_option_value(10, "amount", "xyz").is_err());
+        assert!(slash_option_value(5, "loud", "maybe").is_err());
+        let err = slash_option_value(4, "count", "abc").unwrap_err();
+        assert!(err.contains("count"), "error names the parameter: {err}");
+        // Good values still parse.
+        assert_eq!(slash_option_value(4, "count", "5").unwrap(), 5);
+        assert_eq!(slash_option_value(10, "amount", "2.5").unwrap(), 2.5);
+        assert_eq!(slash_option_value(5, "loud", "false").unwrap(), false);
+        assert_eq!(slash_option_value(5, "loud", "có").unwrap(), true);
+        assert_eq!(slash_option_value(5, "loud", "không").unwrap(), false);
+        assert_eq!(slash_option_value(3, "text", " hi ").unwrap(), "hi");
+        assert_eq!(slash_option_value(7, "chan", "998877").unwrap(), "998877");
+        assert_eq!(slash_option_value(9, "target", "112233").unwrap(), "112233");
     }
 
     #[test]

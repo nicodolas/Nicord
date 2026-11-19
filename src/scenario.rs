@@ -705,18 +705,35 @@ impl Node {
 // ---------------------------------------------------------------------------
 
 /// Discord application-command option type codes.
-/// 3 string, 4 integer, 5 boolean, 6 user, 7 channel, 8 role, 10 number.
+/// 1 subcommand, 2 subcommand group, 3 string, 4 integer,
+/// 5 boolean, 6 user, 7 channel, 8 role, 9 mentionable, 10 number.
+/// 11 (attachment) is NOT supported: the interaction endpoint sends
+/// JSON only, and attachments would need a multipart upload.
 pub fn slash_option_kind_label(kind: u8) -> &'static str {
     match kind {
+        1 => "Lệnh con",
+        2 => "Nhóm lệnh con",
         3 => "Chuỗi",
         4 => "Số nguyên",
         5 => "Đúng / Sai",
         6 => "Người dùng",
         7 => "Kênh",
         8 => "Vai trò",
+        9 => "Nhắc đến",
         10 => "Số thực",
         _ => "Chuỗi",
     }
+}
+
+/// True for container kinds (subcommand / subcommand group): they
+/// carry nested options and no value of their own.
+pub fn is_container_option_kind(kind: u8) -> bool {
+    matches!(kind, 1 | 2)
+}
+
+/// True for leaf kinds (a real parameter with a value).
+pub fn is_leaf_option_kind(kind: u8) -> bool {
+    matches!(kind, 3..=10)
 }
 
 /// All option kinds the editor offers, in UI order.
@@ -728,10 +745,28 @@ pub const SLASH_OPTION_KINDS: &[(u8, &str)] = &[
     (6, "Người dùng"),
     (7, "Kênh"),
     (8, "Vai trò"),
+    (9, "Nhắc đến"),
+    (1, "Lệnh con"),
+    (2, "Nhóm lệnh con"),
+];
+
+/// Leaf-only kinds: the editor offers these inside a subcommand.
+/// A group only offers kind 1 (see `SLASH_OPTION_KINDS`).
+pub const SLASH_LEAF_OPTION_KINDS: &[(u8, &str)] = &[
+    (3, "Chuỗi"),
+    (4, "Số nguyên"),
+    (10, "Số thực"),
+    (5, "Đúng / Sai"),
+    (6, "Người dùng"),
+    (7, "Kênh"),
+    (8, "Vai trò"),
+    (9, "Nhắc đến"),
 ];
 
 /// One slash-command parameter (name + type + raw value; the value is
-/// parsed per type when the interaction payload is built).
+/// parsed per type when the interaction payload is built). Kinds 1
+/// (subcommand) and 2 (subcommand group) are containers: they carry
+/// nested `options` and no value of their own.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SlashOption {
     #[serde(default)]
@@ -740,9 +775,15 @@ pub struct SlashOption {
     #[serde(default = "default_slash_option_kind")]
     pub kind: u8,
     /// Raw value as typed by the user (number/bool parsed at send time;
-    /// user/channel/role values are snowflake IDs as text).
+    /// user/channel/role values are snowflake IDs as text). Must be
+    /// empty for container kinds (1/2).
     #[serde(default)]
     pub value: String,
+    /// Nested options for a subcommand (kind 1) or group (kind 2).
+    /// Empty for leaf kinds. `serde(default)` keeps configs saved
+    /// before nesting existed parsing as empty.
+    #[serde(default)]
+    pub options: Vec<SlashOption>,
 }
 
 impl Default for SlashOption {
@@ -753,6 +794,7 @@ impl Default for SlashOption {
             // the serde default fn only applies on deserialization.
             kind: default_slash_option_kind(),
             value: String::new(),
+            options: Vec::new(),
         }
     }
 }
@@ -877,29 +919,85 @@ impl CommandConfig {
         // Prefix commands ignore options, so stale options on a prefix
         // config must not fail it — only slash options are checked.
         if self.is_slash() {
-            let mut seen: Vec<String> = Vec::new();
-            for opt in &self.options {
-                let name = opt.name.trim();
-                if name.is_empty() {
-                    return Err(
-                        "Lệnh slash có tham số tên trống — điền tên hoặc xóa hàng đó".into(),
-                    );
-                }
-                if !SLASH_OPTION_KINDS.iter().any(|(k, _)| *k == opt.kind) {
-                    return Err(format!(
-                        "Tham số slash '{name}' có mã loại không hỗ trợ {}",
-                        opt.kind
-                    ));
-                }
-                let key = name.to_lowercase();
-                if seen.contains(&key) {
-                    return Err(format!("Lệnh slash có tên tham số trùng '{name}'"));
-                }
-                seen.push(key);
-            }
+            validate_slash_options(&self.options)?;
         }
         Ok(())
     }
+}
+
+/// Validate one level of slash options, recursively: names non-empty
+/// and unique among siblings (case-insensitive), kinds known,
+/// containers (1/2) carry ≥1 child and no value, a subcommand's
+/// children are leaf kinds only, a group's children are subcommands
+/// only, leaf kinds carry no children, and leaf number/bool values
+/// must parse (fail fast with the parameter name instead of sending
+/// a silent 0/false at fire time).
+fn validate_slash_options(options: &[SlashOption]) -> Result<(), String> {
+    let mut seen: Vec<String> = Vec::new();
+    for opt in options {
+        let name = opt.name.trim();
+        if name.is_empty() {
+            return Err("Lệnh slash có tham số tên trống — điền tên hoặc xóa hàng đó".into());
+        }
+        let key = name.to_lowercase();
+        if seen.contains(&key) {
+            return Err(format!("Lệnh slash có tên tham số trùng '{name}'"));
+        }
+        seen.push(key);
+        if opt.kind == 11 {
+            return Err(format!(
+                "Tham số slash '{name}' là loại đính kèm (11) — chưa hỗ trợ, vì gửi lệnh đi kèm file cần tải lên đa phần (multipart) mà đường gửi tương tác hiện chỉ gửi JSON"
+            ));
+        }
+        if is_container_option_kind(opt.kind) {
+            if !opt.value.trim().is_empty() {
+                return Err(format!(
+                    "Lệnh con '{name}' không nhận giá trị — giá trị nằm ở tham số con bên trong"
+                ));
+            }
+            if opt.options.is_empty() {
+                let what = if opt.kind == 1 {
+                    "Lệnh con"
+                } else {
+                    "Nhóm lệnh con"
+                };
+                return Err(format!("{what} '{name}' cần ít nhất một tham số con"));
+            }
+            if opt.kind == 1 {
+                for child in &opt.options {
+                    if is_container_option_kind(child.kind) {
+                        return Err(format!(
+                            "Trong lệnh con '{name}' chỉ được tham số thường — không được lồng lệnh con trong lệnh con"
+                        ));
+                    }
+                }
+            } else {
+                for child in &opt.options {
+                    if child.kind != 1 {
+                        return Err(format!(
+                            "Trong nhóm '{name}' chỉ được lệnh con (loại 1) — tham số thường phải nằm trong lệnh con"
+                        ));
+                    }
+                }
+            }
+            validate_slash_options(&opt.options)?;
+        } else if is_leaf_option_kind(opt.kind) {
+            if !opt.options.is_empty() {
+                return Err(format!(
+                    "Tham số '{name}' là loại thường nên không được có tham số con — chuyển nó sang Lệnh con hoặc xóa các hàng con"
+                ));
+            }
+            // Fail fast on unparseable leaf values (same check the
+            // payload builder runs at send time).
+            crate::discord::slash_option_value(opt.kind, name, &opt.value)?;
+        } else {
+            return Err(format!(
+                "Tham số slash '{name}' có mã loại không hỗ trợ {}",
+                opt.kind
+            ));
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1495,14 +1593,23 @@ impl Scenario {
         Ok(())
     }
 
-    /// First `ActionSendCommand` node, if any. One scheduled firing
-    /// runs exactly that node (and ignores message nodes) — running
-    /// several commands per firing would duplicate earlier commands
-    /// when a later one fails and the run is retried.
+    /// First `ActionSendCommand` node, if any. Kept for validation
+    /// (message nodes are ignored when a command exists) — the
+    /// scheduler runs ALL command nodes via `command_nodes`.
     pub fn command_node(&self) -> Option<&Node> {
         self.nodes
             .iter()
             .find(|n| n.kind == NodeKind::ActionSendCommand)
+    }
+
+    /// All `ActionSendCommand` nodes, in node order. One scheduled
+    /// firing runs all of them in order (see `Engine::send_commands`
+    /// in scheduler.rs for the retry-safety rule).
+    pub fn command_nodes(&self) -> Vec<&Node> {
+        self.nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::ActionSendCommand)
+            .collect()
     }
 
     /// Delete one message from the rotation. Returns false when the
@@ -2841,6 +2948,24 @@ mod tests {
         assert!(cfg.is_slash());
     }
 
+    fn cmd_opt(name: &str, kind: u8, value: &str) -> SlashOption {
+        SlashOption {
+            name: name.to_string(),
+            kind,
+            value: value.to_string(),
+            options: Vec::new(),
+        }
+    }
+
+    fn cmd_container(name: &str, kind: u8, children: Vec<SlashOption>) -> SlashOption {
+        SlashOption {
+            name: name.to_string(),
+            kind,
+            value: String::new(),
+            options: children,
+        }
+    }
+
     #[test]
     fn slash_option_validation_rejects_bad_options() {
         // H-CMD: slash options fail fast with clear errors.
@@ -2858,71 +2983,36 @@ mod tests {
         }];
         let err = cfg.validate().unwrap_err();
         assert!(err.contains("tên trống"), "unexpected error: {err}");
-        // Unsupported type codes (1/2 are subcommands, 0/9 invalid).
-        for bad in [0u8, 1, 2, 9, 11] {
-            cfg.options = vec![SlashOption {
-                name: "count".into(),
-                kind: bad,
-                value: "1".into(),
-            }];
+        // Unsupported type codes.
+        for bad in [0u8, 12, 255] {
+            cfg.options = vec![cmd_opt("count", bad, "1")];
             let err = cfg.validate().unwrap_err();
             assert!(
                 err.contains("mã loại không hỗ trợ"),
                 "kind {bad}: unexpected error: {err}"
             );
         }
+        // Attachment (11) is blocked with its own message.
+        cfg.options = vec![cmd_opt("file", 11, "x")];
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("chưa hỗ trợ"), "unexpected error: {err}");
+        // Mentionable (9) is accepted.
+        cfg.options = vec![cmd_opt("target", 9, "123")];
+        assert!(cfg.validate().is_ok());
         // Duplicate names, including a case variant.
-        cfg.options = vec![
-            SlashOption {
-                name: "count".into(),
-                kind: 4,
-                value: "1".into(),
-            },
-            SlashOption {
-                name: "Count".into(),
-                kind: 4,
-                value: "2".into(),
-            },
-        ];
+        cfg.options = vec![cmd_opt("count", 4, "1"), cmd_opt("Count", 4, "2")];
         let err = cfg.validate().unwrap_err();
         assert!(err.contains("trùng"), "unexpected error: {err}");
-        // Every supported kind passes together.
+        // Every supported leaf kind passes together.
         cfg.options = vec![
-            SlashOption {
-                name: "text".into(),
-                kind: 3,
-                value: "hi".into(),
-            },
-            SlashOption {
-                name: "n".into(),
-                kind: 4,
-                value: "5".into(),
-            },
-            SlashOption {
-                name: "f".into(),
-                kind: 10,
-                value: "2.5".into(),
-            },
-            SlashOption {
-                name: "b".into(),
-                kind: 5,
-                value: "true".into(),
-            },
-            SlashOption {
-                name: "u".into(),
-                kind: 6,
-                value: "123".into(),
-            },
-            SlashOption {
-                name: "ch".into(),
-                kind: 7,
-                value: "456".into(),
-            },
-            SlashOption {
-                name: "r".into(),
-                kind: 8,
-                value: "789".into(),
-            },
+            cmd_opt("text", 3, "hi"),
+            cmd_opt("n", 4, "5"),
+            cmd_opt("f", 10, "2.5"),
+            cmd_opt("b", 5, "true"),
+            cmd_opt("u", 6, "123"),
+            cmd_opt("ch", 7, "456"),
+            cmd_opt("r", 8, "789"),
+            cmd_opt("m", 9, "999"),
         ];
         assert!(cfg.validate().is_ok());
         // Prefix commands ignore options: junk options must not fail.
@@ -2931,13 +3021,99 @@ mod tests {
             name: "".into(),
             kind: 0,
             value: "".into(),
+            options: vec![],
         }];
         assert!(cfg.validate().is_ok());
     }
 
     #[test]
+    fn slash_subcommand_nesting_validates() {
+        let mut cfg = CommandConfig {
+            kind: "slash".into(),
+            name: "music".into(),
+            application_id: "123456789".into(),
+            ..Default::default()
+        };
+        // Valid: subcommand with leaf options + group of subcommands.
+        cfg.options = vec![
+            cmd_container("play", 1, vec![cmd_opt("song", 3, "x")]),
+            cmd_container(
+                "admin",
+                2,
+                vec![cmd_container(
+                    "set",
+                    1,
+                    vec![cmd_opt("key", 3, "volume"), cmd_opt("value", 4, "7")],
+                )],
+            ),
+        ];
+        assert!(cfg.validate().is_ok());
+        // A container with no children fails.
+        cfg.options = vec![cmd_container("play", 1, vec![])];
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.contains("ít nhất một tham số con"),
+            "unexpected error: {err}"
+        );
+        // A container carrying a value fails.
+        cfg.options = vec![SlashOption {
+            name: "play".into(),
+            kind: 1,
+            value: "x".into(),
+            options: vec![cmd_opt("song", 3, "x")],
+        }];
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.contains("không nhận giá trị"),
+            "unexpected error: {err}"
+        );
+        // A group may only contain subcommands (no leaf directly).
+        cfg.options = vec![cmd_container("admin", 2, vec![cmd_opt("key", 3, "x")])];
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("chỉ được lệnh con"), "unexpected error: {err}");
+        // A subcommand may not nest another container.
+        cfg.options = vec![cmd_container(
+            "play",
+            1,
+            vec![cmd_container("deep", 1, vec![cmd_opt("x", 3, "y")])],
+        )];
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.contains("chỉ được tham số thường"),
+            "unexpected error: {err}"
+        );
+        // A leaf carrying children fails.
+        cfg.options = vec![SlashOption {
+            name: "count".into(),
+            kind: 4,
+            value: "1".into(),
+            options: vec![cmd_opt("x", 3, "y")],
+        }];
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.contains("không được có tham số con"),
+            "unexpected error: {err}"
+        );
+        // Duplicate names inside a subcommand fail too.
+        cfg.options = vec![cmd_container(
+            "play",
+            1,
+            vec![cmd_opt("song", 3, "a"), cmd_opt("Song", 3, "b")],
+        )];
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("trùng"), "unexpected error: {err}");
+        // A bad leaf value fails fast, naming the parameter.
+        cfg.options = vec![cmd_opt("count", 4, "abc")];
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("count"), "unexpected error: {err}");
+        assert!(err.contains("số nguyên"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn command_node_returns_first_command_node_only() {
-        // H-CMD: one firing runs exactly the FIRST command node.
+        // H-CMD: `command_node()` finds the first command node, and
+        // `command_nodes()` returns all of them in node order (one
+        // firing runs all of them).
         let mut s = Scenario::new("cmd");
         assert!(s.command_node().is_none());
         let mut first = Node::new(NodeKind::ActionSendCommand);
@@ -2948,6 +3124,10 @@ mod tests {
         s.nodes.push(second);
         let found = s.command_node().unwrap();
         assert_eq!(CommandConfig::from_node(found).name, "first");
+        let all = s.command_nodes();
+        assert_eq!(all.len(), 2);
+        assert_eq!(CommandConfig::from_node(all[0]).name, "first");
+        assert_eq!(CommandConfig::from_node(all[1]).name, "second");
     }
 
     #[test]
@@ -3323,12 +3503,15 @@ mod tests {
 
     #[test]
     fn slash_option_kind_labels() {
+        assert_eq!(slash_option_kind_label(1), "Lệnh con");
+        assert_eq!(slash_option_kind_label(2), "Nhóm lệnh con");
         assert_eq!(slash_option_kind_label(3), "Chuỗi");
         assert_eq!(slash_option_kind_label(4), "Số nguyên");
         assert_eq!(slash_option_kind_label(5), "Đúng / Sai");
         assert_eq!(slash_option_kind_label(6), "Người dùng");
         assert_eq!(slash_option_kind_label(7), "Kênh");
         assert_eq!(slash_option_kind_label(8), "Vai trò");
+        assert_eq!(slash_option_kind_label(9), "Nhắc đến");
         assert_eq!(slash_option_kind_label(10), "Số thực");
         assert_eq!(slash_option_kind_label(99), "Chuỗi");
     }
