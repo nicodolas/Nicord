@@ -577,29 +577,33 @@ impl NodeKind {
     pub fn is_mvp(&self) -> bool {
         self.is_executed()
     }
+    // Plain Vietnamese, no unexplained markers: the old " *" / " %"
+    // suffixes were stale (they no longer matched `is_executed()`)
+    // and nothing in the UI ever explained them. "Call API" is
+    // "Lấy dữ liệu" everywhere the user can see it.
     pub fn label(&self) -> &'static str {
         match self {
-            NodeKind::TriggerSchedule => "Kích hoạt: Theo lịch *",
-            NodeKind::TriggerManual => "Kích hoạt: Thủ công *",
+            NodeKind::TriggerSchedule => "Kích hoạt: Theo lịch",
+            NodeKind::TriggerManual => "Kích hoạt: Thủ công",
             NodeKind::TriggerMessageReceived => "Kích hoạt: Nhận tin nhắn",
             NodeKind::TriggerMemberJoin => "Kích hoạt: Thành viên mới",
-            NodeKind::ActionSendMessage => "Hành động: Gửi tin nhắn *",
-            NodeKind::ActionSendEmbed => "Hành động: Gửi embed *",
-            NodeKind::ActionSendCommand => "Hành động: Gửi lệnh *",
+            NodeKind::ActionSendMessage => "Hành động: Gửi tin nhắn",
+            NodeKind::ActionSendEmbed => "Hành động: Gửi embed",
+            NodeKind::ActionSendCommand => "Hành động: Gửi lệnh",
             NodeKind::ActionSendFile => "Hành động: Gửi file",
             NodeKind::ActionAddReaction => "Hành động: Thêm reaction",
             NodeKind::ActionReply => "Hành động: Trả lời",
             NodeKind::ActionDeleteMessage => "Hành động: Xóa tin nhắn",
-            NodeKind::ConditionKeyword => "Điều kiện: Từ khóa *",
-            NodeKind::ConditionTimeWindow => "Điều kiện: Khung giờ *",
-            NodeKind::ConditionRandom => "Điều kiện: Ngẫu nhiên %",
+            NodeKind::ConditionKeyword => "Điều kiện: Từ khóa",
+            NodeKind::ConditionTimeWindow => "Điều kiện: Khung giờ",
+            NodeKind::ConditionRandom => "Điều kiện: Ngẫu nhiên",
             NodeKind::ConditionRole => "Điều kiện: Vai trò",
             NodeKind::ConditionVariable => "Điều kiện: Biến",
-            NodeKind::UtilityWait => "Tiện ích: Chờ *",
-            NodeKind::UtilityRandomPick => "Tiện ích: Chọn ngẫu nhiên *",
-            NodeKind::UtilitySetVariable => "Tiện ích: Đặt biến *",
+            NodeKind::UtilityWait => "Tiện ích: Chờ",
+            NodeKind::UtilityRandomPick => "Tiện ích: Chọn ngẫu nhiên",
+            NodeKind::UtilitySetVariable => "Tiện ích: Đặt biến",
             NodeKind::UtilityLoop => "Tiện ích: Lặp",
-            NodeKind::UtilityCallApi => "Tiện ích: Call API",
+            NodeKind::UtilityCallApi => "Tiện ích: Lấy dữ liệu",
         }
     }
     pub fn group(&self) -> &'static str {
@@ -831,7 +835,7 @@ impl CommandConfig {
             return Err("Node Gửi lệnh cần tên lệnh".into());
         }
         if self.is_slash() && self.application_id.trim().is_empty() {
-            return Err("Lệnh slash cần Application ID của bot (dán vào phần sửa node)".into());
+            return Err("Lệnh slash cần Application ID của bot (dán vào phần sửa bước)".into());
         }
         // Prefix commands ignore options, so stale options on a prefix
         // config must not fail it — only slash options are checked.
@@ -939,31 +943,35 @@ impl ApiCallConfig {
     pub fn validate(&self) -> Result<(), String> {
         if self.url_ref.trim().is_empty() {
             return Err(
-                "Node Call API chưa có địa chỉ đã lưu — dán địa chỉ https trong phần sửa node"
+                "Bước lấy dữ liệu chưa có địa chỉ đã lưu — dán địa chỉ https trong phần sửa bước"
                     .into(),
             );
         }
         if !valid_counter_name(self.variable.trim()) {
-            return Err("Tên biến Call API phải dài 1–64 ký tự: chữ, số, '_' hoặc '-'".into());
+            return Err(
+                "Tên biến của bước lấy dữ liệu phải dài 1–64 ký tự: chữ, số, '_' hoặc '-'".into(),
+            );
         }
         let path = self.field_path.trim();
         if path.is_empty() {
-            return Err("Đường dẫn trường Call API đang trống — vd: weather.temp".into());
+            return Err(
+                "Đường dẫn trường của bước lấy dữ liệu đang trống — vd: weather.temp".into(),
+            );
         }
         if path.starts_with('.')
             || path.ends_with('.')
             || path.split('.').any(|seg| seg.trim().is_empty())
         {
             return Err(format!(
-                "Đường dẫn trường Call API '{path}' sai định dạng — dùng tên cách nhau bằng dấu chấm như weather.temp"
+                "Đường dẫn trường '{path}' của bước lấy dữ liệu sai định dạng — dùng tên cách nhau bằng dấu chấm như weather.temp"
             ));
         }
         if self.timeout_secs < 1 || self.timeout_secs > 60 {
-            return Err("Thời gian chờ Call API phải là 1–60 giây".into());
+            return Err("Thời gian chờ của bước lấy dữ liệu phải là 1–60 giây".into());
         }
         let policy = self.on_failure.trim();
         if !policy.is_empty() && policy != "skip" && policy != "empty" {
-            return Err("Chính sách lỗi Call API phải là 'skip' hoặc 'empty'".into());
+            return Err("Chính sách lỗi của bước lấy dữ liệu phải là 'skip' hoặc 'empty'".into());
         }
         Ok(())
     }
@@ -1308,34 +1316,34 @@ impl Scenario {
         for node in &self.nodes {
             if !node.kind.is_executed() {
                 return Err(format!(
-                    "Node '{}' chưa được làm trong phiên bản này — hãy xóa nó \
+                    "Bước '{}' chưa được làm trong phiên bản này — hãy xóa nó \
                      (hỗ trợ: kích hoạt Theo lịch/Thủ công, Gửi tin nhắn, Gửi embed, \
-                     Gửi lệnh, điều kiện Khung giờ, Chờ, Chọn ngẫu nhiên, Đặt biến, Call API)",
+                     Gửi lệnh, điều kiện Khung giờ, Chờ, Chọn ngẫu nhiên, Đặt biến, Lấy dữ liệu)",
                     node.kind.label()
                 ));
             }
             if node.kind == NodeKind::ActionSendCommand {
                 if !allow_commands {
                     return Err(
-                        "chế độ Webhook không hỗ trợ node Gửi lệnh — dùng Gửi tin nhắn, hoặc chuyển lại chế độ Tài khoản"
+                        "chế độ Webhook không hỗ trợ bước Gửi lệnh — dùng Gửi tin nhắn, hoặc chuyển lại chế độ Tài khoản"
                             .into(),
                     );
                 }
                 CommandConfig::from_node(node)
                     .validate()
-                    .map_err(|e| format!("Node Gửi lệnh {}: {e}", node.id))?;
+                    .map_err(|e| format!("Bước Gửi lệnh {}: {e}", node.id))?;
             }
             // Time Window nodes fail CLOSED: a present-but-unparsable
             // start/end is a validation error, never a silent
             // whole-day default (which would send at any hour).
             if node.kind == NodeKind::ConditionTimeWindow {
                 validate_time_window(node)
-                    .map_err(|e| format!("Node Khung giờ {}: {e}", node.id))?;
+                    .map_err(|e| format!("Bước Khung giờ {}: {e}", node.id))?;
             }
             if node.kind == NodeKind::UtilityCallApi {
                 ApiCallConfig::from_node(node)
                     .validate()
-                    .map_err(|e| format!("Node Call API {}: {e}", node.id))?;
+                    .map_err(|e| format!("Bước lấy dữ liệu {}: {e}", node.id))?;
             }
         }
         // Two Call API nodes feeding the same variable would make
@@ -1352,7 +1360,7 @@ impl Scenario {
                 }
                 if seen.contains(&name) {
                     return Err(format!(
-                        "hai node Call API cùng đưa vào biến '{{{name}}}' — đổi tên một cái"
+                        "hai bước lấy dữ liệu cùng đưa vào biến '{{{name}}}' — đổi tên một cái"
                     ));
                 }
                 seen.push(name);
@@ -1370,7 +1378,7 @@ impl Scenario {
         // combination is rejected instead of silently doing nothing.
         if self.edit_last_message && has_command {
             return Err(
-                "chế độ sửa tin nhắn cũ không áp dụng cho node Gửi lệnh — xóa node lệnh hoặc tắt chế độ này"
+                "chế độ sửa tin nhắn cũ không áp dụng cho bước Gửi lệnh — xóa bước lệnh hoặc tắt chế độ này"
                     .into(),
             );
         }
@@ -1440,7 +1448,7 @@ impl Scenario {
                 let content = node_content(node);
                 if char_count(&content) > DISCORD_CONTENT_LIMIT {
                     return Err(format!(
-                        "nội dung node Gửi tin nhắn {} dài {} ký tự, vượt giới hạn 2000 ký tự của Discord",
+                        "nội dung bước Gửi tin nhắn {} dài {} ký tự, vượt giới hạn 2000 ký tự của Discord",
                         node.id,
                         char_count(&content)
                     ));
@@ -1458,6 +1466,87 @@ impl Scenario {
         self.nodes
             .iter()
             .find(|n| n.kind == NodeKind::ActionSendCommand)
+    }
+
+    /// Delete one message from the rotation. Returns false when the
+    /// index is out of range (stale UI state must not panic).
+    pub fn remove_message(&mut self, idx: usize) -> bool {
+        if idx >= self.messages.len() {
+            return false;
+        }
+        self.messages.remove(idx);
+        true
+    }
+
+    /// Move one message one step up (`up = true`) or down. Returns
+    /// false at the ends or for an out-of-range index.
+    pub fn move_message(&mut self, idx: usize, up: bool) -> bool {
+        if idx >= self.messages.len() {
+            return false;
+        }
+        let target = if up {
+            idx.checked_sub(1)
+        } else {
+            idx.checked_add(1)
+        };
+        let Some(target) = target else {
+            return false;
+        };
+        if target >= self.messages.len() {
+            return false;
+        }
+        self.messages.swap(idx, target);
+        true
+    }
+
+    /// Delete one workflow step by id. The only trigger step cannot
+    /// be deleted: validation requires exactly one trigger, and the
+    /// schedule itself is edited in the schedule section, not by
+    /// removing its step. Returns Err with the reason when the step
+    /// cannot be deleted.
+    pub fn remove_node(&mut self, id: &str) -> Result<(), String> {
+        let Some(pos) = self.nodes.iter().position(|n| n.id == id) else {
+            return Err("Không tìm thấy bước này.".to_string());
+        };
+        let is_only_trigger = self.nodes[pos].kind.group() == "Trigger"
+            && self
+                .nodes
+                .iter()
+                .filter(|n| n.kind.group() == "Trigger")
+                .count()
+                == 1;
+        if is_only_trigger {
+            return Err(
+                "Không xóa được bước kích hoạt duy nhất — kịch bản cần đúng một bước kích hoạt. Muốn đổi lịch, sửa ở phần Lịch bên dưới."
+                    .to_string(),
+            );
+        }
+        self.nodes.remove(pos);
+        Ok(())
+    }
+
+    /// Move one workflow step one step up (`up = true`) or down.
+    /// Moving the trigger step is harmless: firing uses the
+    /// `schedule` field, and only the order of the action steps
+    /// affects a run. Returns false at the ends or when the id is
+    /// unknown.
+    pub fn move_node(&mut self, id: &str, up: bool) -> bool {
+        let Some(pos) = self.nodes.iter().position(|n| n.id == id) else {
+            return false;
+        };
+        let target = if up {
+            pos.checked_sub(1)
+        } else {
+            pos.checked_add(1)
+        };
+        let Some(target) = target else {
+            return false;
+        };
+        if target >= self.nodes.len() {
+            return false;
+        }
+        self.nodes.swap(pos, target);
+        true
     }
 
     /// Pick the next message to send, rotating without repeating the last one.
@@ -1552,7 +1641,7 @@ impl Scenario {
             };
             if !inside {
                 return Err(format!(
-                    "ngoài khung giờ của node Khung giờ {} ({}–{}) — bỏ qua",
+                    "ngoài khung giờ của bước Khung giờ {} ({}–{}) — bỏ qua",
                     node.id,
                     fmt_mins(start),
                     fmt_mins(end)
@@ -1882,7 +1971,7 @@ pub fn analyze_import(text: &str, is_webhook: bool) -> (Option<Scenario>, Vec<St
         .count();
     if api_nodes > 0 {
         warnings.push(format!(
-            "Kịch bản có {api_nodes} node Call API — địa chỉ URL là bí mật riêng của máy xuất, hãy nhập lại URL trên máy này trước khi chạy."
+            "Kịch bản có {api_nodes} bước lấy dữ liệu — địa chỉ URL là bí mật riêng của máy xuất, hãy nhập lại URL trên máy này trước khi chạy."
         ));
     }
     (Some(scenario), warnings)
@@ -2735,6 +2824,83 @@ mod tests {
         s.nodes.push(second);
         let found = s.command_node().unwrap();
         assert_eq!(CommandConfig::from_node(found).name, "first");
+    }
+
+    #[test]
+    fn message_remove_and_move() {
+        // Builder Group 1: one message can be deleted or moved;
+        // the ends and stale indices are safe no-ops.
+        let mut s = Scenario::new("m");
+        s.messages = vec!["a".into(), "b".into(), "c".into()];
+        assert!(!s.move_message(0, true));
+        assert!(!s.move_message(2, false));
+        assert!(!s.move_message(9, true));
+        assert!(s.move_message(0, false));
+        assert_eq!(s.messages, vec!["b", "a", "c"]);
+        assert!(s.move_message(2, true));
+        assert_eq!(s.messages, vec!["b", "c", "a"]);
+        assert!(!s.remove_message(9));
+        assert!(s.remove_message(1));
+        assert_eq!(s.messages, vec!["b", "a"]);
+    }
+
+    #[test]
+    fn node_remove_refuses_only_trigger_and_moves() {
+        // Builder Group 1: the only trigger step cannot be deleted
+        // (validation needs exactly one), other steps can; moving
+        // swaps neighbours and stops at the ends.
+        let mut s = Scenario::new("n"); // TriggerSchedule + SendMessage
+        let trigger_id = s.nodes[0].id.clone();
+        let msg_id = s.nodes[1].id.clone();
+        assert!(s.remove_node(&trigger_id).is_err());
+        assert_eq!(s.nodes.len(), 2);
+        assert!(s.remove_node(&msg_id).is_ok());
+        assert_eq!(s.nodes.len(), 1);
+        assert!(s.remove_node("no-such-id").is_err());
+        s.nodes.push(Node::new(NodeKind::UtilityWait));
+        s.nodes.push(Node::new(NodeKind::UtilityWait));
+        let last = s.nodes[2].id.clone();
+        assert!(s.move_node(&last, true));
+        assert_eq!(s.nodes[1].id, last);
+        assert!(s.move_node(&last, true));
+        assert_eq!(s.nodes[0].id, last);
+        assert!(!s.move_node(&last, true));
+        assert!(!s.move_node("no-such-id", false));
+    }
+
+    #[test]
+    fn workflow_labels_are_plain_vietnamese() {
+        // Builder Group 2: no unexplained "*" / "%" markers, and
+        // "Call API" is "Lấy dữ liệu" everywhere the user sees it.
+        for kind in [
+            NodeKind::TriggerSchedule,
+            NodeKind::TriggerManual,
+            NodeKind::TriggerMessageReceived,
+            NodeKind::TriggerMemberJoin,
+            NodeKind::ActionSendMessage,
+            NodeKind::ActionSendEmbed,
+            NodeKind::ActionSendCommand,
+            NodeKind::ActionSendFile,
+            NodeKind::ActionAddReaction,
+            NodeKind::ActionReply,
+            NodeKind::ActionDeleteMessage,
+            NodeKind::ConditionKeyword,
+            NodeKind::ConditionTimeWindow,
+            NodeKind::ConditionRandom,
+            NodeKind::ConditionRole,
+            NodeKind::ConditionVariable,
+            NodeKind::UtilityWait,
+            NodeKind::UtilityRandomPick,
+            NodeKind::UtilitySetVariable,
+            NodeKind::UtilityLoop,
+            NodeKind::UtilityCallApi,
+        ] {
+            let label = kind.label();
+            assert!(!label.ends_with(" *"), "{label}");
+            assert!(!label.ends_with(" %"), "{label}");
+            assert!(!label.contains("Call API"), "{label}");
+        }
+        assert_eq!(NodeKind::UtilityCallApi.label(), "Tiện ích: Lấy dữ liệu");
     }
 
     #[test]

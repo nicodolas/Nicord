@@ -164,8 +164,8 @@ mod tests {
     fn no_keyed_string_is_english() {
         // Guard against the mixed-language regression: every keyed
         // string must be Vietnamese. Keys whose value legitimately
-        // contains a Latin product term (Webhook, Embed, Call API)
-        // are covered by the explicit assertions above; this test
+        // contains a Latin product term (Webhook, Embed) are covered
+        // by the explicit assertions above; this test
         // pins the historically-English keys to their Vietnamese
         // values so a reverted translation fails loudly.
         for key in [

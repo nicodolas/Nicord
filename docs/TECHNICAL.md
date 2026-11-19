@@ -1420,15 +1420,15 @@ already removed.
   on their own row), four metric cards, destination card,
   timeline, and a recent-activity card (5 newest log rows,
   refreshed at most every 30 s, secret-scrubbed).
-- **Builder:** compose card, then a "Quy trình" workflow card
+- **Builder:** compose card, then a "Các bước chạy" workflow card
   (node rows with kind badges + short names; command nodes
   show `Lệnh: {name}`), then a context inspector
-  ("Thuộc tính node", only for command / Call API nodes),
+  ("Chi tiết bước", only for command / Lấy dữ liệu nodes),
   then grouped sections (LỊCH & MẪU, NÂNG CAO). The action
   bar is two explicit rows; the editor ScrollArea insets its
   content 14 px so the scroll bar never covers card borders
-  or wrapped text. No node reordering exists (the old header
-  text falsely claimed it did; fixed).
+  or wrapped text. Node reorder/delete was added later (see
+  Builder edit/delete/reorder below).
 - **Destinations:** list rows carry status badges mapped from
   `FailureState`; the editor is grouped (KẾT NỐI / HIỂN THỊ /
   GIỚI HẠN / TIN MẶC ĐỊNH) with labels above long fields.
@@ -1473,3 +1473,73 @@ emoji font (a new asset), which is out of scope for this
 redesign. No release has been cut yet, so the light theme +
 large text combination was verified only under Xvfb, not on
 a real Windows/macOS desktop.
+
+## Builder edit/delete/reorder + plain terms (Groups 1+2, 2026-11-19)
+
+The Builder used to be add-only inside a scenario: messages
+and workflow steps could only be added, never edited,
+deleted, or reordered — the only fix was deleting the whole
+scenario and starting over. Terminology was also confusing
+("Quy trình", "node", "Call API", a "Kiểm tra (chạy thử)"
+button that only validated and sent nothing).
+
+- **Messages (`src/scenario.rs`, `src/app.rs`).** Each message
+  row is now two rows: the text (truncated, full text on
+  hover) and Sửa / Xóa / Lên / Xuống. Sửa loads the text into
+  the add field, which becomes "Lưu tin nhắn" + "Hủy". Xóa is
+  two-click ("Xóa" → "Xóa thật?" + "Hủy"). Lên/Xuống swap
+  with the neighbour (`remove_message` / `move_message` on
+  `Scenario`, unit-tested). No new persisted state: messages
+  were already persisted, reorder only changes their order;
+  the edit/pending-confirm state is session-only.
+- **Workflow steps.** Each step row is badge + name, then
+  Xóa / Lên / Xuống (`remove_node` / `move_node`,
+  unit-tested). Moving a step never affects firing: the
+  schedule lives in the separate `schedule` field, not in
+  step position. The single trigger step cannot be deleted —
+  validation requires exactly one trigger — so its Xóa is
+  disabled with a hover note pointing at the Lịch section
+  below, where the schedule is edited instead. Deleting a
+  "Lấy dữ liệu" step also deletes its saved URL from the
+  secret store (`delete_secret`).
+- **Scenario delete** in the list is now two-click as well
+  ("Xóa" → "Xóa thật?" + "Hủy"); it used to delete
+  immediately with no confirmation.
+- **Plain terms.** "Quy trình" → "Các bước chạy", "Thuộc
+  tính node" → "Chi tiết bước", "Call API" → "Lấy dữ liệu"
+  (button, editor title, Settings allowlist, validation and
+  import messages), "Kiểm tra (chạy thử)" → "Kiểm tra hợp
+  lệ" with a header line and status text that say it only
+  checks and sends nothing, node kind labels in plain
+  Vietnamese ("Tiện ích: Lấy dữ liệu"). The stale " *" /
+  " %" suffixes on node labels were removed (they no longer
+  matched `is_executed()`).
+- **Import without typing a path.** The export/import row
+  now offers a dropdown of already-exported files
+  (`nicord-export-*.json` in the config dir); the manual path
+  field stays as a fallback. No file picker was added: the
+  usual picker library needs GTK or an XDG portal on Linux,
+  a CI risk on all three OSes, and the dropdown covers the
+  normal export → import flow.
+- **Disabled buttons are near-invisible in this theme**
+  (pre-existing, not introduced here): a disabled button
+  paints with the card-colored `noninteractive` style, so
+  Lên/Xuống at the ends of a list and the trigger step's Xóa
+  show no visible button. The buttons still exist and work
+  when enabled (verified live: all four message buttons on a
+  middle row, all three step buttons on a middle step).
+  Changing the `noninteractive` style is not a safe fix —
+  its background fill is also the window background.
+- **Layout notes from live verification (Xvfb, 900x600 and
+  1100x700):** the action bar is three explicit rows
+  ("Kiểm tra hợp lệ" / "+ Gửi tin nhắn" "+ Gửi lệnh" /
+  "+ Chờ" "+ Lấy dữ liệu") because `ui.set_width` only sets a
+  minimum width in egui 0.31, so `horizontal_wrapped` did not
+  wrap the long label and "+ Gửi lệnh" slid off-screen; the
+  pinned action-bar reserve is 250 px so the import row stays
+  reachable at 900x600. Message-row truncation is measured
+  outside the inner `ScrollArea`, or the content-width
+  feedback loop narrows the list and clips the buttons.
+  Verified live: add/edit/move/delete message, add/move/
+  delete step, two-click confirms with Hủy, scenario-delete
+  confirm with Hủy, 252 tests green.

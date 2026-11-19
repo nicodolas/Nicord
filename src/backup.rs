@@ -649,7 +649,7 @@ fn apply_import_with(
             .count();
         if api_nodes > 0 {
             report.warnings.push(format!(
-                "Kịch bản '{}' có {api_nodes} node Call API: địa chỉ của chúng là secret gắn với máy đã xuất — nhập lại từng địa chỉ trên máy này.",
+                "Kịch bản '{}' có {api_nodes} bước lấy dữ liệu: địa chỉ của chúng là bí mật gắn với máy đã xuất — nhập lại từng địa chỉ trên máy này.",
                 s.name
             ));
         }

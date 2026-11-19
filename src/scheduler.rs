@@ -723,7 +723,10 @@ impl Engine {
             // validated the scenario; this guards direct callers
             // and config edits between validation and fetch.)
             if let Err(e) = cfg.validate() {
-                return Err(format!("invalid scenario: node Call API {}: {e}", node.id));
+                return Err(format!(
+                    "invalid scenario: bước lấy dữ liệu {}: {e}",
+                    node.id
+                ));
             }
             let host = if cfg.url_host.trim().is_empty() {
                 "host đã cấu hình".to_string()
@@ -1683,7 +1686,7 @@ impl Engine {
                         Some(h) => (h.id.clone(), h.version.clone()),
                         None => {
                             return Err(format!(
-                                "không tìm thấy lệnh slash /{} trong kênh này — dán Command ID thủ công trong phần sửa node",
+                                "không tìm thấy lệnh slash /{} trong kênh này — dán Command ID thủ công trong phần sửa bước",
                                 cfg.name.trim()
                             ));
                         }
@@ -1691,7 +1694,7 @@ impl Engine {
                 }
                 Err(e) => {
                     return Err(format!(
-                        "không tìm được lệnh ứng dụng ({e}) — dán Command ID thủ công trong phần sửa node"
+                        "không tìm được lệnh ứng dụng ({e}) — dán Command ID thủ công trong phần sửa bước"
                     ));
                 }
             }

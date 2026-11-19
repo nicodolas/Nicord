@@ -65,9 +65,23 @@ pub struct NicordApp {
     pub webhook_check_status: Arc<Mutex<String>>,
     pub new_scenario_name: String,
     pub new_message: String,
+    /// Builder: message being edited, as (scenario id, message
+    /// index). The text lives in `new_message` while editing; the
+    /// add button becomes "Lưu tin nhắn". Session-only: indices
+    /// shift on any message mutation, so edits are cleared then.
+    pub edit_message: Option<(String, usize)>,
+    /// Builder: message awaiting delete confirmation, as
+    /// (scenario id, message index). Session-only.
+    pub pending_delete_message: Option<(String, usize)>,
+    /// Builder: workflow step id awaiting delete confirmation.
+    /// Session-only.
+    pub pending_delete_node: Option<String>,
+    /// Builder: scenario id awaiting delete confirmation in the
+    /// list. Session-only.
+    pub pending_delete_scenario: Option<String>,
     /// File path being typed for a new attachment (idea #4).
     pub new_attachment_path: String,
-    /// API URL being typed for a Call API node (idea #5; never
+    /// API URL being typed for a data-fetch step (idea #5; never
     /// stored in plaintext — saved via the secret store on click).
     pub api_url_input: String,
     /// Builder list search query. Session-only: a search is
@@ -378,6 +392,30 @@ fn truncate_display(value: &str, max: usize) -> String {
     }
 }
 
+/// Scenario files exported by "Lưu kịch bản ra file": they land in
+/// the config dir as `nicord-export-<id>.json`. Listed so importing
+/// one needs no typed path (see the import picker in
+/// `show_builder_actions`). Sorted by name; unreadable dirs yield
+/// an empty list instead of an error.
+fn exported_scenario_files() -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(config_dir()) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with("nicord-export-") && name.ends_with(".json") {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .collect();
+    names.sort();
+    names
+}
+
 fn resolve_senders_for_scenario(
     store: &Store,
     config: &AppConfig,
@@ -556,6 +594,10 @@ impl NicordApp {
             webhook_check_status: Arc::new(Mutex::new(String::new())),
             new_scenario_name: String::new(),
             new_message: String::new(),
+            edit_message: None,
+            pending_delete_message: None,
+            pending_delete_node: None,
+            pending_delete_scenario: None,
             new_attachment_path: String::new(),
             api_url_input: String::new(),
             builder_search: String::new(),
@@ -1141,7 +1183,7 @@ impl NicordApp {
                 return;
             };
             let Some(n) = s.nodes.iter().find(|n| n.id == node_id).cloned() else {
-                self.set_status("Không tìm thấy node.");
+                self.set_status("Không tìm thấy bước.");
                 return;
             };
             let display = CommandConfig::from_node(&n).display_name();
@@ -3031,7 +3073,9 @@ impl NicordApp {
     }
 
     fn show_builder(&mut self, ui: &mut egui::Ui) {
-        ui.label("Thêm node, bấm vào node để sửa thuộc tính. Chạy thử chỉ kiểm tra, không gửi.");
+        ui.label(
+            "Thêm bước, bấm vào bước để sửa chi tiết. Kiểm tra hợp lệ chỉ kiểm tra, không gửi.",
+        );
         ui.add_space(12.0);
         // Two columns: scenario list | editor for the selected scenario.
         // The editor content scrolls, but the action bar (Validate, node
@@ -3050,7 +3094,16 @@ impl NicordApp {
             let selected = self.selected;
             match selected {
                 Some(i) => {
-                    let action_h = 130.0;
+                    // Height reserved for the pinned action bar, so
+                    // the editor ScrollArea stops above it. Must
+                    // cover the whole bar: 3 button rows + import
+                    // picker + path field + export/import row
+                    // (~250 px at default text size; measured from
+                    // screenshots, 230 still left the export/import
+                    // row half under the window edge). Too small and
+                    // the bar slides past the window bottom at
+                    // 900x600, putting Import out of reach.
+                    let action_h = 250.0;
                     let avail = cols[1].available_height();
                     egui::ScrollArea::vertical()
                         .id_salt("builder_editor")
@@ -3131,6 +3184,14 @@ impl NicordApp {
             let mut to_delete: Option<usize> = None;
             let mut to_toggle: Option<usize> = None;
             let mut to_clone: Option<usize> = None;
+            // Delete confirmation (Group 1): deleting a scenario
+            // used to happen on one click with no way back. The
+            // first click now arms the confirm state (keyed by
+            // scenario id, stable across list changes); the second
+            // click deletes. Read once, before the list borrow.
+            let mut to_arm_delete: Option<String> = None;
+            let mut cancel_delete = false;
+            let pending_del = self.pending_delete_scenario.clone();
             // Indices matching the search query, in list order. Bulk
             // actions apply to exactly these (what you see is what
             // you act on); indices stay valid because the list is
@@ -3176,8 +3237,18 @@ impl NicordApp {
                             to_toggle = Some(i);
                         }
                         // Delete is destructive: red text so it can
-                        // never be confused with Enable at a glance.
-                        if ui
+                        // never be confused with Enable at a glance,
+                        // and two clicks so one stray tap cannot wipe
+                        // a scenario (destinations already confirm
+                        // the same way).
+                        if pending_del.as_deref() == Some(s.id.as_str()) {
+                            if theme::danger_button(ui, "Xóa thật?").clicked() {
+                                to_delete = Some(i);
+                            }
+                            if ui.button("Hủy").clicked() {
+                                cancel_delete = true;
+                            }
+                        } else if ui
                             .add(
                                 egui::Button::new(
                                     RichText::new("Xóa").color(theme::palette().danger),
@@ -3186,7 +3257,7 @@ impl NicordApp {
                             )
                             .clicked()
                         {
-                            to_delete = Some(i);
+                            to_arm_delete = Some(s.id.clone());
                         }
                     });
                     if !s.channel_id.is_empty() {
@@ -3279,6 +3350,13 @@ impl NicordApp {
                     }
                 }
                 self.selected = None;
+                self.pending_delete_scenario = None;
+            }
+            if cancel_delete {
+                self.pending_delete_scenario = None;
+            }
+            if let Some(id) = to_arm_delete {
+                self.pending_delete_scenario = Some(id);
             }
             if let Some(i) = to_clone {
                 // Clone (QoL Q5): fresh id, disabled, no run history,
@@ -3307,12 +3385,14 @@ impl NicordApp {
     /// Right column of the Builder: edit the selected scenario in place.
     fn show_builder_editor(&mut self, ui: &mut egui::Ui, i: usize) {
         let mut channel_id = String::new();
+        let mut scenario_id = String::new();
         let mut messages: Vec<String> = Vec::new();
         // (kind, id, command display name — "" for non-command nodes).
         let mut nodes: Vec<(NodeKind, String, String)> = Vec::new();
         if let Ok(list) = self.scenarios.lock() {
             if let Some(s) = list.get(i) {
                 channel_id = s.channel_id.clone();
+                scenario_id = s.id.clone();
                 messages = s.messages.clone();
                 nodes = s
                     .nodes
@@ -3434,7 +3514,7 @@ impl NicordApp {
                         ),
                     );
                 }
-                theme::muted(ui, "Lệnh (node Gửi lệnh) không hoạt động ở chế độ Webhook.");
+                theme::muted(ui, "Lệnh (bước Gửi lệnh) không hoạt động ở chế độ Webhook.");
                 ui.add_space(6.0);
             } else {
                 ui.label("Chọn kênh (tải server/kênh của bạn từ Discord):");
@@ -3497,53 +3577,162 @@ impl NicordApp {
                     egui::TextEdit::singleline(&mut channel_id).hint_text("vd: 123456789012345678"),
                 );
             } // end user-mode channel picker
-            ui.label("Tin nhắn (xoay vòng, hỗ trợ spin-text {a|b}):");
+            ui.label("Tin nhắn (mỗi lần gửi chọn ngẫu nhiên một tin; viết {a|b} trong một tin để xoay mẫu):");
             if messages.is_empty() {
                 theme::muted(ui, "Chưa có tin nhắn nào — thêm ở dưới.");
             }
+            // Group 1: every message can be edited, deleted, or
+            // moved. Previously the list was display-only and the
+            // only way to drop a message was deleting the whole
+            // scenario. Scenario mutations are collected during the
+            // rows and applied after the ScrollArea (same pattern
+            // as the scenario list); only session state is set
+            // inside the rows. Row text is truncated to the
+            // available width so the ScrollArea content width stays
+            // bounded (redesign feedback-loop rule).
+            // Group 1: every message can be edited, deleted, or
+            // moved. Previously the list was display-only and the
+            // only way to drop a message was deleting the whole
+            // scenario. Two rows per message (text, then actions),
+            // like the scenario and destination rows: one row cannot
+            // hold the text plus four buttons at 900 px. The
+            // truncation width is read OUTSIDE the ScrollArea: a
+            // vertical ScrollArea follows its content width, so
+            // measuring inside it feeds back into a narrow
+            // equilibrium that clipped the move buttons (verified
+            // by screenshot at 900x600).
+            let list_w = ui.available_width();
+            let mut msg_delete: Option<usize> = None;
+            let mut msg_move: Option<(usize, bool)> = None;
+            let editing_idx = self.edit_message.as_ref().and_then(|(sid, idx)| {
+                if sid == &scenario_id {
+                    Some(*idx)
+                } else {
+                    None
+                }
+            });
             egui::ScrollArea::vertical()
                 .id_salt("builder_messages")
-                .max_height(90.0)
+                .max_height(120.0)
                 .show(ui, |ui| {
-                    for m in &messages {
-                        if over_limit(m) {
-                            ui.label(
-                                RichText::new(format!(
-                                    "• {m} (quá 2000 ký tự — sẽ bị chặn khi bật)"
-                                ))
-                                .color(theme::palette().danger),
-                            );
+                    for (idx, m) in messages.iter().enumerate() {
+                        let over = over_limit(m);
+                        let shown = truncate_display(m, ((list_w - 24.0) / 8.0).max(8.0) as usize);
+                        let text = if over {
+                            format!("• {shown} (quá 2000 ký tự)")
                         } else {
-                            ui.label(format!("• {m}"));
-                        }
+                            format!("• {shown}")
+                        };
+                        ui.label(RichText::new(text).color(if over {
+                            theme::palette().danger
+                        } else {
+                            theme::palette().text
+                        }))
+                        .on_hover_text(m);
+                        ui.horizontal(|ui| {
+                            if editing_idx == Some(idx) {
+                                theme::muted(ui, "Đang sửa — sửa ở ô bên dưới.");
+                            } else if self.pending_delete_message.as_ref()
+                                == Some(&(scenario_id.clone(), idx))
+                            {
+                                if theme::danger_button(ui, "Xóa thật?").clicked() {
+                                    msg_delete = Some(idx);
+                                }
+                                if ui.button("Hủy").clicked() {
+                                    self.pending_delete_message = None;
+                                }
+                            } else {
+                                if ui.button("Sửa").clicked() {
+                                    self.edit_message = Some((scenario_id.clone(), idx));
+                                    self.new_message = m.clone();
+                                    self.pending_delete_message = None;
+                                }
+                                if ui.button("Xóa").clicked() {
+                                    self.pending_delete_message = Some((scenario_id.clone(), idx));
+                                }
+                                if ui.add_enabled(idx > 0, egui::Button::new("Lên")).clicked() {
+                                    msg_move = Some((idx, true));
+                                }
+                                if ui
+                                    .add_enabled(
+                                        idx + 1 < messages.len(),
+                                        egui::Button::new("Xuống"),
+                                    )
+                                    .clicked()
+                                {
+                                    msg_move = Some((idx, false));
+                                }
+                            }
+                        });
                     }
                 });
+            if let Some(idx) = msg_delete {
+                if let Ok(mut list) = self.scenarios.lock() {
+                    if let Some(s) = list.get_mut(i) {
+                        s.remove_message(idx);
+                    }
+                }
+                // Indices shift: any in-progress edit is stale.
+                self.pending_delete_message = None;
+                self.edit_message = None;
+                self.save_scenarios();
+            }
+            if let Some((idx, up)) = msg_move {
+                if let Ok(mut list) = self.scenarios.lock() {
+                    if let Some(s) = list.get_mut(i) {
+                        s.move_message(idx, up);
+                    }
+                }
+                self.edit_message = None;
+                self.save_scenarios();
+            }
             ui.horizontal(|ui| {
-                // The field must leave room for the button in this narrow
-                // column, or the button is pushed past the right edge.
-                let field_w = (ui.available_width() - 132.0).max(100.0);
+                // The field must leave room for the button(s) in this
+                // narrow column, or they are pushed past the right edge.
+                let reserve = if editing_idx.is_some() { 210.0 } else { 132.0 };
+                let field_w = (ui.available_width() - reserve).max(100.0);
                 ui.add(
                     egui::TextEdit::singleline(&mut self.new_message)
-                        .hint_text("Thêm tin nhắn...")
+                        .hint_text(if editing_idx.is_some() {
+                            "Sửa tin nhắn..."
+                        } else {
+                            "Thêm tin nhắn..."
+                        })
                         .desired_width(field_w),
                 );
                 // Over the Discord limit: the button is disabled and
                 // the preview below shows why (QoL Q1).
                 let too_long = over_limit(self.new_message.trim());
-                let add_clicked = ui
+                let save_label = if editing_idx.is_some() {
+                    "Lưu tin nhắn"
+                } else {
+                    "+ Thêm tin nhắn"
+                };
+                let save_clicked = ui
                     .add_enabled(
                         !self.new_message.trim().is_empty() && !too_long,
-                        egui::Button::new("+ Thêm tin nhắn"),
+                        egui::Button::new(save_label),
                     )
                     .clicked();
-                if add_clicked {
+                if save_clicked {
                     if let Ok(mut list) = self.scenarios.lock() {
                         if let Some(s) = list.get_mut(i) {
-                            s.messages.push(self.new_message.trim().to_string());
+                            if let Some(idx) = editing_idx {
+                                if idx < s.messages.len() {
+                                    s.messages[idx] = self.new_message.trim().to_string();
+                                }
+                            } else {
+                                s.messages.push(self.new_message.trim().to_string());
+                            }
                         }
                     }
                     self.new_message.clear();
+                    self.edit_message = None;
                     self.save_scenarios();
+                }
+                if editing_idx.is_some() && ui.button("Hủy").clicked() {
+                    self.new_message.clear();
+                    self.edit_message = None;
                 }
             });
             // Emoji picker (Q10) + content source line (Q6).
@@ -3557,20 +3746,31 @@ impl NicordApp {
             ui.add_space(6.0);
         });
         ui.add_space(6.0);
-        // Workflow overview (redesign): the node list sits right
+        // Workflow overview (redesign): the step list sits right
         // after the compose area, so the scenario's shape is visible
         // without scrolling through every section. Order is the
-        // execution order; creation order is fixed (no reordering
-        // control exists — the list is honest about that).
+        // execution order. Group 1: every step can be deleted or
+        // moved up/down — previously steps were add-only, so one
+        // wrong step meant rebuilding the scenario.
         theme::card(ui, |ui| {
             theme::section_header(
                 ui,
-                "Quy trình",
-                "Các node theo thứ tự chạy. Bấm vào node lệnh hoặc Call API để sửa thuộc tính.",
+                "Các bước chạy",
+                "Các bước chạy theo thứ tự từ trên xuống dưới. Bấm vào bước 'Gửi lệnh' hoặc 'Lấy dữ liệu' để sửa chi tiết.",
             );
-            for (kind, id, cmd_name) in &nodes {
+            // The only trigger step is protected (see
+            // `Scenario::remove_node`): a scenario needs exactly
+            // one trigger, and the schedule is edited in the
+            // schedule section below.
+            let trigger_count = nodes
+                .iter()
+                .filter(|(k, _, _)| k.group() == "Trigger")
+                .count();
+            let mut node_delete: Option<String> = None;
+            let mut node_move: Option<(String, bool)> = None;
+            for (pos, (kind, id, cmd_name)) in nodes.iter().enumerate() {
                 // Labels already carry the group prefix
-                // ("Hành động: Gửi tin nhắn *"); the badge shows the
+                // ("Hành động: Gửi tin nhắn"); the badge shows the
                 // group, so the row shows the short name only.
                 let short = if kind == &NodeKind::ActionSendCommand {
                     format!("Lệnh: {cmd_name}")
@@ -3581,27 +3781,114 @@ impl NicordApp {
                         .unwrap_or(kind.label())
                         .to_string()
                 };
+                // A long command name must not widen the card (the
+                // editor ScrollArea follows content width); the
+                // full name stays on hover.
+                let short_shown = truncate_display(&short, 36);
                 let group_kind = match kind.group() {
                     "Trigger" => theme::BadgeKind::Info,
                     "Action" => theme::BadgeKind::Success,
                     "Condition" => theme::BadgeKind::Warning,
                     _ => theme::BadgeKind::Muted,
                 };
+                // Two rows, like the scenario and destination rows:
+                // name first, actions below, so names never clip at
+                // narrow windows.
                 ui.horizontal(|ui| {
                     theme::badge(ui, kind.group_label(), group_kind);
                     if ui
-                        .selectable_label(self.selected_node.as_deref() == Some(id.as_str()), short)
+                        .selectable_label(
+                            self.selected_node.as_deref() == Some(id.as_str()),
+                            short_shown,
+                        )
+                        .on_hover_text(short)
                         .clicked()
                     {
                         self.selected_node = Some(id.clone());
                     }
                 });
+                ui.horizontal(|ui| {
+                    let is_only_trigger =
+                        kind.group() == "Trigger" && trigger_count == 1;
+                    if is_only_trigger {
+                        ui.add_enabled(false, egui::Button::new("Xóa"))
+                            .on_hover_text(
+                                "Không xóa được bước kích hoạt duy nhất — sửa lịch ở phần Lịch bên dưới.",
+                            );
+                    } else if self.pending_delete_node.as_deref() == Some(id.as_str()) {
+                        if theme::danger_button(ui, "Xóa thật?").clicked() {
+                            node_delete = Some(id.clone());
+                        }
+                        if ui.button("Hủy").clicked() {
+                            self.pending_delete_node = None;
+                        }
+                    } else if ui.button("Xóa").clicked() {
+                        self.pending_delete_node = Some(id.clone());
+                    }
+                    if ui
+                        .add_enabled(pos > 0, egui::Button::new("Lên"))
+                        .clicked()
+                    {
+                        node_move = Some((id.clone(), true));
+                    }
+                    if ui
+                        .add_enabled(pos + 1 < nodes.len(), egui::Button::new("Xuống"))
+                        .clicked()
+                    {
+                        node_move = Some((id.clone(), false));
+                    }
+                });
+            }
+            if let Some(id) = node_delete {
+                if let Ok(mut list) = self.scenarios.lock() {
+                    if let Some(s) = list.get_mut(i) {
+                        // Deleting a data-fetch step must also drop
+                        // its saved URL from the secret store, or
+                        // the secret would linger with no step
+                        // pointing at it.
+                        let api_url_ref = s.nodes.iter().find(|n| n.id == id).and_then(|n| {
+                            if n.kind == NodeKind::UtilityCallApi {
+                                let r = ApiCallConfig::from_node(n).url_ref;
+                                if r.trim().is_empty() {
+                                    None
+                                } else {
+                                    Some(r)
+                                }
+                            } else {
+                                None
+                            }
+                        });
+                        match s.remove_node(&id) {
+                            Ok(()) => {
+                                if let Some(r) = api_url_ref {
+                                    delete_secret(&r);
+                                }
+                                if self.selected_node.as_deref() == Some(id.as_str()) {
+                                    self.selected_node = None;
+                                }
+                                self.pending_delete_node = None;
+                                self.set_status("Đã xóa bước.");
+                            }
+                            Err(e) => self.set_status(&e),
+                        }
+                    }
+                }
+                self.save_scenarios();
+            }
+            if let Some((id, up)) = node_move {
+                if let Ok(mut list) = self.scenarios.lock() {
+                    if let Some(s) = list.get_mut(i) {
+                        s.move_node(&id, up);
+                    }
+                }
+                self.save_scenarios();
             }
         });
         ui.add_space(6.0);
-        // Context inspector: the selected command / Call API node's
-        // editor, in the secondary surface, directly under the list.
-        // Other node kinds have no editor, so no empty panel shows.
+        // Context inspector: the selected command / data-fetch
+        // step's editor, in the secondary surface, directly under
+        // the list. Other step kinds have no editor, so no empty
+        // panel shows.
         let inspector_open = nodes.iter().any(|(kind, id, _)| {
             self.selected_node.as_deref() == Some(id.as_str())
                 && matches!(kind, NodeKind::ActionSendCommand | NodeKind::UtilityCallApi)
@@ -3609,7 +3896,7 @@ impl NicordApp {
         if inspector_open {
             theme::inspector_frame().show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                theme::section_title(ui, "Thuộc tính node");
+                theme::section_title(ui, "Chi tiết bước");
                 self.show_command_editor(ui, i);
                 self.show_api_editor(ui, i);
             });
@@ -3778,7 +4065,7 @@ impl NicordApp {
         );
         // Source line.
         if let Some(node_msg) = scenario.node_message() {
-            theme::muted(ui, &format!("Tin tiếp theo (từ node): {node_msg}"));
+            theme::muted(ui, &format!("Tin tiếp theo (từ bước): {node_msg}"));
         } else if scenario.use_destination_messages {
             match &dest {
                 Some(d) if !d.default_messages.is_empty() => {
@@ -4956,7 +5243,7 @@ impl NicordApp {
             return;
         };
         ui.separator();
-        theme::section_title(ui, "Lấy dữ liệu từ web (Call API)");
+        theme::section_title(ui, "Lấy dữ liệu từ đường link");
         theme::muted(
             ui,
             "Mỗi lần chạy, Nicord tải JSON từ địa chỉ này và đưa một trường vào biến mẫu. Chỉ dùng https. Địa chỉ có thể chứa khóa API nên được lưu mã hóa và không bao giờ hiện lại.",
@@ -5071,8 +5358,15 @@ impl NicordApp {
     fn show_builder_actions(&mut self, ui: &mut egui::Ui, i: usize) {
         theme::slim_card_frame().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.horizontal_wrapped(|ui| {
-                if theme::primary_button(ui, "Kiểm tra (chạy thử)").clicked() {
+            // Explicit rows (redesign lesson): `horizontal_wrapped`
+            // did not wrap the longer "Kiểm tra hợp lệ (không gửi
+            // tin)" label at 900 px — the add buttons slid off the
+            // right edge instead (verified by screenshot). Fixed
+            // rows are deterministic. The shorter label says the
+            // same thing: the header line and the status text both
+            // state that checking sends nothing.
+            ui.horizontal(|ui| {
+                if theme::primary_button(ui, "Kiểm tra hợp lệ").clicked() {
                     let result = self
                         .scenarios
                         .lock()
@@ -5080,14 +5374,15 @@ impl NicordApp {
                         .and_then(|l| l.get(i).map(|s| s.validate()));
                     match result {
                         Some(Ok(())) => {
-                            self.set_status("Chạy thử OK: kịch bản hợp lệ, chưa gửi gì.")
+                            self.set_status("Hợp lệ: kịch bản đủ điều kiện chạy, chưa gửi gì.")
                         }
                         Some(Err(e)) => self.set_status(&format!("Kiểm tra thất bại: {e}")),
                         None => self.set_status("Chưa chọn kịch bản nào."),
                     }
                 }
-                // Short labels so Validate + both node buttons fit on one
-                // row in the narrow column.
+            });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
                 if ui.button("+ Gửi tin nhắn").clicked() {
                     if let Ok(mut list) = self.scenarios.lock() {
                         if let Some(s) = list.get_mut(i) {
@@ -5105,12 +5400,8 @@ impl NicordApp {
                     self.save_scenarios();
                 }
             });
-            // Second row, explicit: all five buttons in one wrapped
-            // row left "+ Chờ" half off-screen at 1100 px (verified
-            // by screenshot) — the wrap heuristic placed it past
-            // the visible edge. Two fixed rows are deterministic.
             ui.add_space(4.0);
-            ui.horizontal_wrapped(|ui| {
+            ui.horizontal(|ui| {
                 if ui.button("+ Chờ").clicked() {
                     if let Ok(mut list) = self.scenarios.lock() {
                         if let Some(s) = list.get_mut(i) {
@@ -5119,7 +5410,7 @@ impl NicordApp {
                     }
                     self.save_scenarios();
                 }
-                if ui.button("+ Call API").clicked() {
+                if ui.button("+ Lấy dữ liệu").clicked() {
                     if let Ok(mut list) = self.scenarios.lock() {
                         if let Some(s) = list.get_mut(i) {
                             s.nodes.push(Node::new(NodeKind::UtilityCallApi));
@@ -5129,12 +5420,50 @@ impl NicordApp {
                 }
             });
             ui.add_space(4.0);
+            // Import picker (Group 2): files exported by "Lưu kịch
+            // bản ra file" land in the config dir as
+            // `nicord-export-<id>.json`, so list them — the normal
+            // export → import flow needs no typed path. A native
+            // file dialog would need a new dependency (`rfd`, whose
+            // Linux backend is GTK or a desktop portal — a CI risk
+            // on all three OSes), so the list + the manual path
+            // field below cover the same need with no new dependency.
+            // The path field stays for files kept elsewhere.
+            let exported = exported_scenario_files();
+            if !exported.is_empty() {
+                let current = std::path::Path::new(&self.import_path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .filter(|n| exported.iter().any(|e| e == n))
+                    .unwrap_or_else(|| "Chọn file đã xuất…".to_string());
+                let current = truncate_display(&current, 24);
+                let mut picked = String::new();
+                egui::ComboBox::from_label("File kịch bản đã xuất")
+                    .selected_text(current)
+                    .show_ui(ui, |ui| {
+                        for name in &exported {
+                            if ui
+                                .selectable_value(&mut picked, name.clone(), name)
+                                .clicked()
+                            {
+                                self.import_path =
+                                    config_dir().join(name).display().to_string();
+                            }
+                        }
+                    });
+            } else {
+                // One line at 900 px: the longer version wrapped
+                // to two lines and pushed the import field past the
+                // window bottom (the path hint below already says
+                // where to paste a path).
+                theme::muted(ui, "Chưa có file kịch bản đã xuất.");
+            }
             ui.add(
                 egui::TextEdit::singleline(&mut self.import_path)
-                    .hint_text("Đường dẫn tới file .json kịch bản cần nhập"),
+                    .hint_text("Hoặc dán đường dẫn file .json đã xuất"),
             );
             ui.horizontal(|ui| {
-                if ui.button("Xuất kịch bản (JSON)").clicked() {
+                if ui.button("Lưu kịch bản ra file").clicked() {
                     let path = config_dir().join(format!(
                         "nicord-export-{}.json",
                         self.scenarios
@@ -6988,10 +7317,10 @@ impl NicordApp {
         // written back on change; persisted + live-applied by the
         // Save button below (same as the other settings here).
         theme::card(ui, |ui| {
-            theme::section_title(ui, "Call API — Host được phép");
+            theme::section_title(ui, "Lấy dữ liệu — Máy chủ được phép");
             theme::muted(
                 ui,
-                "Để trống: node Call API được lấy dữ liệu từ bất kỳ host https nào. Thêm host để giới hạn: mỗi dòng một host, '.example.com' cho phép mọi tên miền con.",
+                "Để trống: bước lấy dữ liệu được lấy từ bất kỳ địa chỉ https nào. Thêm máy chủ để giới hạn: mỗi dòng một máy chủ, '.example.com' cho phép mọi tên miền con.",
             );
             let mut hosts = self.config.api_allowed_hosts.clone();
             let mut changed = false;
