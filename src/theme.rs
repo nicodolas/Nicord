@@ -541,10 +541,6 @@ pub fn nav_section_label(ui: &mut egui::Ui, text: &str) {
 }
 
 /// Colored bullet "•" (U+2022 is in the bundled font) for status dots.
-pub fn dot(color: Color32) -> RichText {
-    RichText::new("•").size(18.0).color(color)
-}
-
 /// Semantic badge kinds. Colors come from the palette so badges stay
 /// readable in both themes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -652,55 +648,6 @@ pub fn inspector_frame() -> egui::Frame {
         .stroke(Stroke::new(1.0_f32, p.card_border))
         .corner_radius(10)
         .inner_margin(12)
-}
-
-/// Daily-cap progress bar, drawn by hand.
-///
-/// egui's stock `ProgressBar` always paints a minimum-width fill
-/// (`min_width = 2 * corner_radius`), so at 0/300 it shows a small blue
-/// pill. This one paints no fill at all at 0, a left-rounded fill while
-/// partial, and a fully rounded fill when (nearly) complete.
-pub fn progress_bar(ui: &mut egui::Ui, frac: f32, text: &str) {
-    let frac = frac.clamp(0.0, 1.0);
-    let height = 18.0;
-    let (rect, _) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), height),
-        egui::Sense::hover(),
-    );
-    let painter = ui.painter();
-    let p = palette();
-    // Track.
-    painter.rect_filled(rect, CornerRadius::same(6), p.input_bg);
-    painter.rect_stroke(
-        rect,
-        CornerRadius::same(6),
-        Stroke::new(1.0_f32, p.card_border),
-        egui::StrokeKind::Inside,
-    );
-    // Fill — nothing at 0, so no pill.
-    if frac > 0.0 {
-        let w = (rect.width() * frac).max(4.0);
-        let fill = egui::Rect::from_min_size(rect.min, egui::vec2(w, height));
-        let radius = if w >= rect.width() - 1.0 {
-            CornerRadius::same(6)
-        } else {
-            CornerRadius {
-                nw: 6,
-                ne: 0,
-                sw: 6,
-                se: 0,
-            }
-        };
-        painter.rect_filled(fill, radius, ACCENT);
-    }
-    // Centered label on top.
-    painter.text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        text,
-        FontId::new(12.0, FontFamily::Proportional),
-        p.text_secondary,
-    );
 }
 
 #[cfg(test)]

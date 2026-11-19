@@ -206,7 +206,13 @@ pub async fn check_for_update() -> CheckResult {
         .build()
     {
         Ok(c) => c,
-        Err(e) => return CheckResult::Failed(format!("không tạo được HTTP client: {e}")),
+        Err(e) => {
+            // User-facing strings stay Vietnamese-only: the raw
+            // library error goes to the log, never to the UI (audit
+            // M9 — the raw reqwest error used to show verbatim).
+            tracing::warn!("update check: cannot build HTTP client: {e}");
+            return CheckResult::Failed("Không tạo được HTTP client".to_string());
+        }
     };
     let resp = match client
         .get(RELEASES_LATEST_URL)
@@ -215,7 +221,13 @@ pub async fn check_for_update() -> CheckResult {
         .await
     {
         Ok(r) => r,
-        Err(e) => return CheckResult::Failed(format!("không kết nối được GitHub: {e}")),
+        Err(e) => {
+            tracing::warn!("update check: cannot reach GitHub: {e}");
+            return CheckResult::Failed(
+                "Không kết nối được GitHub để kiểm tra cập nhật — kiểm tra mạng rồi thử lại"
+                    .to_string(),
+            );
+        }
     };
     if resp.status() == StatusCode::NOT_FOUND {
         // No releases published yet (the releases page was emptied).
@@ -236,7 +248,10 @@ pub async fn check_for_update() -> CheckResult {
     }
     let json: serde_json::Value = match resp.json().await {
         Ok(j) => j,
-        Err(e) => return CheckResult::Failed(format!("không đọc được phản hồi GitHub: {e}")),
+        Err(e) => {
+            tracing::warn!("update check: cannot read GitHub response: {e}");
+            return CheckResult::Failed("Không đọc được phản hồi GitHub".to_string());
+        }
     };
     let Some(info) = parse_release(&json) else {
         return CheckResult::Failed("không đọc được thông tin bản phát hành".to_string());

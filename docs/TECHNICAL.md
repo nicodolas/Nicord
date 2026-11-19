@@ -1543,3 +1543,131 @@ button that only validated and sent nothing).
   Verified live: add/edit/move/delete message, add/move/
   delete step, two-click confirms with Hủy, scenario-delete
   confirm with Hủy, 252 tests green.
+
+## UI declutter: Builder tabs, shorter text, no duplicates (2026-11-19)
+
+An independent UI review of the release binary (43 screenshots,
+all screens at 900x600 and 1100x700) concluded the interface
+felt cluttered not because of colors or fonts, but because of
+information density and missing visual hierarchy: the Builder
+stacked ~6 screens of content in one column, Settings read like
+documentation (~10 explanatory paragraphs), and the same number
+appeared 3–4 times per screen. Three changes landed in this
+batch; sending behavior is untouched (display only).
+
+- **Builder tabs (`src/app.rs`: `BuilderTab`, `show_messages_tab`,
+  `show_schedule_tab`, `show_send_options_card`).** The editor
+  splits into "Tin nhắn" | "Bước & Lịch" | "Nâng cao",
+  default "Tin nhắn". The target picker (destinations / channel)
+  stays visible above the tabs. "Tin nhắn" holds the message
+  list, compose field, emoji picker, content source, preview,
+  the shared template library (templates are message text, so
+  they moved here from the schedule group), and the File menu.
+  "Bước & Lịch" holds the steps card, the step inspector,
+  and the schedule editor with the 10-run preview. "Nâng cao"
+  holds one "Tùy chọn gửi" card: silent send, embed, poll,
+  edit-in-place, attachments — one row per option, each
+  composer expanding inline under its checkbox (previously
+  each option was its own large card for a single checkbox).
+  The pinned action bar is one row now ("Kiểm tra hợp lệ" +
+  a "+ Thêm bước" menu); the pinned reserve dropped from
+  250 px to 72 px. Import/export moved out of the bar into a
+  "File" menu at the end of the Messages tab (Lưu ra file /
+  Nhập kịch bản / pick an exported file); the manual path
+  field stays as a fallback line below it. The tab choice and
+  the variables-popup flag are session-only state
+  (`builder_tab`, `show_variables_popup`): which tab is open
+  is transient UI state, nobody expects it to survive a
+  restart — no new persisted state.
+- **Run preview collapse (audit M7).** When every simulated
+  run is blocked for the same reason, the preview shows the
+  first 3 runs + one summary line ("và 7 lần nữa — tất cả sẽ
+  bị bỏ qua vì …") instead of ten identical warnings
+  (`collapse_sim_runs`, unit-tested).
+- **Shorter text (audit H3).** ~70% of the explanatory text
+  left the main screens: each card keeps at most one short
+  line; the detail moved into hover tips on the label or the
+  control itself (`on_hover_text`). Examples: the message label lost the
+  `{a|b}` clause (now a tip), the template-variables list
+  became a "Xem biến mẫu" button opening a popup, edit-mode
+  and attachment notes are one line each, the send-mode /
+  limits / allowlist / backup / update explanations are one
+  line + tip. Field labels shortened (M6): "Tên hiển thị",
+  "Avatar URL", "Thread ID", "Giới hạn tin/ngày" — the
+  "(để trống = …)" detail is now the field's placeholder or
+  a hover tip. Export radio labels are two lines (name above,
+  description below) so they no longer clip at the card edge
+  (M12); the export path hint is "để trống = tự đặt tên".
+  Dev notes left the UI (M11): the Logs header line about
+  tokens is gone, and the Destinations "Webhook ? (ID …),
+  kênh ?" line now says "Chưa có thông tin webhook." (or
+  "chưa rõ" for the missing part only). The update-check
+  error no longer shows the raw English library error (M9):
+  `updater::check_for_update` returns short Vietnamese
+  messages and logs the raw error with `tracing::warn`.
+- **No duplicates, no dead blocks (audit H4, M3, M4, M5).**
+  The "1 kênh • 300 tin/ngày • đặt lại lúc 00:00 UTC" meta
+  left every screen header; the Dashboard "Đã gửi hôm nay"
+  metric card is gone (the sidebar's "Hôm nay" card is the
+  one place for the sent-today count, and the limits card in
+  Settings is the one place for the cap/reset info — the
+  reset time now lives in that card's hover tip). The sidebar
+  "Hôm nay" card shrank to one line ("Đã gửi hôm nay: X /
+  300") and the footer reserve dropped from 240 px to 140 px,
+  so all five nav items fit at 900x600 without scrolling the
+  sidebar; the engine status, scenario count and next run
+  that used to live in that card are on the Dashboard instead.
+  The "Chống ban" card hides entirely in Webhook mode behind
+  one line ("Tùy chọn chống ban chỉ áp dụng ở chế độ Tài
+  khoản Discord."). `theme::progress_bar` and `theme::dot`
+  were removed (their only callers were the old sidebar
+  card).
+- **Legacy webhook card (M4): KEPT, not deleted.** The
+  Settings webhook card still uses the legacy URL slot, but
+  that slot is live, not dead: it is the onboarding entry
+  point (a first-run paste creates the first destination via
+  `upsert_destination_from_legacy`), the engine-start
+  fallback in `can_start`, and the re-check target — while
+  the actual send path never reads it (webhook mode resolves
+  per-destination senders). What changed: the misleading
+  "Chưa có webhook URL" line now checks destinations first
+  and says "Đang dùng Đích đến — URL webhook quản lý ở màn
+  Đích đến." when one is configured; and the separate "Lưu
+  webhook" button is gone (M2) — the page has one Save
+  button, and `save_settings` saves a pasted URL first via
+  `save_pasted_webhook` (an invalid URL aborts the save with
+  the error in the status line). Onboarding reuses the same
+  helper. No sending behavior changed.
+- **Next-run timezone label (H2 follow-up, not a bug fix).**
+  The next-run time was already correct; the audit compared
+  two launches with different process timezones and read a
+  UTC render as a wrong time. The time now carries its zone
+  everywhere it shows ("20/11 09:00 (Asia/Ho_Chi_Minh)":
+  Dashboard control card, destination card, scenario rows),
+  and the Dashboard control card only counts ENABLED
+  scenarios (it used to show a next run for a disabled
+  scenario, unlike the scenario-row card).
+- **GUI-verification fixes (found live under Xvfb at
+  900x600, shots 249–251).** The first tab label, \"Lịch &
+  Bước chạy\", was too long: the tab row overflowed the
+  editor column and clipped \"Nâng cao\", and because a
+  vertical ScrollArea follows its widest child, the
+  overflow also widened the whole editor ScrollArea — the
+  muted notes inside wrapped at the too-wide width and
+  lost their tails at the window edge. Shortening the label
+  to \"Bước & Lịch\" fixed both the tab and the notes. The
+  template library's save row had the same failure on its
+  own: the name field + the long \"Lưu tin đang soạn thành
+  mẫu\" button did not fit one row, so the row widened its
+  card and clipped the \"không chứa secret.\" note (the
+  button itself was pushed off-screen). The row is now
+  stacked — field above, button below. `theme::help_tip`
+  was removed again: the one label that used it became a
+  short label with an `on_hover_text` tip, leaving the
+  helper unused (clippy `-D warnings`).
+- **Out of scope:** the Builder left column (M1 — mostly
+  empty with the single test scenario; fills with real data),
+  a separate guide page (tips cover it), and the Settings
+  theme dropdown the reviewer could not open by clicking —
+  unconfirmed as an app bug, to be re-tested by hand during
+  GUI verification.
